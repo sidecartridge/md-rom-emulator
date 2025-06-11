@@ -54,7 +54,7 @@ static const Command commands[] = {
 static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 
 // Global array to store ROM info.
-static ROM roms[MAX_ROMS];
+static ROM *roms = NULL;
 static int romsCount = 0;
 
 // ROMs folder. Initialize with the default value.
@@ -85,13 +85,19 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
   FIL file;
   FRESULT res;
   UINT bytesRead;
-  uint8_t buffer[FLASH_SECTOR_SIZE];
   FSIZE_t size;
+
+  uint8_t *buffer = (uint8_t *)malloc(FLASH_SECTOR_SIZE);
+  if (buffer == NULL) {
+    DPRINTF("Error allocating memory for buffer\n");
+    return FR_NOT_ENOUGH_CORE;
+  }
 
   // Open the file (read-only, binary mode)
   res = f_open(&file, filename, FA_READ);
   if (res != FR_OK) {
     DPRINTF("Error opening file %s: %d\n", filename, res);
+    free(buffer);
     return res;
   }
 
@@ -108,6 +114,7 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
       DPRINTF("Error reading header of file: %d (bytes read: %u)\n", res,
               bytesRead);
       f_close(&file);
+      free(buffer);
       return res;
     }
 
@@ -121,6 +128,7 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
       if (res != FR_OK) {
         DPRINTF("Error seeking back in file: %d\n", res);
         f_close(&file);
+        free(buffer);
         return res;
       }
     }
@@ -131,10 +139,14 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
 
   // Read and program the file in FLASH_SECTOR_SIZE chunks.
   while (1) {
+    // Read a chunk of data from the file.
+    DPRINTF("Reading %u bytes from file at offset 0x%X\n", FLASH_SECTOR_SIZE,
+            offset);
     res = f_read(&file, buffer, FLASH_SECTOR_SIZE, &bytesRead);
     if (res != FR_OK) {
       DPRINTF("Error reading file: %d\n", res);
       f_close(&file);
+      free(buffer);
       return res;
     }
     if (bytesRead == 0) {
@@ -167,6 +179,8 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
   }
 
   f_close(&file);
+  free(buffer);
+  DPRINTF("File %s stored to flash at address 0x%X\n", filename, flashAddress);
   return FR_OK;
 }
 
@@ -292,129 +306,90 @@ static void readRomsSdcard(const char *folder) {
 static void readRomsCsv(const char *csvFilepath) {
   FRESULT res;
   FIL csvFile;
-  char line[FLASH_PAGE_SIZE * 2];
+  char line[256];  // If you really have huge CSV lines, make this larger, but
+                   // 256 is often enough.
   int lineNum = 0;
 
-  // Reset the ROM count.
   romsCount = 0;
 
-  // Open the CSV file.
   res = f_open(&csvFile, csvFilepath, FA_READ);
   if (res != FR_OK) {
     DPRINTF("Error opening CSV file %s: %d\n", csvFilepath, res);
     return;
   }
 
-  // Read and discard the header line.
+  // Skip header
   if (f_gets(line, sizeof(line), &csvFile) == NULL) {
     DPRINTF("Error reading header from CSV file\n");
     f_close(&csvFile);
     return;
   }
 
-  // Read each subsequent line.
   while (f_gets(line, sizeof(line), &csvFile) != NULL) {
     lineNum++;
+    DPRINTF("Line %d: %s", lineNum, line);
 
-    // Skip empty lines.
     if (line[0] == '\0' || line[0] == '\n') continue;
 
-    // Expected format:
-    // "URL","Name","Description","Tags","Size (KB)"
-    char field1[MAX_PATH_SIZE * 2] = {0};  // URL
-    char field2[MAX_PATH_SIZE * 2] = {0};  // Name
-    char field3[MAX_PATH_SIZE] = {0};      // Description
-    char field4[MAX_PATH_SIZE * 2] = {0};  // Tags
-    char field5[MAX_PATH_SIZE / 4] = {0};  // Size (KB)
+    // These should be as small as possible!
+    char field1[MAX_PATH_SIZE] = {0};  // URL
+    char field2[MAX_PATH_SIZE] = {0};  // Name
+    char field3[MAX_PATH_SIZE] = {0};  // Description (tune this)
+    char field4[MAX_PATH_SIZE] = {0};  // Tags (tune this)
+    char field5[12] = {0};             // Size (KB) (should never be big)
 
     char *ptr = line;
+    int jdx;
 
-// Helper macro to extract a quoted field.
-#define EXTRACT_FIELD(dest)                                              \
-  do {                                                                   \
-    while (*ptr && isspace((unsigned char)*ptr)) ptr++;                  \
-    if (*ptr != '"') {                                                   \
-      DPRINTF("Line %d: expected '\"'\n", lineNum);                      \
-      goto next_line;                                                    \
-    }                                                                    \
-    ptr++; /* skip opening quote */                                      \
-    int jdx = 0;                                                         \
-    while (*ptr && *ptr != '"' && jdx < (int)sizeof(dest) - 1) {         \
-      dest[jdx++] = *ptr++;                                              \
-    }                                                                    \
-    dest[jdx] = '\0';                                                    \
-    if (*ptr == '"') ptr++;                                              \
-    while (*ptr && (*ptr == ',' || isspace((unsigned char)*ptr))) ptr++; \
+// Tiny helper: extracts quoted CSV field (no inner quotes support)
+#define EXTRACT_FIELD(dest)                                \
+  do {                                                     \
+    while (*ptr && isspace((unsigned char)*ptr)) ptr++;    \
+    if (*ptr != '\"') goto next_line;                      \
+    ptr++;                                                 \
+    jdx = 0;                                               \
+    while (*ptr && *ptr != '\"' && jdx < sizeof(dest) - 1) \
+      dest[jdx++] = *ptr++;                                \
+    dest[jdx] = 0;                                         \
+    if (*ptr == '\"') ptr++;                               \
+    while (*ptr && (*ptr == ',' || isspace(*ptr))) ptr++;  \
   } while (0)
 
     EXTRACT_FIELD(field1);  // URL
     EXTRACT_FIELD(field2);  // Name
     EXTRACT_FIELD(field3);  // Description
     EXTRACT_FIELD(field4);  // Tags
-    EXTRACT_FIELD(field5);  // Size (KB)
+    EXTRACT_FIELD(field5);  // Size
 
-    {
-      // Decode URL-encoded text from the fields.
-      char decodedField1[MAX_PATH_SIZE * 2] = {0};
-      char decodedField2[MAX_PATH_SIZE * 2] = {0};
-      char decodedField3[MAX_PATH_SIZE] = {0};
-      char decodedField4[MAX_PATH_SIZE * 2] = {0};
-      urlDecode(field1, decodedField1, sizeof(decodedField1));
-      urlDecode(field2, decodedField2, sizeof(decodedField2));
-      urlDecode(field3, decodedField3, sizeof(decodedField3));
-      urlDecode(field4, decodedField4, sizeof(decodedField4));
+    // --- Decode fields directly into their struct fields ---
+    if (romsCount < MAX_ROMS) {
+      ROM *r = &roms[romsCount];
 
-      int sizeKb = atoi(field5);
+      urlDecode(field1, r->filename, sizeof(r->filename));
+      // Compose path
+      const char *romsFolder =
+          settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROMS_FOLDER)
+              ->value;
+      snprintf(r->path, sizeof(r->path), "%s/%s", romsFolder, r->filename);
 
-      // Store the parsed values into the ROM structure.
-      if (romsCount < MAX_ROMS) {
-        // Store the decoded URL into filename.
-        strncpy(roms[romsCount].filename, field1, MAX_FILENAME_LENGTH - 1);
-        roms[romsCount].filename[MAX_FILENAME_LENGTH - 1] = '\0';
+      urlDecode(field2, r->name, sizeof(r->name));
+      urlDecode(field3, r->description, sizeof(r->description));
+      urlDecode(field4, r->tags, sizeof(r->tags));
+      r->size = atoi(field5);
 
-        // Build the full path: ROMs folder + "/" + decoded URL.
-        const char *romsFolder =
-            settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROMS_FOLDER)
-                ->value;
-        roms[romsCount].path[0] = '\0';
-        strncat(roms[romsCount].path, romsFolder, MAX_PATH_SIZE - 1);
-        strncat(roms[romsCount].path, "/", MAX_PATH_SIZE - 1);
-        strncat(roms[romsCount].path, decodedField1, MAX_PATH_SIZE - 1);
-
-        // Store the friendly name.
-        strncpy(roms[romsCount].name, decodedField2, MAX_FILENAME_LENGTH - 1);
-        roms[romsCount].name[MAX_FILENAME_LENGTH - 1] = '\0';
-
-        // Store the description.
-        int sizeField3 = sizeof(field3) > 0 ? sizeof(field3) - 1 : 0;
-        strncpy(roms[romsCount].description, decodedField3, sizeField3);
-        roms[romsCount].description[sizeField3] = '\0';
-
-        // Store the tags.
-        strncpy(roms[romsCount].tags, decodedField4, MAX_FILENAME_LENGTH - 1);
-        roms[romsCount].tags[MAX_FILENAME_LENGTH - 1] = '\0';
-
-        // Store the size (in KB).
-        roms[romsCount].size = sizeKb;
-
-        romsCount++;
-      } else {
-        DPRINTF("Maximum ROM count reached (%d)\n", MAX_ROMS);
-        break;
-      }
+      romsCount++;
+    } else {
+      DPRINTF("Maximum ROM count reached (%d)\n", MAX_ROMS);
+      break;
     }
-
-  next_line:;  // Label for skipping to next line.
+  next_line:;
   }
-
   f_close(&csvFile);
 
-  // Sort the ROMs array alphabetically by filename.
   qsort(roms, romsCount, sizeof(ROM), compareRoms);
 
   DPRINTF("Found %d ROMs in CSV file.\n", romsCount);
   maxRomPages = (romsCount + MAX_ROMS_PER_PAGE - 1) / MAX_ROMS_PER_PAGE;
-
 #undef EXTRACT_FIELD
 }
 
@@ -877,9 +852,9 @@ void emul_start() {
     // to start the ROM emulation So the user boots as usual, but the ROM
     // emulation is not started until the SELECT button is pressed because
     // that is how the old ripper cartridges worked
+    select_configure();
+    select_setLongResetCallback(reset_deviceAndEraseFlash);
     if (appModeValue == ROM_MODE_DELAY) {
-      select_configure();
-      select_setLongResetCallback(reset_deviceAndEraseFlash);
       // Wait until SELECT is pressed
       while (!select_detectPush()) {
         // Run the ROM emulation state machine
@@ -900,14 +875,13 @@ void emul_start() {
     blink_on();
 #endif
 
-    select_configure();
-    select_setLongResetCallback(reset_deviceAndEraseFlash);
-
+    DPRINTF("ROM emulation mode started. Waiting for SELECT button\n");
     // Wait until SELECT is pressed
     while (!select_detectPush()) {
       // Run the ROM emulation state machine
       sleep_ms(SLEEP_LOOP_MS);
     }
+    DPRINTF("SELECT button pressed. Waiting for release\n");
     // Select button pressed. Wait until it is released
     select_waitPush();
     // Change the mode to setup menu
@@ -940,13 +914,20 @@ void emul_start() {
   // Initialize the display
   display_setupU8g2();
 
-  // 5. Init the sd card
+  // 5. Configure the SELECT button
+  // Short press: reset the device and restart the app
+  // Long press: reset the device and erase the flash.
+  select_configure();
+  select_coreWaitPush(reset_device,
+                      reset_deviceAndEraseFlash);  // Wait for the SELECT
+                                                   // button to be pushed
+  // 6. Init the sd card
   // Most of the apps or microfirmwares will need to read and write files
   // to the SD card. The SD card is used to store the ROM files, configuration
   // files, and other data.
   // The SD card is initialized here. If the SD card is not present, the
-  // app will show an error message and wait for the user to insert the SD card.
-  // The app will not start until the SD card is inserted correctly.
+  // app will show an error message and wait for the user to insert the SD
+  // card. The app will not start until the SD card is inserted correctly.
   // Each app or microfirmware must have a folder in the SD card where the
   // files are stored. The folder name is defined in the configuration.
 
@@ -984,7 +965,7 @@ void emul_start() {
   // Pre-init the terminal emulator for ROMS waiting for the network
   preinit();
 
-  // 6. Init the network, if needed
+  // 7. Init the network, if needed
   // It's always a good idea to wait for the network to be ready
   // Get the WiFi mode from the settings
   SettingsConfigEntry *wifiMode =
@@ -1030,10 +1011,10 @@ void emul_start() {
     }
   }
 
-  // 7. Download the list of available ROMs from the network
-  // Since the list of availanble ROMs is stored in a remote server and does not
-  // change frequently, it is a good idea to download the list of ROMs at the
-  // beginning of the app. This way, the user can browse the list of ROMs
+  // 8. Download the list of available ROMs from the network
+  // Since the list of availanble ROMs is stored in a remote server and does
+  // not change frequently, it is a good idea to download the list of ROMs at
+  // the beginning of the app. This way, the user can browse the list of ROMs
   // available in the server and download the ROMs to the SD card.
   // The list of ROMs is stored in a CSV file in the server. The CSV file
   // contains the URL of the ROM file, the name of the ROM, the description,
@@ -1056,7 +1037,7 @@ void emul_start() {
     download_start();
   }
 
-  // 8. Now complete the terminal emulator initialization
+  // 9. Now complete the terminal emulator initialization
   // The terminal emulator is used to interact with the user to configure the
   // device.
   init(romsFolderName);
@@ -1066,11 +1047,16 @@ void emul_start() {
   blink_on();
 #endif
 
-  // 9. Start the main loop
+  // 10. Start the main loop
   // The main loop is the core of the app. It is responsible for running the
   // app, handling the user input, and performing the tasks of the app.
-  // The main loop runs until the user decides to launch a ROM or exit the app.
+  // The main loop runs until the user decides to launch a ROM or exit the
+  // app.
   DPRINTF("Start the app loop here\n");
+  roms = malloc(MAX_ROMS * sizeof(ROM));
+  if (roms == NULL) {
+    DPRINTF("Error allocating memory for ROMs\n");
+  }
   absolute_time_t wifiScanTime = make_timeout_time_ms(
       WIFI_SCAN_TIME_MS);  // 3 seconds minimum for network scanning
 
@@ -1118,9 +1104,13 @@ void emul_start() {
       }
     }
   }
-  // 10. Send RESET computer command
-  // Exiting the loop means we are done with the setup/configuration mode and we
-  // are ready to start the ROM emulation or the booster app.
+  if (roms != NULL) {
+    free(roms);
+    roms = NULL;
+  }
+  // 11. Send RESET computer command
+  // Exiting the loop means we are done with the setup/configuration mode and
+  // we are ready to start the ROM emulation or the booster app.
 
   // We must reset the computer
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
