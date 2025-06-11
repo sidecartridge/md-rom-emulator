@@ -61,6 +61,7 @@ int main() {
   const char *currentVoltage = VOLTAGE_VALUES[RP2040_VOLTAGE];
   DPRINTF("Clock frequency: %i KHz\n", currentClockFrequencyKhz);
   DPRINTF("Voltage: %s\n", currentVoltage);
+  DPRINTF("FLASH SPI CLKDIV: %i\n", PICO_FLASH_SPI_CLKDIV);
   DPRINTF("PICO_FLASH_SIZE_BYTES: %i\n", PICO_FLASH_SIZE_BYTES);
 
   // Show information about the flash memory layout
