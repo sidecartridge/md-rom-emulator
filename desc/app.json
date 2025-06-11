@@ -4,14 +4,16 @@
   "description": "Pure raw emulation of ROMs with a maximum of 128KBs. It can load any ROM file from the SD card or download it from the public repository in the net.",
   "image": "https://placehold.co/256x256/png",
   "tags": [
-      "Emulation",
-      "ROM"
+    "Emulation",
+    "ROM"
   ],
   "devices": [
-      "Atari ST",
-      "Atari STE",
-      "Atari MegaST",
-      "Atari MegaSTE"
+    "ST",
+    "STE",
+    "MegaST",
+    "MegaSTE",
+    "TT",
+    "Falcon"
   ],
   "binary": "https://atarist.sidecartridge.com/<APP_UUID>-<APP_VERSION>.uf2",
   "md5": "<BINARY_MD5_HASH>",
