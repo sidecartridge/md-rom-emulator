@@ -16,6 +16,24 @@ static char filepath[DOWNLOAD_BUFFLINE_SIZE] = {0};
 static download_url_components_t components;
 static download_file_t fileUrl;
 
+static void url_encode(const char *src, char *dst, size_t dst_len) {
+  static const char hex[] = "0123456789ABCDEF";
+  size_t i = 0;
+  while (*src && i + 3 < dst_len) {
+    if (('a' <= *src && *src <= 'z') || ('A' <= *src && *src <= 'Z') ||
+        ('0' <= *src && *src <= '9') || *src == '-' || *src == '_' ||
+        *src == '.' || *src == '~' || *src == '/') {
+      dst[i++] = *src;
+    } else {
+      dst[i++] = '%';
+      dst[i++] = hex[(*src >> 4) & 0xF];
+      dst[i++] = hex[*src & 0xF];
+    }
+    src++;
+  }
+  dst[i] = '\0';
+}
+
 // Generates a temporary file path for downloads.
 static void getTmpFilenamePath(char filename[DOWNLOAD_BUFFLINE_SIZE]) {
   snprintf(filename, DOWNLOAD_BUFFLINE_SIZE, "%s/tmp.download",
@@ -228,6 +246,11 @@ download_err_t download_start() {
   DPRINTF("Clearing read-only attribute, if any\n");
   f_chmod(filename, 0, AM_RDO);
 
+  // Force deletion of the file if it exists
+  DPRINTF("Removing file if it exists\n");
+  res = f_unlink(filename);
+  DPRINTF("Status of unlink: %i. And move on.\n", res);
+
   // Open file for writing or create if it doesn't exist
   DPRINTF("Opening file for writing\n");
   res = f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
@@ -250,9 +273,15 @@ download_err_t download_start() {
 
   downloadStatus = DOWNLOAD_STATUS_STARTED;
 
-  request.url = components.uri;
+  // Encode the URI for HTTP request
+  // The URI must be URL-encoded to handle special characters
+  char encodedUri[DOWNLOAD_BUFFLINE_SIZE] = {0};
+  url_encode(components.uri, encodedUri, sizeof(encodedUri));
+  DPRINTF("Encoded URI: %s\n", encodedUri);
+  // Initialize the request structure
+  request.url = encodedUri;
   request.hostname = components.host;
-  DPRINTF("HOST: %s. URI: %s\n", components.host, components.uri);
+  DPRINTF("HOST: %s. URI: %s\n", components.host, encodedUri);
   request.headers_fn = httpClientHeaderCheckSizeFn;
   request.recv_fn = httpClientReceiveFileFn;
   request.result_fn = httpClientResultCompleteFn;
