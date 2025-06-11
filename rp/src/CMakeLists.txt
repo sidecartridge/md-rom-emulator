@@ -115,6 +115,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_flash           # Flash memory access
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico                # FATFS library   
     pico_stdlib              # Core functionality
+    pico_multicore           # Multicore support
     httpc                    # HTTP client
     settings                 # Custom settings library
     u8g2                     # for display
@@ -181,7 +182,7 @@ if(NOT RELEASE_DATE)
 endif()
 
 if (NOT _DEBUG)
-        set(_DEBUG 1)
+        set(_DEBUG 0)
 endif()
 
 # Debug outputs
