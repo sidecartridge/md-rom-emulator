@@ -59,20 +59,22 @@ static inline void __not_in_flash_func(handle_protocol_checksum_error)(
 
 // Interrupt handler for DMA completion
 void __not_in_flash_func(term_dma_irq_handler_lookup)(void) {
-  // Read the rom3 signal and if so then process the command
-  bool rom3Gpio = (1UL << ROM3_GPIO) & sio_hw->gpio_in;
-  // bool rom4_gpio = (1ul << ROM4_GPIO) & sio_hw->gpio_in;
-  // DPRINTF("ROM3_GPIO: %d ROM4_GPIO: %d\n", rom3_gpio, rom4_gpio);
+  // Read once to avoid redundant hardware access
+  uint32_t addr = dma_hw->ch[2].al3_read_addr_trig;
 
-  dma_hw->ints1 = 1U << 2;
+  // Check ROM3 signal (bit 16)
+  // We expect that the ROM3 signal is not set very often, so this should help
+  // the compilar to run faster
+  if (__builtin_expect(addr & 0x00010000, 0)) {
+    // Invert highest bit of low word to get 16-bit address
+    uint16_t addr_lsb = (uint16_t)(addr ^ ADDRESS_HIGH_BIT);
 
-  // Read the ROM3_GPIO and if active then process the command
-  if (!rom3Gpio) {
-    // Read the address to process and invert the highest bit
-    uint16_t addrLsb = dma_hw->ch[2].al3_read_addr_trig ^ ADDRESS_HIGH_BIT;
-    tprotocol_parse(addrLsb, handle_protocol_command,
+    tprotocol_parse(addr_lsb, handle_protocol_command,
                     handle_protocol_checksum_error);
   }
+
+  // Read the rom3 signal and if so then process the command
+  dma_hw->ints1 = 1U << 2;
 }
 
 static char screen[TERM_SCREEN_SIZE];

@@ -58,6 +58,11 @@ sdcard_status_t sdcard_initFilesystem(FATFS *fsPtr, const char *folderName) {
 
   // If the folder does not exist, try to create it
   if (!folderExists) {
+    // If the folder is empty or '/' then ignore it
+    if (strcmp(folderName, "") == 0 || strcmp(folderName, "/") == 0) {
+      DPRINTF("Empty folder name. Ignoring.\n");
+      return SDCARD_INIT_OK;
+    }
     // Create the folder
     fres = f_mkdir(folderName);
     if (fres != FR_OK) {
