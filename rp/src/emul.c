@@ -1113,9 +1113,10 @@ void emul_start() {
   // we are ready to start the ROM emulation or the booster app.
 
   // We must reset the computer
-  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
-  sleep_ms(SLEEP_LOOP_MS);
   if (getResetDevice()) {
+    select_coreWaitPushDisable();  // Disable the SELECT button
+    SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
+    sleep_ms(SLEEP_LOOP_MS);
     // Reset the device
     reset_device();
   } else {
@@ -1127,7 +1128,18 @@ void emul_start() {
                          ROM_MODE_SETUP);
     settings_save(aconfig_getContext(), true);
 
+    select_coreWaitPushDisable();  // Disable the SELECT button
+    sleep_ms(SLEEP_LOOP_MS);
+    // We must reset the computer
+    SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
+    sleep_ms(SLEEP_LOOP_MS);
+
     // Jump to the booster app
+    DPRINTF("Jumping to the booster app...\n");
     reset_jump_to_booster();
+    while (1) {
+      // Wait forever
+      DPRINTF("Waiting for the booster app to start...\n");
+    }
   }
 }
