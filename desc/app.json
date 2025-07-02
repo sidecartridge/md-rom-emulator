@@ -1,7 +1,7 @@
 {
   "uuid": "<APP_UUID>",
   "name": "ROM Emulator",
-  "description": "Pure raw emulation of ROMs with a maximum of 128KBs. It can load any ROM file from the SD card or download it from the public repository in the net.",
+  "description": "Pure raw emulation of ROMs with a maximum of 128KBs. It can load any ROM file from the SD card or download it from the public repository in the net.  <a target='_blank' href='https://docs.sidecartridge.com/sidecartridge-multidevice/microfirmwares/rom_emulator/'>Learn more</a>",
   "image": "https://placehold.co/256x256/png",
   "tags": [
     "Emulation",
