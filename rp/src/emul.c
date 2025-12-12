@@ -1208,11 +1208,14 @@ void emul_start() {
   // We must reset the computer
   if (getResetDevice()) {
     multicore_reset_core1();
+    sleep_ms(SLEEP_LOOP_MS);
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
     sleep_ms(SLEEP_LOOP_MS);
     // Reset the device
     reset_device();
   } else {
+    multicore_reset_core1();
+    sleep_ms(SLEEP_LOOP_MS);
     // Before jumping to the booster app, let's clean the settings
     // Clean the ROM_SELECTED setting
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, "");
