@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "aconfig.h"
+#include "blink.h"
 #include "constants.h"
 #include "debug.h"
 #include "download.h"
@@ -37,6 +38,8 @@
 #define MAX_FILENAME_LENGTH 36
 #define MAX_PATH_SIZE 128
 
+#define AUTORUN_BLINK_MS 200
+
 typedef struct {
   char filename[MAX_FILENAME_LENGTH];
   // You can add other fields (e.g. file size, type, etc.)
@@ -56,6 +59,14 @@ enum {
 
 #define ROM_MODE_SETUP_STR \
   "255"  // ROM setup string for the config initialization
+
+typedef enum {
+  AUTORUN_OK = 0,
+  AUTORUN_ERR_AUTORUN_NOT_FOUND = -1,
+  AUTORUN_ERR_AUTORUN_EMPTY = -2,
+  AUTORUN_ERR_ROM_NOT_FOUND = -3,
+  AUTORUN_ERR_FLASH_STORE = -4
+} AutorunResult;
 
 enum {
   TERM_ROMS_MENU_MAIN = 0,
