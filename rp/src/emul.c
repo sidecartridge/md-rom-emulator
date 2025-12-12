@@ -1138,11 +1138,6 @@ void emul_start() {
   // device.
   init(romsFolderName);
 
-  // Blink on
-#ifdef BLINK_H
-  blink_on();
-#endif
-
   // 10. Start the main loop
   // The main loop is the core of the app. It is responsible for running the
   // app, handling the user input, and performing the tasks of the app.
@@ -1212,6 +1207,7 @@ void emul_start() {
 
   // We must reset the computer
   if (getResetDevice()) {
+    multicore_reset_core1();
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
     sleep_ms(SLEEP_LOOP_MS);
     // Reset the device

@@ -7,6 +7,7 @@
 
 ### Fixes
 - Green LED now correctly indicates when the ROM emulation is working.
+- Launching booster now kills core 1 to avoid conflicts. Now it does not randomly hang the system.
 
 ---
 
