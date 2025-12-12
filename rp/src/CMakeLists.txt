@@ -222,8 +222,9 @@ add_definitions(-D_DEBUG=${_DEBUG})
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)
 
-# We don't modify the flash in Core 1
-add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
+# Assume both cores are safe for flash operations
+set(PICO_FLASH_ASSUME_CORE1_SAFE 1)
+set(PICO_FLASH_ASSUME_CORE0_SAFE 1)
 
 # Select HTTPS or HTTP downloads of the firmware
 add_definitions(-DAPP_DOWNLOAD_HTTPS=0)
