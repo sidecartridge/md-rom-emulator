@@ -184,6 +184,98 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
   return FR_OK;
 }
 
+// Tries to autorun a ROM specified in /roms/.autorun (or custom ROM folder)
+static AutorunResult autorunIfRequested(void) {
+  char autorunPath[MAX_PATH_SIZE];
+  snprintf(autorunPath, sizeof(autorunPath), "%s/.autorun", romsFolder);
+  DPRINTF("Checking for autorun file: %s\n", autorunPath);
+
+  FIL autorunFile;
+  FRESULT res = f_open(&autorunFile, autorunPath, FA_READ);
+  if (res != FR_OK) {
+    DPRINTF("No autorun file found or cannot open it: %d\n", res);
+    return AUTORUN_ERR_AUTORUN_NOT_FOUND;  // No autorun file or cannot open it
+  }
+
+  char fileBuf[MAX_PATH_SIZE];
+  UINT bytesRead = 0;
+  res = f_read(&autorunFile, fileBuf, sizeof(fileBuf) - 1, &bytesRead);
+  f_close(&autorunFile);
+  if (res != FR_OK || bytesRead == 0) {
+    DPRINTF("Error reading autorun file or file is empty: %d\n", res);
+    return AUTORUN_ERR_AUTORUN_EMPTY;  // Autorun file empty or read error
+  }
+  fileBuf[bytesRead] = '\0';
+
+  // Trim whitespace/newlines
+  char *filenameStart = fileBuf;
+  while (*filenameStart && isspace((unsigned char)*filenameStart)) {
+    filenameStart++;
+  }
+  char *filenameEnd = filenameStart + strlen(filenameStart);
+  while (filenameEnd > filenameStart &&
+         isspace((unsigned char)*(filenameEnd - 1))) {
+    filenameEnd--;
+  }
+  *filenameEnd = '\0';
+
+  if (*filenameStart == '\0') {
+    DPRINTF("Autorun file is empty after trimming whitespace\n");
+    return AUTORUN_ERR_AUTORUN_EMPTY;  // Empty filename
+  }
+
+  DPRINTF("Autorun requested for file: %s\n", filenameStart);
+
+  // Build full path to the ROM file
+  char romPath[MAX_PATH_SIZE];
+  snprintf(romPath, sizeof(romPath), "%s/%s", romsFolder, filenameStart);
+
+  // Ensure the target file exists and is not a directory
+  FILINFO fno;
+  res = f_stat(romPath, &fno);
+  if (res != FR_OK || (fno.fattrib & AM_DIR)) {
+    DPRINTF("Autorun file not found or is a directory: %s\n", romPath);
+    return AUTORUN_ERR_ROM_NOT_FOUND;  // ROM file not found or is a directory
+  }
+
+  // Copy ROM into flash
+  unsigned int flashAddress = (unsigned int)&_rom_temp_start;
+  res = storeFileToFlash(romPath, flashAddress);
+  if (res != FR_OK) {
+    DPRINTF("Failed to store autorun ROM to flash: %d\n", res);
+    return AUTORUN_ERR_FLASH_STORE;  // Failed to store ROM in flash
+  }
+
+  // Update settings to boot directly into this ROM
+  settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
+                      filenameStart);
+  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_ROM_MODE,
+                       ROM_MODE_DIRECT);
+  settings_save(aconfig_getContext(), true);
+
+  // Blink green LED (if available) forever instead of resetting
+#ifdef BLINK_H
+  DPRINTF("Autorun successful. Blinking LED to indicate autorun mode.\n");
+  bool ledOn = false;
+  while (1) {
+    ledOn = !ledOn;
+    if (ledOn) {
+      blink_on();
+    } else {
+      blink_off();
+    }
+    sleep_ms(AUTORUN_BLINK_MS);
+  }
+#else
+  DPRINTF(
+      "Autorun successful. Entering infinite loop to indicate autorun mode.\n");
+  while (1) {
+    sleep_ms(AUTORUN_BLINK_MS);
+  }
+#endif
+  return AUTORUN_OK;  // Not reached on success, keeps signature consistent
+}
+
 /**
  * @brief Checks whether a filename has one of the allowed extensions.
  *
@@ -957,6 +1049,10 @@ void emul_start() {
     }
   } else {
     DPRINTF("SD card found & initialized\n");
+    AutorunResult autorunResult = autorunIfRequested();
+    if (autorunResult != AUTORUN_OK) {
+      DPRINTF("Autorun error: %i. Continue.\n", autorunResult);
+    }
   }
 
   // Initialize the display again (in case the terminal emulator changed it)
