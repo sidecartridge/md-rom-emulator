@@ -1,6 +1,6 @@
 # Changelog
 
-## v2.1.0 (2025-12-12) - release
+## v2.1.0 (2025-12-12) - release
 
 ### Features
 - Added autorun mode. When a file named ".autorun" is present in the ROM folder, the filename inside that file will be automatically executed on startup. This allows launching of diagonostic cartridges or other utilities without user intervention. It is valuable for troubleshooting computers with faulty keyboards or screens.
