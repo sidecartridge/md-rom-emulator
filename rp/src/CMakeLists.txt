@@ -223,8 +223,7 @@ add_definitions(-D_DEBUG=${_DEBUG})
 add_definitions(-DDISPLAY_ATARIST)
 
 # Assume both cores are safe for flash operations
-set(PICO_FLASH_ASSUME_CORE1_SAFE 1)
-set(PICO_FLASH_ASSUME_CORE0_SAFE 1)
+set(PICO_FLASH_ASSUME_CORE1_SAFE 0)
 
 # Select HTTPS or HTTP downloads of the firmware
 add_definitions(-DAPP_DOWNLOAD_HTTPS=0)
