@@ -900,7 +900,7 @@ static void init(const char *folder) {
   display_refresh();
 }
 
-void emul_start() {
+void __not_in_flash_func(emul_start)() {
   // The anatomy of an app or microfirmware is as follows:
   // - The driver code running in the remote device (the computer)
   // - the driver code running in the host device (the rp2040/rp2350)
@@ -976,11 +976,20 @@ void emul_start() {
     DPRINTF("SELECT button pressed. Waiting for release\n");
     // Select button pressed. Wait until it is released
     select_waitPush();
+
+    multicore_reset_core1();
+    sleep_ms(SLEEP_LOOP_MS);
+
     // Change the mode to setup menu
     // Set the ROM emulation mode to 255 (setup menu)
     settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_ROM_MODE,
                          ROM_MODE_SETUP);
     settings_save(aconfig_getContext(), true);
+
+#ifdef BLINK_H
+    blink_off();
+#endif
+
     // Now reset the device
     reset_device();
   }
@@ -994,7 +1003,7 @@ void emul_start() {
   // The code is stored as an array in the target_firmware.h file
   //
   // Copy the terminal firmware to RAM
-  COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
+  COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length * 2);
   init_romemul(NULL, term_dma_irq_handler_lookup, false);
 
   // 4. During the setup/configuration mode, the driver code must interact
