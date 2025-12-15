@@ -144,17 +144,6 @@ static void termRenderChar(char chr) {
   prevCursorY = cursorY;
 }
 
-// Prints entire screen to stdout
-static void termPrintScreen(void) {
-  for (int posY = 0; posY < TERM_SCREEN_SIZE_Y; posY++) {
-    for (int posX = 0; posX < TERM_SCREEN_SIZE_X; posX++) {
-      char chr = screen[posY * TERM_SCREEN_SIZE_X + posX];
-      putchar(chr ? chr : ' ');
-    }
-    putchar('\n');
-  }
-}
-
 /**
  * @brief Processes a complete VT52 escape sequence.
  *
@@ -383,15 +372,6 @@ static void termInputChar(char chr) {
     display_termRefresh();
   } else {
     // Buffer full, ignore or beep?
-  }
-}
-
-// For convenience, we can also have a helper function that "types" a string as
-// if typed by user
-static void termTypeString(const char *str) {
-  while (*str) {
-    termInputChar(*str);
-    str++;
   }
 }
 
