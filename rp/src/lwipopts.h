@@ -23,22 +23,22 @@
 #define MEM_ALIGNMENT 4
 #define MEM_SIZE 4096
 
-#define MEM_SANITY_CHECK 1
-#define MEM_OVERFLOW_CHECK 1
+#define MEM_SANITY_CHECK 0
+#define MEM_OVERFLOW_CHECK 0
 
-#define MEMP_NUM_PBUF 32
-#define MEMP_NUM_TCP_PCB 10
-#define MEMP_NUM_TCP_SEG 32
-#define MEMP_NUM_ARP_QUEUE 10
-#define PBUF_POOL_SIZE 32
+#define MEMP_NUM_PBUF 8
+#define MEMP_NUM_TCP_PCB 4
+#define MEMP_NUM_TCP_SEG 16
+#define MEMP_NUM_ARP_QUEUE 2
+#define PBUF_POOL_SIZE 12
 #define LWIP_ARP 1
 #define LWIP_ETHERNET 1
 #define LWIP_ICMP 1
 #define LWIP_RAW 0
 #define TCP_MSS 1460
-#define TCP_WND (12 * TCP_MSS)
-#define TCP_SND_BUF (8 * TCP_MSS)
-#define TCP_SND_QUEUELEN ((4 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
+#define TCP_WND (4 * TCP_MSS)
+#define TCP_SND_BUF (4 * TCP_MSS)
+#define TCP_SND_QUEUELEN ((2 * (TCP_SND_BUF) + (TCP_MSS - 1)) / (TCP_MSS))
 #define LWIP_NETIF_STATUS_CALLBACK 1
 #define LWIP_NETIF_LINK_CALLBACK 1
 #define LWIP_NETIF_HOSTNAME 1
@@ -128,17 +128,11 @@
 #define HTTPD_FSDATA_FILE "fsdata_srv.c"
 #endif
 
-#if APP_DOWNLOAD_HTTPS == 1
-// If you don't want to use TLS (just a http request) you can avoid linking to
-// mbedtls and remove the following
-#define LWIP_ALTCP 1
-#define MEMP_NUM_ALTCP_PCB 10
-#define LWIP_ALTCP_TLS 1
-#define LWIP_ALTCP_TLS_MBEDTLS 1
-#define ALTCP_MBEDTLS_AUTHMODE MBEDTLS_SSL_VERIFY_NONE
-// #define ALTCP_MBEDTLS_DEBUG  LWIP_DBG_ON
-// #define ALTCP_MBEDTLS_LIB_DEBUG LWIP_DBG_ON
-#endif
+// Only plain HTTP client: keep ALTCP/TLS disabled to save memory.
+#define LWIP_ALTCP 0
+#define MEMP_NUM_ALTCP_PCB 0
+#define LWIP_ALTCP_TLS 0
+#define LWIP_ALTCP_TLS_MBEDTLS 0
 
 // Note bug in lwip with LWIP_ALTCP and LWIP_DEBUG
 // https://savannah.nongnu.org/bugs/index.php?62159
