@@ -31,30 +31,6 @@ typedef struct {
 } MorseCode;
 
 /**
- * @brief   Blinks an LED to represent a given character in Morse code.
- *
- * @param   chr  The character to blink in Morse code.
- *
- * @details This function searches for the provided character in the
- *          `morseAlphabet` structure array to get its Morse code
- * representation. If found, it then blinks an LED in the pattern of dots and
- * dashes corresponding to the Morse code of the character. The LED blinks are
- *          separated by time intervals defined by constants such as
- * DOT_DURATION_MS, DASH_DURATION_MS, SYMBOL_GAP_MS, and CHARACTER_GAP_MS.
- *
- * @return  void
- */
-void blink_morse(char ch);
-
-/**
- * @brief Flashes the letter 'E' in Morse code to indicate an error.
- *
- * This function enters an infinite loop where it continuously flashes the
- * letter 'E' in Morse code.
- */
-void blink_error();
-
-/**
  * @brief Turns off the LED.
  *
  * This function turns off the LED by setting the appropriate GPIO pin to low.
