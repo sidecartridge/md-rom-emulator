@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.1.1 (2025-12-23) - bug fix release
+
+### Features
+- No new features.
+
+### Changes
+- No functional changes.
+
+### Fixes
+- Strange bug that caused memory corruption parsing the downloaded ROM list when the microfirmware is compiled in Release mode has been fixed. Now the build script forces Debug mode to avoid this issue. Memory leak issue or overoptimization by the compiler suspected.
+- Read the downloaded ROM list from the ROM folder set in the parameters, not from a hardcoded path (not the cause of the issue, but a good time to fix it).
+
+---
+
 ## v2.1.0 (2025-12-12) - release
 
 ### Features
