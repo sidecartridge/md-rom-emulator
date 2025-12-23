@@ -229,26 +229,6 @@ wifi_sta_conn_status_t network_wifiConnStatus(
 char* network_wifiConnStatusStr();
 
 /**
- * @brief Converts a numeric WiFi authentication code into a descriptive string.
- *
- * Facilitates understanding of the authentication mode used.
- *
- * @param connect_code Numeric authentication code.
- * @return Pointer to a string with the full authentication type description.
- */
-const char* network_getAuthTypeString(u_int16_t connect_code);
-
-/**
- * @brief Returns an abbreviated string for the WiFi authentication type.
- *
- * Useful when display area is limited.
- *
- * @param connect_code Numeric authentication code.
- * @return Pointer to a short string representing the authentication type.
- */
-const char* network_getAuthTypeStringShort(u_int16_t connect_code);
-
-/**
  * @brief Retrieves the current IP address assigned to the network interface.
  *
  * Returns the IP structure with the current address information.

@@ -110,47 +110,6 @@ void network_setPollingCallback(NetworkPollingCallback callback) {
   networkPollingCallback = callback;
 }
 
-// NOLINTBEGIN(readability-magic-numbers)
-const char *network_getAuthTypeString(u_int16_t connectCode) {
-  switch (connectCode) {
-    case 0:
-      return "OPEN";
-    case 1:
-    case 2:
-      return "WPA_TKIP_PSK";
-    case 3:
-    case 4:
-    case 5:
-      return "WPA2_AES_PSK";
-    case 6:
-    case 7:
-    case 8:
-      return "WPA2_MIXED_PSK";
-    default:
-      return "OPEN";
-  }
-}
-// NOLINTEND(readability-magic-numbers)
-
-// NOLINTBEGIN(readability-magic-numbers)
-const char *network_getAuthTypeStringShort(u_int16_t connectCode) {
-  switch (connectCode) {
-    case 1:
-    case 2:
-      return "WPA";
-    case 3:
-    case 4:
-    case 5:
-    case 6:
-    case 7:
-    case 8:
-      return "WPA2";
-    default:
-      return "OPEN";
-  }
-}
-// NOLINTEND(readability-magic-numbers)
-
 /**
  * @brief Initializes the CYW43 WiFi chip if it has not been initialized
  * already.
