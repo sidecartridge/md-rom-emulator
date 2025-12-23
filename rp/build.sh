@@ -83,10 +83,12 @@ mkdir build
 # And previously pushed to the repo version
 
 # Build the project
+# Build the project ALWAYS in Debug mode. In Release mode breaks.
+# Memory issues? Overoptimizations?
 echo "Building the project"
 cd build
-cmake ../src -DCMAKE_BUILD_TYPE=$BUILD_TYPE
-#cmake ../src -DCMAKE_BUILD_TYPE=MinSizeRel
+#cmake ../src -DCMAKE_BUILD_TYPE=$BUILD_TYPE
+cmake ../src -DCMAKE_BUILD_TYPE=Debug
 
 make -j4 
 
