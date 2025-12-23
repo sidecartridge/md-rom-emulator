@@ -1214,12 +1214,11 @@ void __not_in_flash_func(emul_start)() {
   // Exiting the loop means we are done with the setup/configuration mode and
   // we are ready to start the ROM emulation or the booster app.
 
-  select_coreWaitPushDisable();  // Disable the SELECT button
-
   // We must reset the computer
   if (getResetDevice()) {
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
     sleep_ms(SLEEP_LOOP_MS);
+
     // Reset the device
     reset_device();
   } else {
@@ -1232,6 +1231,7 @@ void __not_in_flash_func(emul_start)() {
     settings_save(aconfig_getContext(), true);
 
     sleep_ms(SLEEP_LOOP_MS);
+    select_coreWaitPushDisable();  // Disable the SELECT button
 
     // We must reset the computer
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
