@@ -650,7 +650,9 @@ void cmdCard(const char *arg) {
 }
 
 void cmdNetwork(const char *arg) {
-  readRomsCsv("/roms/roms.csv");
+  char csvPath[MAX_PATH_SIZE];
+  snprintf(csvPath, sizeof(csvPath), "%s/roms.csv", romsFolder);
+  readRomsCsv(csvPath);
   menuState.menuLevel = TERM_ROMS_MENU_BROWSE_NETWORK;
   currentRomPage = 0;
   navigatePages(currentRomPage);

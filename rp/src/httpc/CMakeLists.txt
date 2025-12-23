@@ -14,6 +14,12 @@ target_link_libraries(httpc
     pico_stdlib    # Core Pico SDK library
     pico_cyw43_arch_lwip_threadsafe_background 
     pico_lwip_http
-    pico_lwip_mbedtls
-    pico_mbedtls
 )
+
+# Link mbedtls only when HTTPS is enabled.
+if(APP_DOWNLOAD_HTTPS)
+    target_link_libraries(httpc
+        pico_lwip_mbedtls
+        pico_mbedtls
+    )
+endif()

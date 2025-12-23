@@ -118,15 +118,6 @@ void display_setupU8g2();
 void display_refresh();
 
 /**
- * @brief Draws product information on the display.
- *
- * Sets the appropriate font, composes a string with the product message,
- * release version, and copyright information, centers it using calculated left
- * padding, and renders the text.
- */
-void display_drawProductInfo();
-
-/**
  * @brief Generates a high-resolution mask table. Used to speed up high-res
  * upscaled display.
  *
