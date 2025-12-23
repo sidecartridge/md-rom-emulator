@@ -369,8 +369,6 @@ download_status_t download_getStatus() { return downloadStatus; }
 
 void download_setStatus(download_status_t status) { downloadStatus = status; }
 
-const char *download_getFilepath() { return filepath; }
-
 void download_setFilepath(const char *path) {
   strncpy(filepath, path, sizeof(filepath) - 1);
   filepath[sizeof(filepath) - 1] = '\0';

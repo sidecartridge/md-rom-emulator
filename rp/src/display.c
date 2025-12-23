@@ -160,18 +160,6 @@ void display_refresh() {
 #endif
 }
 
-void display_drawProductInfo() {
-  // Product info
-  char productStr[DISPLAY_MAX_CHARACTERS] = {0};
-  u8g2_SetFont(&u8g2, u8g2_font_squeezed_b7_tr);
-  snprintf(productStr, sizeof(productStr), "%s %s - %s", DISPLAY_PRODUCT_MSG,
-           RELEASE_VERSION, DISPLAY_COPYRIGHT_MESSAGE);
-  u8g2_DrawStr(
-      &u8g2,
-      LEFT_PADDING_FOR_CENTER(productStr, 68) * DISPLAY_NARROW_CHAR_WIDTH,
-      DISPLAY_HEIGHT, productStr);
-}
-
 void display_generateMaskTable(uint32_t memoryAddress) {
   for (int i = 0; i < DISPLAY_MASK_TABLE_SIZE; i++) {
     unsigned int mask = 0;

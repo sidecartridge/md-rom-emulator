@@ -130,16 +130,6 @@ download_status_t download_getStatus(void);
 void download_setStatus(download_status_t status);
 
 /**
- * @brief Retrieves the current file path used in the download process.
- *
- * This path may represent the temporary file or a user-defined URL for
- * downloading.
- *
- * @return A pointer to a null-terminated string with the current file path.
- */
-const char *download_getFilepath(void);
-
-/**
  * @brief Sets the file path for the download process.
  *
  * Copies the supplied path into internal storage ensuring proper
