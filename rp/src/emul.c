@@ -77,6 +77,8 @@ static bool resetDeviceAtBoot = true;
 
 // Do we have network or not?
 static bool hasNetwork = false;
+static bool wifiConnected = false;
+static bool catalogAvailable = false;
 
 // Delay/ripper mode?
 static bool delayMode = false;
@@ -197,12 +199,19 @@ static AutorunResult autorunIfRequested(void) {
     return AUTORUN_ERR_AUTORUN_NOT_FOUND;  // No autorun file or cannot open it
   }
 
-  char fileBuf[MAX_PATH_SIZE];
+  const size_t fileBufSize = MAX_PATH_SIZE;
+  char *fileBuf = malloc(fileBufSize);
+  if (fileBuf == NULL) {
+    DPRINTF("Error allocating memory for autorun file buffer\n");
+    f_close(&autorunFile);
+    return AUTORUN_ERR_AUTORUN_EMPTY;
+  }
   UINT bytesRead = 0;
-  res = f_read(&autorunFile, fileBuf, sizeof(fileBuf) - 1, &bytesRead);
+  res = f_read(&autorunFile, fileBuf, fileBufSize - 1, &bytesRead);
   f_close(&autorunFile);
   if (res != FR_OK || bytesRead == 0) {
     DPRINTF("Error reading autorun file or file is empty: %d\n", res);
+    free(fileBuf);
     return AUTORUN_ERR_AUTORUN_EMPTY;  // Autorun file empty or read error
   }
   fileBuf[bytesRead] = '\0';
@@ -221,6 +230,7 @@ static AutorunResult autorunIfRequested(void) {
 
   if (*filenameStart == '\0') {
     DPRINTF("Autorun file is empty after trimming whitespace\n");
+    free(fileBuf);
     return AUTORUN_ERR_AUTORUN_EMPTY;  // Empty filename
   }
 
@@ -235,6 +245,7 @@ static AutorunResult autorunIfRequested(void) {
   res = f_stat(romPath, &fno);
   if (res != FR_OK || (fno.fattrib & AM_DIR)) {
     DPRINTF("Autorun file not found or is a directory: %s\n", romPath);
+    free(fileBuf);
     return AUTORUN_ERR_ROM_NOT_FOUND;  // ROM file not found or is a directory
   }
 
@@ -243,8 +254,10 @@ static AutorunResult autorunIfRequested(void) {
   res = storeFileToFlash(romPath, flashAddress);
   if (res != FR_OK) {
     DPRINTF("Failed to store autorun ROM to flash: %d\n", res);
+    free(fileBuf);
     return AUTORUN_ERR_FLASH_STORE;  // Failed to store ROM in flash
   }
+  free(fileBuf);
 
   // Update settings to boot directly into this ROM
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
@@ -398,37 +411,51 @@ static void readRomsSdcard(const char *folder) {
 static void readRomsCsv(const char *csvFilepath) {
   FRESULT res;
   FIL csvFile;
-  char line[256];  // If you really have huge CSV lines, make this larger, but
-                   // 256 is often enough.
+  const size_t lineSize = 256;
+  char *line = malloc(lineSize);  // If you really have huge CSV lines, make
+                                  // this larger, but 256 is often enough.
   int lineNum = 0;
+  // Reduce stack usage: keep field buffers in static storage.
+  static char field1[MAX_PATH_SIZE];  // URL
+  static char field2[MAX_PATH_SIZE];  // Name
+  static char field3[MAX_PATH_SIZE];  // Description (tune this)
+  static char field4[MAX_PATH_SIZE];  // Tags (tune this)
+  static char field5[12];             // Size (KB) (should never be big)
 
   romsCount = 0;
+
+  if (line == NULL) {
+    DPRINTF("Error allocating memory for CSV line buffer\n");
+    return;
+  }
 
   res = f_open(&csvFile, csvFilepath, FA_READ);
   if (res != FR_OK) {
     DPRINTF("Error opening CSV file %s: %d\n", csvFilepath, res);
+    free(line);
     return;
   }
 
   // Skip header
-  if (f_gets(line, sizeof(line), &csvFile) == NULL) {
+  if (f_gets(line, lineSize, &csvFile) == NULL) {
     DPRINTF("Error reading header from CSV file\n");
     f_close(&csvFile);
+    free(line);
     return;
   }
 
-  while (f_gets(line, sizeof(line), &csvFile) != NULL) {
+  while (f_gets(line, lineSize, &csvFile) != NULL) {
     lineNum++;
     DPRINTF("Line %d: %s", lineNum, line);
 
     if (line[0] == '\0' || line[0] == '\n') continue;
 
     // These should be as small as possible!
-    char field1[MAX_PATH_SIZE] = {0};  // URL
-    char field2[MAX_PATH_SIZE] = {0};  // Name
-    char field3[MAX_PATH_SIZE] = {0};  // Description (tune this)
-    char field4[MAX_PATH_SIZE] = {0};  // Tags (tune this)
-    char field5[12] = {0};             // Size (KB) (should never be big)
+    memset(field1, 0, sizeof(field1));
+    memset(field2, 0, sizeof(field2));
+    memset(field3, 0, sizeof(field3));
+    memset(field4, 0, sizeof(field4));
+    memset(field5, 0, sizeof(field5));
 
     char *ptr = line;
     int jdx;
@@ -477,6 +504,7 @@ static void readRomsCsv(const char *csvFilepath) {
   next_line:;
   }
   f_close(&csvFile);
+  free(line);
 
   qsort(roms, romsCount, sizeof(ROM), compareRoms);
 
@@ -509,16 +537,21 @@ static void displayRomsPage(const ROM roms[], int romsCount, int pageSize,
     endIndex = romsCount;
   }
 
-  char buff[TERM_SCREEN_SIZE_X];
+  const size_t buffSize = TERM_SCREEN_SIZE_X;
+  char *buff = malloc(buffSize);
+  if (buff == NULL) {
+    DPRINTF("Error allocating memory for display buffer\n");
+    return;
+  }
   // Page starts at 1 for user display.
-  snprintf(buff, sizeof(buff), "Page %d, ROMs %d to %d of %d:\n\n",
-           pageNumber + 1, startIndex + 1, endIndex, romsCount);
+  snprintf(buff, buffSize, "Page %d, ROMs %d to %d of %d:\n\n", pageNumber + 1,
+           startIndex + 1, endIndex, romsCount);
   term_printString(buff);
 
   for (int i = startIndex; i < endIndex; i++) {
     // ROMs starts at 1 for user display.
-    snprintf(buff, sizeof(buff), "%d. %s\n", i + 1, roms[i].name);
-    if (strlen(buff) >= (TERM_SCREEN_SIZE_X - 2)) {
+    snprintf(buff, buffSize, "%d. %s\n", i + 1, roms[i].name);
+    if (strlen(buff) >= (buffSize - 2)) {
       if (buff[strlen(buff) - 2] != '\n') {
         buff[strlen(buff) - 2] = '\n';
         buff[strlen(buff) - 1] = '\0';
@@ -526,6 +559,7 @@ static void displayRomsPage(const ROM roms[], int romsCount, int pageSize,
     }
     term_printString(buff);
   }
+  free(buff);
 
   currentRomPage = pageNumber;
 }
@@ -557,7 +591,9 @@ static void menu(void) {
   showTitle();
   term_printString("\n\n");
   term_printString("[B] Browse ROMs in microSD card\n");
-  term_printString("[D] Download ROMs from internet server\n");
+  if (hasNetwork && catalogAvailable) {
+    term_printString("[D] Download ROMs from internet server\n");
+  }
   term_printString("[S] Settings\n\n");
   term_printString("[E] Exit to desktop\n");
   term_printString("[X] Return to booster menu\n\n");
@@ -587,7 +623,7 @@ static void menu(void) {
   term_printString("Network status: ");
   ip_addr_t currentIp = network_getCurrentIp();
 
-  hasNetwork = currentIp.addr != 0;
+  hasNetwork = wifiConnected || (currentIp.addr != 0);
   if (hasNetwork) {
     term_printString("Connected\n");
   } else {
@@ -650,6 +686,10 @@ void cmdCard(const char *arg) {
 }
 
 void cmdNetwork(const char *arg) {
+  if (!catalogAvailable || network_getCurrentIp().addr == 0) {
+    term_printString("Network catalog not available.\n");
+    return;
+  }
   char csvPath[MAX_PATH_SIZE];
   snprintf(csvPath, sizeof(csvPath), "%s/roms.csv", romsFolder);
   readRomsCsv(csvPath);
@@ -1078,6 +1118,7 @@ void __not_in_flash_func(emul_start)() {
   SettingsConfigEntry *wifiMode =
       settings_find_entry(gconfig_getContext(), PARAM_WIFI_MODE);
   wifi_mode_t wifiModeValue = WIFI_MODE_STA;
+  wifiConnected = false;
   if (wifiMode == NULL) {
     DPRINTF("No WiFi mode found in the settings. No initializing.\n");
   } else {
@@ -1110,6 +1151,8 @@ void __not_in_flash_func(emul_start)() {
           DPRINTF("Timeout connecting to the WiFi network after %d attempts\n",
                   maxAttempts);
           // Optionally, return an error code here.
+        } else if (err == 0) {
+          wifiConnected = true;
         }
         network_setPollingCallback(NULL);
       }
@@ -1135,19 +1178,49 @@ void __not_in_flash_func(emul_start)() {
   SettingsConfigEntry *catalog =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_HTTP_CATALOG);
 #endif
-  if (catalog == NULL) {
+  if (!wifiConnected) {
+    DPRINTF("WiFi not connected. Skipping catalog download.\n");
+    catalogAvailable = false;
+  } else if (catalog == NULL) {
     DPRINTF("No catalog URL found in the settings. No initializing.\n");
+    catalogAvailable = false;
   } else {
     catalogUrl = catalog->value;
     DPRINTF("Catalog URL: %s\n", catalogUrl);
     download_setFilepath(catalogUrl);
-    download_start();
+    download_err_t err = download_start();
+    if (err != DOWNLOAD_OK) {
+      DPRINTF("Error starting catalog download: %d\n", err);
+      catalogAvailable = false;
+    } else {
+      DPRINTF("Waiting for catalog download to complete...\n");
+      while (true) {
+        download_status_t status = download_getStatus();
+        if (status == DOWNLOAD_STATUS_COMPLETED) {
+          download_finish();
+          download_confirm();
+          download_setStatus(DOWNLOAD_STATUS_IDLE);
+          catalogAvailable = true;
+          break;
+        }
+        if (status == DOWNLOAD_STATUS_FAILED) {
+          DPRINTF("Catalog download failed.\n");
+          download_finish();
+          download_setStatus(DOWNLOAD_STATUS_IDLE);
+          catalogAvailable = false;
+          break;
+        }
+        download_poll();
+      }
+    }
   }
 
   // 9. Now complete the terminal emulator initialization
   // The terminal emulator is used to interact with the user to configure the
   // device.
   init(romsFolderName);
+
+  menu();
 
   // 10. Start the main loop
   // The main loop is the core of the app. It is responsible for running the
