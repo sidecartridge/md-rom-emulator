@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.1.2 (2026-01-22) - bug fix release
+
+### Features
+- No new features.
+
+### Changes
+- Added `AGENTS.md` with guidance for LLM agents working in this repo.
+- RP build now forces `MinSizeRel` to reduce memory pressure.
+
+### Fixes
+- Reduced stack usage by avoiding large stack allocations in ROM catalog parsing.
+
+---
+
 ## v2.1.1 (2025-12-23) - bug fix release
 
 ### Features
@@ -11,6 +25,7 @@
 ### Fixes
 - Strange bug that caused memory corruption while parsing the downloaded ROM list when the microfirmware is compiled in Release mode has been fixed. Now the build script forces Debug mode to avoid this issue. Root cause is suspected memory corruption, possibly due to over-optimization by the compiler.
 - Read the downloaded ROM list from the ROM folder set in the parameters, not from a hardcoded path (not the cause of the issue, but a good time to fix it).
+- Improved boot after reset and booster launch by disabling the killing of core 1 until after the flash settings have been saved. This prevents random hangs during boot.
 
 ---
 
