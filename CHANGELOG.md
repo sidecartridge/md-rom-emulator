@@ -1,5 +1,19 @@
 # Changelog
 
+## v2.1.2 (2026-01-22) - bug fix release
+
+### Features
+- No new features.
+
+### Changes
+- Added `AGENTS.md` with guidance for LLM agents working in this repo.
+- RP build now forces `MinSizeRel` to reduce memory pressure.
+
+### Fixes
+- Reduced stack usage by avoiding large stack allocations in ROM catalog parsing.
+
+---
+
 ## v2.1.1 (2025-12-23) - bug fix release
 
 ### Features
