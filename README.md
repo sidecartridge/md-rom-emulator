@@ -2,6 +2,8 @@
 
 This is a microfirmware app for the SidecarTridge Multi-device that emulates the cartridge ROM of a Atari ST/STE/Mega ST/Mega STE computer. 
 
+> 🛒 **Get the hardware:** [SidecarTridge Multi-device](https://sidecartridge.com/products/sidecartridge-multidevice-atari-st/)
+
 ## 🚀 Installation
 
 To install the ROM Emulator app on your SidecarTridge Multi-device:
