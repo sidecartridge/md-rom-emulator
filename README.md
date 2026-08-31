@@ -1,4 +1,14 @@
+<div align="center">
+
+<img src="icon.png" alt="ROM Emulator" width="180" />
+
 # SidecarTridge Multi-device ROM Emulator app
+
+[![Build](https://github.com/sidecartridge/md-rom-emulator/actions/workflows/build.yml/badge.svg)](https://github.com/sidecartridge/md-rom-emulator/actions/workflows/build.yml)
+[![Release](https://github.com/sidecartridge/md-rom-emulator/actions/workflows/release.yml/badge.svg)](https://github.com/sidecartridge/md-rom-emulator/actions/workflows/release.yml)
+[![License: GPL v3](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE)
+
+</div>
 
 This is a microfirmware app for the SidecarTridge Multi-device that emulates the cartridge ROM of a Atari ST/STE/Mega ST/Mega STE computer. 
 
@@ -13,8 +23,6 @@ To install the ROM Emulator app on your SidecarTridge Multi-device:
 3. In the **Apps** tab, select **"ROM Emulator"** from the list of available apps.
 4. Click **"Download"** to install the app to your SidecarTridge’s microSD card.
 5. Once installed, select the app and click **"Launch"** to activate it.
-
-> **⚠️ WARNING:** Booster Loader is currently in **alpha**. Use at your own risk.
 
 After launching, the app will automatically run every time your Atari computer is powered on.
 
