@@ -1,0 +1,4 @@
+-std=c11
+-Ishim
+-isystem
+../../rp/src/include
