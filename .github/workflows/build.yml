@@ -30,8 +30,8 @@ jobs:
       matrix:
         build_type: [release, debug]
         # 1 builds HTTPS downloads in (APP_DOWNLOAD_HTTPS). HTTP only until the
-        # app takes the template's download.c: this app's HTTPS path does not
-        # compile yet.
+        # HTTPS profile fits in RAM: it compiles, and the link stops 28,876
+        # bytes over (release).
         https: [0]
     steps:
     - name: Checkout the code

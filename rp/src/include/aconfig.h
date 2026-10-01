@@ -1,8 +1,8 @@
 /**
  * File: aconfig.h
  * Author: Diego Parrilla Santamaría
- * Date: February 2025
- * Copyright: 2025 - GOODDATA LABS SL
+ * Date: February 2025, February 2026
+ * Copyright: 2025-2026 - GOODDATA LABS SL
  * Description: Header file for the app configuration manager
  */
 
@@ -13,9 +13,10 @@
 #include "debug.h"
 #include "settings.h"
 
-#define ACONFIG_PARAM_ROMS_FOLDER "FOLDER"
+#define ACONFIG_PARAM_FOLDER "FOLDER"
+#define ACONFIG_PARAM_MODE "MODE"
+// The ROM Emulator's own settings, with v2.1.2's keys and values.
 #define ACONFIG_PARAM_ROM_SELECTED "EMULATED"
-#define ACONFIG_PARAM_ROM_MODE "MODE"
 #define ACONFIG_PARAM_ROM_HTTP_CATALOG "HTTP_CATALOG"
 #define ACONFIG_PARAM_ROM_HTTPS_CATALOG "HTTPS_CATALOG"
 

@@ -1,15 +1,20 @@
 #include "include/aconfig.h"
 
 // We don't have any variables because this is the placeholder app
+// Never remove an entry from this table, and add new ones only at the end. The
+// loader reads only as many stored entries as there are defaults, so one
+// default fewer silently drops the last setting a user saved. To retire a
+// setting, leave its entry here and stop reading it.
 static SettingsConfigEntry defaultEntries[] = {
+    // v2.1.2's entries, in v2.1.2's order.
     {ACONFIG_PARAM_ROM_SELECTED, SETTINGS_TYPE_STRING, ""},
-    {ACONFIG_PARAM_ROMS_FOLDER, SETTINGS_TYPE_STRING, "/roms"},
+    {ACONFIG_PARAM_FOLDER, SETTINGS_TYPE_STRING, "/roms"},
     {ACONFIG_PARAM_ROM_HTTP_CATALOG, SETTINGS_TYPE_STRING,
      "http://roms.sidecartridge.com/roms.csv"},
     {ACONFIG_PARAM_ROM_HTTPS_CATALOG, SETTINGS_TYPE_STRING,
      "https://roms.sidecartridge.com/roms.csv"},
-    {ACONFIG_PARAM_ROM_MODE, SETTINGS_TYPE_INT,
-     "255"},  // 0: ROM, 1: DELAY-ROM, 255: MENU
+    {ACONFIG_PARAM_MODE, SETTINGS_TYPE_INT,
+     "255"},  // 0: ROM, 1: Delay/Ripper, 255: setup menu
 };
 
 // Create a global context for our settings

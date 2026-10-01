@@ -1,15 +1,50 @@
 /**
  * File: emul.c
  * Author: Diego Parrilla Santamaría
- * Date: February 2025
- * Copyright: 2025 - GOODDATA LABS
- * Description: Code for the ROM emulator core and setup features
+ * Date: February 2025, October 2026
+ * Copyright: 2025-2026 - GOODDATA LABS
+ * Description: The ROM Emulator: its setup menu, on the template's bring-up
+ *              order and polling rules, and its ROM mode, which serves a ROM
+ *              from both cartridge banks.
  */
 
 #include "emul.h"
 
-// inclusw in the C file to avoid multiple definitions
+#include <ctype.h>
+#include <stdint.h>
+
+// included in the C file to avoid multiple definitions
+#include "aconfig.h"
+#include "chandler.h"
+#include "commemul.h"
+#include "constants.h"
+#include "debug.h"
+#include "devdownload.h"  // Debug-only test download, driven over SWD
+#include "devhooks.h"     // Debug-only SWD mailbox; include in this file only
+#include "display.h"
+#include "ff.h"
+#include "gconfig.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "memfunc.h"
+#include "network.h"
+#include "pico/stdlib.h"
+#include "reset.h"
+#include "romemul.h"
+#include "sdcard.h"
+#include "select.h"
 #include "target_firmware.h"  // Include the target firmware binary
+#include "term.h"
+
+// How long a sentinel command the ST must act on before this side moves on
+// is held. The ST reads the sentinel once per pass of its menu loop (measured
+// on an ST: within 42 ms); the hold is well over that.
+#define SENTINEL_HOLD_MS 500
+
+// The largest file ROM_TEMP takes: two 64 KB banks, plus the 4 zero bytes a
+// STEEM cartridge image starts with.
+#define ROM_FILE_MAX_BYTES (ROM_SIZE_BYTES * ROM_BANKS)
+#define ROM_FILE_STEEM_HEADER_BYTES 4
 
 // Command handlers
 static void cmdMenu(const char *arg);
@@ -24,6 +59,9 @@ static void cmdLaunch(const char *arg);
 static void cmdBooster(const char *arg);
 static void cmdDelay(const char *arg);
 static void cmdUnknown(const char *arg);
+#if defined(_DEBUG) && (_DEBUG != 0)
+static void cmdFirmware(const char *arg);
+#endif
 
 // Command table
 static const Command commands[] = {
@@ -47,6 +85,11 @@ static const Command commands[] = {
     {"put_int", term_cmdPutInt},
     {"put_bool", term_cmdPutBool},
     {"put_str", term_cmdPutString},
+#if defined(_DEBUG) && (_DEBUG != 0)
+    // Debug builds only, and not in the menu: hands the ST to userfw.s, where
+    // tools/dev/st_harness.py puts its command-path tests (sttest.s).
+    {"f", cmdFirmware},
+#endif
     {"", cmdUnknown},
 };
 
@@ -82,6 +125,64 @@ static bool catalogAvailable = false;
 
 // Delay/ripper mode?
 static bool delayMode = false;
+// A ROM download from the catalog is running: romDownloadPoll() finishes it.
+static bool romDownloadActive = false;
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Heap held on request by `swd.py app heap_hold`, to test running out of it.
+typedef struct DevhooksHeldBlock {
+  struct DevhooksHeldBlock *next;
+} DevhooksHeldBlock;
+static DevhooksHeldBlock *devhooksHeldHeap = NULL;
+
+// App commands sent over SWD by tools/dev/swd.py (see emul.h).
+static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
+                                 uint16_t payloadSize) {
+  switch (commandId) {
+    case DEVHOOKS_APP_HEAP_HOLD: {
+      uint32_t kb = (payloadSize >= 2u) ? payload[0] : 0u;
+      if (kb == 0u) {
+        while (devhooksHeldHeap != NULL) {
+          DevhooksHeldBlock *next = devhooksHeldHeap->next;
+          free(devhooksHeldHeap);
+          devhooksHeldHeap = next;
+        }
+        DPRINTF("devhooks: heap hold released\n");
+        return 1;
+      }
+      DevhooksHeldBlock *block = malloc(sizeof(DevhooksHeldBlock) + kb * 1024u);
+      if (block != NULL) {
+        block->next = devhooksHeldHeap;
+        devhooksHeldHeap = block;
+      }
+      DPRINTF("devhooks: holding %lu KB more heap: %s\n", (unsigned long)kb,
+              (block != NULL) ? "ok" : "refused");
+      return (block != NULL) ? 1u : 0u;
+    }
+    case DEVHOOKS_APP_DOWNLOAD:
+      return devdownload_start();
+    default:
+      return 0;
+  }
+}
+#endif
+
+// Keep answering the ST for ms milliseconds, so a command in flight is not
+// left without its answer while a sentinel command waits to be seen.
+static void emul_serviceFor(uint32_t ms) {
+  absolute_time_t until = make_timeout_time_ms(ms);
+  while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
+    chandler_loop();
+  }
+}
+
+// What every long wait runs, so the ST's commands are answered and SELECT is
+// seen meanwhile.
+static void __not_in_flash_func(emul_pollTick)(void) {
+  chandler_loop();
+  term_loop();
+  select_poll();
+}
 
 static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
   FIL file;
@@ -106,6 +207,16 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
   // Get file size (use FSIZE_t for portability)
   size = f_size(&file);
   DPRINTF("File size: %u bytes\n", (unsigned int)size);
+
+  // ROM_TEMP holds two banks, and Booster's flash starts right after it: a
+  // larger file is refused before anything is erased.
+  if (size > ROM_FILE_MAX_BYTES + ROM_FILE_STEEM_HEADER_BYTES) {
+    DPRINTF("File too large: %u bytes, the limit is %u\n", (unsigned int)size,
+            (unsigned int)ROM_FILE_MAX_BYTES);
+    f_close(&file);
+    free(buffer);
+    return FR_INVALID_PARAMETER;
+  }
 
   // If the file size is a multiple of FLASH_SECTOR_SIZE plus 4 bytes, check for
   // 4-byte padding.
@@ -135,12 +246,23 @@ static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
       }
     }
   }
+  FSIZE_t romBytes = size - f_tell(&file);
+  if (romBytes > ROM_FILE_MAX_BYTES) {
+    DPRINTF("File too large: %u bytes after its header, the limit is %u\n",
+            (unsigned int)romBytes, (unsigned int)ROM_FILE_MAX_BYTES);
+    f_close(&file);
+    free(buffer);
+    return FR_INVALID_PARAMETER;
+  }
 
   // Calculate the flash programming offset relative to XIP_BASE.
   uint32_t offset = flashAddress - XIP_BASE;
 
   // Read and program the file in FLASH_SECTOR_SIZE chunks.
   while (1) {
+    // The ST keeps its answers and SELECT is seen between chunks.
+    emul_pollTick();
+
     // Read a chunk of data from the file.
     DPRINTF("Reading %u bytes from file at offset 0x%X\n", FLASH_SECTOR_SIZE,
             offset);
@@ -257,12 +379,12 @@ static AutorunResult autorunIfRequested(void) {
     free(fileBuf);
     return AUTORUN_ERR_FLASH_STORE;  // Failed to store ROM in flash
   }
-  free(fileBuf);
 
   // Update settings to boot directly into this ROM
   settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
                       filenameStart);
-  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_ROM_MODE,
+  free(fileBuf);
+  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
                        ROM_MODE_DIRECT);
   settings_save(aconfig_getContext(), true);
 
@@ -344,6 +466,31 @@ static void urlDecode(const char *src, char *dest, size_t destSize) {
   dest[idx] = '\0';
 }
 
+// Percent-encode a path for a request line: everything but RFC 3986's
+// unreserved characters and '/'. The catalog's names are decoded for the
+// screen and the card ("Buggy Boy.img"); the request needs them encoded.
+static void urlEncodePath(const char *src, char *dest, size_t destSize) {
+  static const char hexDigits[] = "0123456789ABCDEF";
+  size_t idx = 0;
+  for (; *src != '\0'; src++) {
+    unsigned char chr = (unsigned char)*src;
+    bool plain = (isalnum(chr) != 0) || chr == '-' || chr == '_' ||
+                 chr == '.' || chr == '~' || chr == '/';
+    size_t need = plain ? 1U : 3U;
+    if (idx + need >= destSize) {
+      break;
+    }
+    if (plain) {
+      dest[idx++] = (char)chr;
+    } else {
+      dest[idx++] = '%';
+      dest[idx++] = hexDigits[chr / HEX_BASE];
+      dest[idx++] = hexDigits[chr % HEX_BASE];
+    }
+  }
+  dest[idx] = '\0';
+}
+
 static void readRomsSdcard(const char *folder) {
   FRESULT res;
   DIR dir;
@@ -361,6 +508,8 @@ static void readRomsSdcard(const char *folder) {
 
   // Read each directory entry.
   for (;;) {
+    // A large folder takes a while: keep answering the ST.
+    emul_pollTick();
     res = f_readdir(&dir, &fno);
     if (res != FR_OK || fno.fname[0] == 0) {
       break;  // Break on error or end of directory
@@ -388,10 +537,6 @@ static void readRomsSdcard(const char *folder) {
       roms[romsCount].filename[MAX_FILENAME_LENGTH - 1] = '\0';
       strncpy(roms[romsCount].name, fno.fname, MAX_FILENAME_LENGTH - 1);
       roms[romsCount].name[MAX_FILENAME_LENGTH - 1] = '\0';
-      roms[romsCount].path[0] = '\0';
-      strncat(roms[romsCount].path, folder, MAX_PATH_SIZE - 1);
-      strncat(roms[romsCount].path, "/", MAX_PATH_SIZE - 1);
-      strncat(roms[romsCount].path, fno.fname, MAX_PATH_SIZE - 1);
       romsCount++;
     } else {
       DPRINTF("Maximum ROM count reached (%d)\n", MAX_ROMS);
@@ -485,12 +630,6 @@ static void readRomsCsv(const char *csvFilepath) {
       ROM *r = &roms[romsCount];
 
       urlDecode(field1, r->filename, sizeof(r->filename));
-      // Compose path
-      const char *romsFolder =
-          settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROMS_FOLDER)
-              ->value;
-      snprintf(r->path, sizeof(r->path), "%s/%s", romsFolder, r->filename);
-
       urlDecode(field2, r->name, sizeof(r->name));
       urlDecode(field3, r->description, sizeof(r->description));
       urlDecode(field4, r->tags, sizeof(r->tags));
@@ -588,6 +727,10 @@ static void showTitle() {
 
 static void menu(void) {
   menuState.menuLevel = TERM_ROMS_MENU_MAIN;
+  // Before [D] is offered: v2.1.2 set this only while drawing the status line
+  // below, and showed [D] because it drew the menu twice at boot.
+  ip_addr_t currentIp = network_getCurrentIp();
+  hasNetwork = wifiConnected || (currentIp.addr != 0);
   showTitle();
   term_printString("\n\n");
   term_printString("[B] Browse ROMs in microSD card\n");
@@ -621,9 +764,6 @@ static void menu(void) {
 
   // Display network status
   term_printString("Network status: ");
-  ip_addr_t currentIp = network_getCurrentIp();
-
-  hasNetwork = wifiConnected || (currentIp.addr != 0);
   if (hasNetwork) {
     term_printString("Connected\n");
   } else {
@@ -669,7 +809,20 @@ void cmdExit(const char *arg) {
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
 }
 
+// The ROM list is allocated once, when the menu starts; without it neither
+// list can be shown.
+static bool romsAvailable(void) {
+  if (roms == NULL) {
+    term_printString("Not enough memory for the ROM list.\n");
+    return false;
+  }
+  return true;
+}
+
 void cmdCard(const char *arg) {
+  if (!romsAvailable()) {
+    return;
+  }
   readRomsSdcard(romsFolder);
   menuState.menuLevel = TERM_ROMS_MENU_BROWSE_SD;
 
@@ -688,6 +841,9 @@ void cmdCard(const char *arg) {
 void cmdNetwork(const char *arg) {
   if (!catalogAvailable || network_getCurrentIp().addr == 0) {
     term_printString("Network catalog not available.\n");
+    return;
+  }
+  if (!romsAvailable()) {
     return;
   }
   char csvPath[MAX_PATH_SIZE];
@@ -723,7 +879,7 @@ void cmdLaunch(const char *arg) {
     } else {
       // Now we can set the ROM emulation mode here
       // Set the ROM emulation mode to 0 (ROM no delay)
-      settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_ROM_MODE,
+      settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
                            delayMode ? ROM_MODE_DELAY : ROM_MODE_DIRECT);
       settings_save(aconfig_getContext(), true);
 
@@ -806,22 +962,29 @@ void cmdUnknown(const char *arg) {
                             "");
         settings_save(aconfig_getContext(), true);
 
-        // Create full path to download the file
-        char fullPath[MAX_PATH_SIZE];
-        snprintf(fullPath, MAX_PATH_SIZE, "%s/%s", romsFolder,
-                 roms[downloadRomSelected].filename);
-        DPRINTF("Downloading ROM: %s\n", fullPath);
-        download_url_components_t components = {};
-        char url[MAX_PATH_SIZE * 2];
-        snprintf(url, sizeof(url), "%s://%s/%s",
-                 download_getUrlComponents()->protocol,
-                 download_getUrlComponents()->host,
-                 roms[downloadRomSelected].filename);
+        // The ROM is fetched from the catalog's own host, at the root.
+        const download_url_components_t *catalogUrl =
+            download_getUrlComponents();
+        char encoded[MAX_PATH_SIZE * 3];
+        urlEncodePath(roms[downloadRomSelected].filename, encoded,
+                      sizeof(encoded));
+        char url[DOWNLOAD_URL_SIZE];
+        if (catalogUrl->port != 0) {
+          snprintf(url, sizeof(url), "%s://%s:%u/%s", catalogUrl->protocol,
+                   catalogUrl->host, (unsigned)catalogUrl->port, encoded);
+        } else {
+          snprintf(url, sizeof(url), "%s://%s/%s", catalogUrl->protocol,
+                   catalogUrl->host, encoded);
+        }
+        DPRINTF("Downloading ROM: %s/%s\n", romsFolder,
+                roms[downloadRomSelected].filename);
         DPRINTF("URL: %s\n", url);
         download_setFilepath(url);
         download_err_t err = download_start();
         if (err != DOWNLOAD_OK) {
           DPRINTF("Error starting download: %d\n", err);
+        } else {
+          romDownloadActive = true;
         }
         menuState.menuLevel = TERM_ROMS_MENU_MAIN;
         menu();
@@ -846,6 +1009,21 @@ void cmdBooster(const char *arg) {
   resetDeviceAtBoot = false;  // Jump to the booster app
   keepActive = false;         // Exit the active loop
 }
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+static void cmdFirmware(const char *arg) {
+  if (!chandler_stPresent()) {
+    // The user firmware relies on what the ST publishes at boot (the machine
+    // type, for a Mega STE's cache), and this RP has not heard it yet.
+    term_printString("\nReset the Atari ST first.\n");
+    return;
+  }
+  term_printString("Launching user firmware on the Atari ST...\n");
+  // The ST's check_commands polls the sentinel and jumps to USERFW on
+  // CMD_START. The release cartridge's userfw.s returns to TOS.
+  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_START);
+}
+#endif
 
 void cmdDelay(const char *arg) {
   // Change the ROM mode
@@ -901,6 +1079,36 @@ static void romDownloadUpdate() {
   }
 }
 
+// One step of a download the user started from the catalog: poll it while it
+// runs, then keep the file and select it, or drop it. Downloads started
+// elsewhere (the devdownload hook) are their starter's to finish.
+static void romDownloadPoll(void) {
+  if (!romDownloadActive) {
+    return;
+  }
+  download_status_t status = download_getStatus();
+  if (status == DOWNLOAD_STATUS_STARTED ||
+      status == DOWNLOAD_STATUS_IN_PROGRESS) {
+    download_poll();
+    return;
+  }
+  if (status != DOWNLOAD_STATUS_COMPLETED &&
+      status != DOWNLOAD_STATUS_FAILED) {
+    return;
+  }
+  romDownloadActive = false;
+  download_err_t err = download_finish();
+  if (err == DOWNLOAD_OK) {
+    err = download_confirm();
+  }
+  download_setStatus(DOWNLOAD_STATUS_IDLE);
+  if (err != DOWNLOAD_OK) {
+    DPRINTF("ROM download failed: %d\n", err);
+    return;
+  }
+  romDownloadUpdate();
+}
+
 static void init(const char *folder) {
   // Store the ROMs folder, if not NULL or empty
   if (folder != NULL && strlen(folder) > 0) {
@@ -916,187 +1124,147 @@ static void init(const char *folder) {
   // Display the menu
   menu();
 
-  // Example 1: Move the cursor up one line.
-  // VT52 sequence: ESC A (moves cursor up)
-  // The escape sequence "\x1BA" will move the cursor up one line.
-  // term_printString("\x1B" "A");
-  // After moving up, print text that overwrites part of the previous line.
-  // term_printString("Line 2 (modified by ESC A)\n");
-
-  // Example 2: Move the cursor right one character.
-  // VT52 sequence: ESC C (moves cursor right)
-  // term_printString("\x1B" "C");
-  // term_printString(" <-- Moved right with ESC C\n");
-
-  // Example 3: Direct cursor addressing.
-  // VT52 direct addressing uses ESC Y <row> <col>, where:
-  //   row_char = row + 0x20, col_char = col + 0x20.
-  // For instance, to move the cursor to row 0, column 10:
-  //   row: 0 -> 0x20 (' ')
-  //   col: 10 -> 0x20 + 10 = 0x2A ('*')
-  // term_printString("\x1B" "Y" "\x20" "\x2A");
-  // term_printString("Text at row 0, column 10 via ESC Y\n");
-
-  // term_printString("\x1B" "Y" "\x2A" "\x20");
-
   display_refresh();
 }
 
-void __not_in_flash_func(emul_start)() {
-  // The anatomy of an app or microfirmware is as follows:
-  // - The driver code running in the remote device (the computer)
-  // - the driver code running in the host device (the rp2040/rp2350)
-  //
-  // The driver code running in the remote device is responsible for:
-  // 1. Perform the emulation of the device (ex: a ROM cartridge)
-  // 2. Handle the communication with the host device
-  // 3. Handle the configuration of the driver (ex: the ROM file to load)
-  // 4. Handle the communication with the user (ex: the terminal)
-  //
-  // The driver code running in the host device is responsible for:
-  // 1. Handle the communication with the remote device
-  // 2. Handle the configuration of the driver (ex: the ROM file to load)
-  // 3. Handle the communication with the user (ex: the terminal)
-  //
-  // Hence, we effectively have two drivers running in two different devices
-  // with different architectures and capabilities.
-  //
-  // Please read the documentation to learn to use the communication protocol
-  // between the two devices in the tprotocol.h file.
-  //
+// ROM mode: SELECT, polled on core 0. A short press either starts the ROM
+// (in the Delay wait) or ends ROM mode; a 10 s press is the factory reset.
+static volatile bool selectPressed = false;
+static void romModeSelectPressed(void) { selectPressed = true; }
 
-  // 1. Check if the host device must be initialized to perform the emulation
-  //    of the device, or start in setup/configuration mode
+static void __not_in_flash_func(romModeWaitForSelect)(void) {
+  selectPressed = false;
+  while (!selectPressed) {
+    select_poll();
+    sleep_ms(1);
+  }
+}
+
+static void romMode(int appModeValue) {
+  select_configure();
+  select_setResetCallback(romModeSelectPressed);
+  select_setLongResetCallback(reset_deviceAndEraseFlash);
+
+  if (appModeValue == ROM_MODE_DELAY) {
+    // Delay/Ripper mode: the ST boots without the cartridge, as the old
+    // ripper cartridges worked, until SELECT is pressed.
+    DPRINTF("Delay mode: waiting for SELECT to start the ROM\n");
+    romModeWaitForSelect();
+  }
+
+  // Copy the ROM in the flash to RAM, both banks
+  DPRINTF("Copy the ROM firmware to RAM: 0x%X, length: %u bytes\n",
+          (unsigned int)&_rom_temp_start, ROM_SIZE_BYTES * ROM_BANKS);
+  COPY_FIRMWARE_TO_RAM((uint16_t *)&_rom_temp_start,
+                       ROM_SIZE_WORDS * ROM_BANKS);
+  if (init_romemul_two_banks(false) < 0) {
+    panic("init_romemul_two_banks failed: PIO/DMA claim returned <0");
+  }
+
+#ifdef BLINK_H
+  blink_on();
+#endif
+
+  DPRINTF("ROM emulation mode started. Waiting for SELECT button\n");
+  romModeWaitForSelect();
+  DPRINTF("SELECT button pressed: back to the setup menu\n");
+
+  // Set the ROM emulation mode to 255 (setup menu)
+  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
+                       ROM_MODE_SETUP);
+  settings_save(aconfig_getContext(), true);
+
+#ifdef BLINK_H
+  blink_off();
+#endif
+
+  // Now reset the device
+  reset_device();
+}
+
+void emul_start() {
+  // 1. ROM mode or setup mode, from the settings
   SettingsConfigEntry *appMode =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_MODE);
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_MODE);
   int appModeValue = ROM_MODE_SETUP;  // Setup menu
   if (appMode == NULL) {
-    DPRINTF("ROM_MODE not found in the configuration. Using default value\n");
+    DPRINTF("MODE not found in the configuration. Using default value\n");
   } else {
     appModeValue = atoi(appMode->value);
     DPRINTF("Start ROM emulation in mode: %i\n", appModeValue);
   }
 
-  // 2. Initialiaze the normal operation of the app, unless the configuration
-  // option says to start the config app Or a SELECT button is (or was) pressed
-  // to start the configuration section of the app
-
+  // 2. ROM mode: the ST owns the whole window, no command channel.
   if ((appModeValue == ROM_MODE_DIRECT) || (appModeValue == ROM_MODE_DELAY)) {
-    // If in ROM delay or ripper mode, we need to wait for the SELECT button
-    // to start the ROM emulation So the user boots as usual, but the ROM
-    // emulation is not started until the SELECT button is pressed because
-    // that is how the old ripper cartridges worked
-    select_configure();
-    select_setLongResetCallback(reset_deviceAndEraseFlash);
-    if (appModeValue == ROM_MODE_DELAY) {
-      // Wait until SELECT is pressed
-      while (!select_detectPush()) {
-        // Run the ROM emulation state machine
-        sleep_ms(SLEEP_LOOP_MS);
-      }
-      // Select button pressed. Wait until it is released
-      select_waitPush();
-    }
-
-    // Copy the ROM in the flash to RAM
-    unsigned int flashAddress = (unsigned int)&_rom_temp_start;
-    DPRINTF("Copy the ROM firmware to RAM: 0x%X, length: %u bytes\n",
-            flashAddress, ROM_SIZE_BYTES * ROM_BANKS);
-    COPY_FIRMWARE_TO_RAM((uint16_t *)flashAddress, ROM_SIZE_BYTES * ROM_BANKS);
-    init_romemul(NULL, NULL, false);
-
-#ifdef BLINK_H
-    blink_on();
-#endif
-
-    DPRINTF("ROM emulation mode started. Waiting for SELECT button\n");
-    // Wait until SELECT is pressed
-    while (!select_detectPush()) {
-      // Run the ROM emulation state machine
-      sleep_ms(SLEEP_LOOP_MS);
-    }
-    DPRINTF("SELECT button pressed. Waiting for release\n");
-    // Select button pressed. Wait until it is released
-    select_waitPush();
-
-    multicore_reset_core1();
-    sleep_ms(SLEEP_LOOP_MS);
-
-    // Change the mode to setup menu
-    // Set the ROM emulation mode to 255 (setup menu)
-    settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_ROM_MODE,
-                         ROM_MODE_SETUP);
-    settings_save(aconfig_getContext(), true);
-
-#ifdef BLINK_H
-    blink_off();
-#endif
-
-    // Now reset the device
-    reset_device();
+    romMode(appModeValue);
   }
 
-  // 3. If we are here, it means the app is not in ROM emulation mode, but in
-  // setup/configuration mode
+  // 3. Setup mode. The cartridge image the ST runs is copied into the window.
+  COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length);
+#if defined(_DEBUG) && (_DEBUG != 0)
+  // The ST must see exactly the generated image.
+  if (memcmp((const void *)&__rom_in_ram_start__, target_firmware,
+             (size_t)target_firmware_length * sizeof(uint16_t)) != 0) {
+    DPRINTF("ERROR: cartridge image in RAM does not match target_firmware\n");
+  } else {
+    DPRINTF("Cartridge image in RAM verified (%u words)\n",
+            (unsigned)target_firmware_length);
+  }
+#endif
 
-  // As a rule of thumb, the remote device (the computer) driver code must
-  // be copied to the RAM of the host device where the emulation will take
-  // place.
-  // The code is stored as an array in the target_firmware.h file
-  //
-  // Copy the terminal firmware to RAM
-  COPY_FIRMWARE_TO_RAM((uint16_t *)target_firmware, target_firmware_length * 2);
-  init_romemul(NULL, term_dma_irq_handler_lookup, false);
+  // ROM4 reads are served by chained DMAs feeding the PIO, no CPU involved.
+  // Without this engine the cartridge image is unreadable from the m68k, so a
+  // failure here is fatal.
+  if (init_romemul(false) < 0) {
+    panic("init_romemul failed: PIO/DMA claim or program load returned <0");
+  }
 
-  // 4. During the setup/configuration mode, the driver code must interact
-  // with the user to configure the device. To simplify the process, the
-  // terminal emulator is used to interact with the user.
-  // The terminal emulator is a simple text-based interface that allows the
-  // user to configure the device using text commands.
+  // The ROM3 command capture (PIO + DMA ring), and the command handler that
+  // polls the ring, parses the protocol and dispatches each command.
+  if (commemul_init() < 0) {
+    panic("commemul_init failed: PIO/DMA claim or program load returned <0");
+  }
+  chandler_init();
+  chandler_addCB(term_command_cb);
 
-  // Initialize the display
+  // After this point, the remote computer can execute the code
+
+  // 4. The terminal, on the ST's screen
   display_setupU8g2();
 
-  // 5. Configure the SELECT button
-  // Short press: reset the device and restart the app
-  // Long press: reset the device and erase the flash.
+  // Configure the SELECT button before anything slow (the SD card, the
+  // network), so a press is seen from here on; its edge interrupt catches one
+  // made while a wait cannot poll. A short press restarts the RP. A press held
+  // for SELECT_LONG_RESET is a factory reset.
   select_configure();
-  select_coreWaitPush(reset_device,
-                      reset_deviceAndEraseFlash);  // Wait for the SELECT
-                                                   // button to be pushed
-  // 6. Init the sd card
-  // Most of the apps or microfirmwares will need to read and write files
-  // to the SD card. The SD card is used to store the ROM files, configuration
-  // files, and other data.
-  // The SD card is initialized here. If the SD card is not present, the
-  // app will show an error message and wait for the user to insert the SD
-  // card. The app will not start until the SD card is inserted correctly.
-  // Each app or microfirmware must have a folder in the SD card where the
-  // files are stored. The folder name is defined in the configuration.
+  select_setResetCallback(reset_device);
+  select_setLongResetCallback(reset_deviceAndEraseFlash);
 
-  FATFS fsys;
-  SettingsConfigEntry *romsFolder =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROMS_FOLDER);
-  char *romsFolderName = "/roms";
-  if (romsFolder == NULL) {
-    DPRINTF(
-        "ROMS_FOLDER not found in the configuration. Using default value\n");
+  // 5. The SD card. Static, not on the stack: FatFs keeps a pointer to it
+  // while the card is mounted.
+  static FATFS fsys;
+  SettingsConfigEntry *folder =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_FOLDER);
+  char *folderName = "/roms";
+  if (folder == NULL) {
+    DPRINTF("FOLDER not found in the configuration. Using default value\n");
   } else {
-    DPRINTF("ROMS_FOLDER: %s\n", romsFolder->value);
-    romsFolderName = romsFolder->value;
+    DPRINTF("FOLDER: %s\n", folder->value);
+    folderName = folder->value;
   }
-  int sdcardErr = sdcard_initFilesystem(&fsys, romsFolderName);
+  int sdcardErr = sdcard_initFilesystem(&fsys, folderName);
   if (sdcardErr != SDCARD_INIT_OK) {
     DPRINTF("Error initializing the SD card: %i\n", sdcardErr);
     failure(
         "SD card error.\nCheck the card is inserted correctly.\nInsert card "
         "and restart the computer.");
     while (1) {
-      // Wait forever
-      term_loop();
+      // Wait forever, answering the ST
+      emul_pollTick();
 #ifdef BLINK_H
       blink_toogle();
 #endif
+      sleep_ms(SLEEP_LOOP_MS);
     }
   } else {
     DPRINTF("SD card found & initialized\n");
@@ -1109,12 +1277,10 @@ void __not_in_flash_func(emul_start)() {
   // Initialize the display again (in case the terminal emulator changed it)
   display_setupU8g2();
 
-  // Pre-init the terminal emulator for ROMS waiting for the network
+  // The "please wait" screen while the network comes up
   preinit();
 
-  // 7. Init the network, if needed
-  // It's always a good idea to wait for the network to be ready
-  // Get the WiFi mode from the settings
+  // 6. The network. Its parameters are Booster's global settings.
   SettingsConfigEntry *wifiMode =
       settings_find_entry(gconfig_getContext(), PARAM_WIFI_MODE);
   wifi_mode_t wifiModeValue = WIFI_MODE_STA;
@@ -1130,10 +1296,10 @@ void __not_in_flash_func(emul_start)() {
       if (err != 0) {
         DPRINTF("Error initializing the network: %i. No initializing.\n", err);
       } else {
-        // Set the term_loop as a callback during the polling period
-        network_setPollingCallback(term_loop);
-        // Connect to the WiFi network
-        int maxAttempts = 3;  // or any other number defined elsewhere
+        // Answer the ST during the (multi-second) connect, so its commands
+        // don't pile up in the ROM3 ring.
+        network_setPollingCallback(emul_pollTick);
+        int maxAttempts = 3;
         int attempt = 0;
         err = NETWORK_WIFI_STA_CONN_ERR_TIMEOUT;
 
@@ -1150,7 +1316,6 @@ void __not_in_flash_func(emul_start)() {
         if (err == NETWORK_WIFI_STA_CONN_ERR_TIMEOUT) {
           DPRINTF("Timeout connecting to the WiFi network after %d attempts\n",
                   maxAttempts);
-          // Optionally, return an error code here.
         } else if (err == 0) {
           wifiConnected = true;
         }
@@ -1161,19 +1326,10 @@ void __not_in_flash_func(emul_start)() {
     }
   }
 
-  // 8. Download the list of available ROMs from the network
-  // Since the list of availanble ROMs is stored in a remote server and does
-  // not change frequently, it is a good idea to download the list of ROMs at
-  // the beginning of the app. This way, the user can browse the list of ROMs
-  // available in the server and download the ROMs to the SD card.
-  // The list of ROMs is stored in a CSV file in the server. The CSV file
-  // contains the URL of the ROM file, the name of the ROM, the description,
-  // the tags, and the size of the ROM file.
-
-  char *catalogUrl = NULL;
+  // 7. The ROM catalog, downloaded into the ROMs folder at every boot.
 #if APP_DOWNLOAD_HTTPS == 1
-  SettingsConfigEntry *catalog = settings_find_entry(
-      aconfig_get_context(), ACONFIG_PARAM_ROM_HTTPS_CATALOG);
+  SettingsConfigEntry *catalog =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_HTTPS_CATALOG);
 #else
   SettingsConfigEntry *catalog =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_HTTP_CATALOG);
@@ -1185,137 +1341,108 @@ void __not_in_flash_func(emul_start)() {
     DPRINTF("No catalog URL found in the settings. No initializing.\n");
     catalogAvailable = false;
   } else {
-    catalogUrl = catalog->value;
-    DPRINTF("Catalog URL: %s\n", catalogUrl);
-    download_setFilepath(catalogUrl);
+    DPRINTF("Catalog URL: %s\n", catalog->value);
+    download_setFilepath(catalog->value);
     download_err_t err = download_start();
     if (err != DOWNLOAD_OK) {
       DPRINTF("Error starting catalog download: %d\n", err);
       catalogAvailable = false;
     } else {
       DPRINTF("Waiting for catalog download to complete...\n");
-      while (true) {
-        download_status_t status = download_getStatus();
-        if (status == DOWNLOAD_STATUS_COMPLETED) {
-          download_finish();
-          download_confirm();
-          download_setStatus(DOWNLOAD_STATUS_IDLE);
-          catalogAvailable = true;
-          break;
-        }
-        if (status == DOWNLOAD_STATUS_FAILED) {
-          DPRINTF("Catalog download failed.\n");
-          download_finish();
-          download_setStatus(DOWNLOAD_STATUS_IDLE);
-          catalogAvailable = false;
-          break;
-        }
+      download_status_t status = download_getStatus();
+      while (status == DOWNLOAD_STATUS_STARTED ||
+             status == DOWNLOAD_STATUS_IN_PROGRESS) {
         download_poll();
+        emul_pollTick();
+        status = download_getStatus();
+      }
+      err = download_finish();
+      if (err == DOWNLOAD_OK) {
+        err = download_confirm();
+      }
+      download_setStatus(DOWNLOAD_STATUS_IDLE);
+      catalogAvailable = (err == DOWNLOAD_OK);
+      if (!catalogAvailable) {
+        DPRINTF("Catalog download failed: %d\n", err);
       }
     }
   }
 
-  // 9. Now complete the terminal emulator initialization
-  // The terminal emulator is used to interact with the user to configure the
-  // device.
-  init(romsFolderName);
+  // 8. The terminal and the menu
+  init(folderName);
 
-  menu();
+  // Blink on
+#ifdef BLINK_H
+  blink_on();
+#endif
 
-  // 10. Start the main loop
-  // The main loop is the core of the app. It is responsible for running the
-  // app, handling the user input, and performing the tasks of the app.
-  // The main loop runs until the user decides to launch a ROM or exit the
-  // app.
-  DPRINTF("Start the app loop here\n");
+  // 9. The main loop, until a ROM is launched or Booster is chosen
   roms = malloc(MAX_ROMS * sizeof(ROM));
   if (roms == NULL) {
     DPRINTF("Error allocating memory for ROMs\n");
   }
-  absolute_time_t wifiScanTime = make_timeout_time_ms(
-      WIFI_SCAN_TIME_MS);  // 3 seconds minimum for network scanning
-
-  absolute_time_t startDownloadTime =
-      make_timeout_time_ms(DOWNLOAD_DAY_MS);  // Future time
-  while (getKeepActive()) {
-#if PICO_CYW43_ARCH_POLL
-    network_safe_poll();
-    cyw43_arch_wait_for_work_until(wifi_scan_time);
-#else
-    sleep_ms(SLEEP_LOOP_MS);
+#if defined(_DEBUG) && (_DEBUG != 0)
+  // Debug builds only: serve the SWD mailbox of tools/dev/swd.py
+  devhooks_setAppHandler(emul_devhooksApp);
 #endif
-    // Check remote commands
+
+  DPRINTF("Start the app loop here\n");
+  absolute_time_t nextNetworkPoll = get_absolute_time();
+  while (getKeepActive()) {
+    devhooks_poll();
+    devdownload_poll();
+    select_poll();
+    // Drain the ROM3 command ring and dispatch to the registered callbacks on
+    // every pass: the ST spins on its answer, so the loop never waits.
+    chandler_loop();
+    if (chandler_consumeStBoot()) {
+      // A new ST session: nothing typed before the reset carries over, and
+      // the ST gets a freshly drawn menu.
+      term_clearInputBuffer();
+      menu();
+      display_refresh();
+    }
+#if PICO_CYW43_ARCH_POLL
+    // Wi-Fi every 10 ms, which is plenty for lwIP's timers and leaves the
+    // loop to the command ring.
+    if (absolute_time_diff_us(nextNetworkPoll, get_absolute_time()) >= 0) {
+      network_safePoll();
+      nextNetworkPoll = make_timeout_time_ms(10);
+    }
+#endif
+
+    // Run the terminal foreground (consume the published command, render
+    // output, etc.).
     term_loop();
 
-    // Check the download status
-    switch (download_getStatus()) {
-      case DOWNLOAD_STATUS_REQUESTED: {
-        startDownloadTime = make_timeout_time_ms(
-            DOWNLOAD_START_MS);  // 3 seconds to start the download
-        download_setStatus(DOWNLOAD_STATUS_NOT_STARTED);
-        break;
-      }
-      case DOWNLOAD_STATUS_NOT_STARTED: {
-        if ((absolute_time_diff_us(get_absolute_time(), startDownloadTime) <
-             0)) {
-          download_err_t err = download_start();
-          if (err != DOWNLOAD_OK) {
-            DPRINTF("Error downloading app. Drive to error page.\n");
-          }
-        }
-        break;
-      }
-      case DOWNLOAD_STATUS_IN_PROGRESS: {
-        download_poll();
-        break;
-      }
-      case DOWNLOAD_STATUS_COMPLETED: {
-        // Save the app info to the SD card
-        download_finish();
-        download_confirm();
-        download_setStatus(DOWNLOAD_STATUS_IDLE);
-        romDownloadUpdate();
-        break;
-      }
-    }
+    // A download the user started from the catalog
+    romDownloadPoll();
   }
   if (roms != NULL) {
     free(roms);
     roms = NULL;
   }
-  // 11. Send RESET computer command
-  // Exiting the loop means we are done with the setup/configuration mode and
-  // we are ready to start the ROM emulation or the booster app.
 
-  // We must reset the computer
+  // 10. Reset the computer, then this device or Booster. Hold the command
+  // long enough for the ST's menu loop to see it, and keep answering: a
+  // keystroke in flight would otherwise keep the ST in its send, retrying,
+  // until the hold was over.
+  emul_serviceFor(SLEEP_LOOP_MS);
+  SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
+  emul_serviceFor(SENTINEL_HOLD_MS);
   if (getResetDevice()) {
-    SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
-    sleep_ms(SLEEP_LOOP_MS);
-
     // Reset the device
     reset_device();
   } else {
-    // Before jumping to the booster app, let's clean the settings
-    // Clean the ROM_SELECTED setting
+    // Before jumping to the booster app, clean the settings: no ROM selected,
+    // setup mode
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, "");
-    // Set the ROM emulation mode to 255 (setup menu)
-    settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_ROM_MODE,
+    settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
                          ROM_MODE_SETUP);
     settings_save(aconfig_getContext(), true);
-
-    sleep_ms(SLEEP_LOOP_MS);
-    select_coreWaitPushDisable();  // Disable the SELECT button
-
-    // We must reset the computer
-    SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
-    sleep_ms(SLEEP_LOOP_MS);
 
     // Jump to the booster app
     DPRINTF("Jumping to the booster app...\n");
     reset_jump_to_booster();
-    while (1) {
-      // Wait forever
-      DPRINTF("Waiting for the booster app to start...\n");
-    }
   }
 }

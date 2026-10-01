@@ -40,47 +40,75 @@ else()
     message(FATAL_ERROR "Unknown BOARD_TYPE: ${BOARD_TYPE}")
 endif()
 
-# Add the env variable FATFS_SDK_PATH if it does not exist
-if(NOT DEFINED ENV{FATFS_SDK_PATH})
-    set(ENV{FATFS_SDK_PATH} ../../fatfs-sdk)
-endif()
-# Show the value
-message("FATFS_SDK_PATH: $ENV{FATFS_SDK_PATH}")
+# Resolve bundled Pico dependencies relative to the repo root so configure
+# works regardless of the active build directory.
+get_filename_component(REPO_ROOT "${CMAKE_CURRENT_LIST_DIR}/../.." REALPATH)
+set(DEFAULT_FATFS_SDK_PATH "${REPO_ROOT}/fatfs-sdk")
+set(DEFAULT_PICO_SDK_PATH "${REPO_ROOT}/pico-sdk")
+set(DEFAULT_PICO_EXTRAS_PATH "${REPO_ROOT}/pico-extras")
 
-# Add the env variable PICO_SDK_PATH if it does not exist
-if(NOT DEFINED ENV{PICO_SDK_PATH})
-    set(ENV{PICO_SDK_PATH} ../../pico-sdk)
+if(NOT DEFINED ENV{FATFS_SDK_PATH} OR "$ENV{FATFS_SDK_PATH}" STREQUAL "")
+    set(ENV{FATFS_SDK_PATH} "${DEFAULT_FATFS_SDK_PATH}")
 endif()
-# Show the value
-message("PICO_SDK_PATH: $ENV{PICO_SDK_PATH}")
+set(FATFS_SDK_PATH "$ENV{FATFS_SDK_PATH}" CACHE PATH "Path to the FATFS SDK" FORCE)
+get_filename_component(FATFS_SDK_PATH "${FATFS_SDK_PATH}" REALPATH BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+set(FATFS_SDK_PATH "${FATFS_SDK_PATH}" CACHE PATH "Path to the FATFS SDK" FORCE)
+set(ENV{FATFS_SDK_PATH} "${FATFS_SDK_PATH}")
+message("FATFS_SDK_PATH: ${FATFS_SDK_PATH}")
 
-# Add the env variable PICO_EXTRAS_PATH if it does not exist
-if(NOT DEFINED ENV{PICO_EXTRAS_PATH})
-    set(ENV{PICO_EXTRAS_PATH} ../../pico-extras)
+if(NOT DEFINED ENV{PICO_SDK_PATH} OR "$ENV{PICO_SDK_PATH}" STREQUAL "")
+    set(ENV{PICO_SDK_PATH} "${DEFAULT_PICO_SDK_PATH}")
 endif()
-# Show the value
-message("PICO_EXTRAS_PATH: $ENV{PICO_EXTRAS_PATH}")
+set(PICO_SDK_PATH "$ENV{PICO_SDK_PATH}" CACHE PATH "Path to the Raspberry Pi Pico SDK" FORCE)
+get_filename_component(PICO_SDK_PATH "${PICO_SDK_PATH}" REALPATH BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+set(PICO_SDK_PATH "${PICO_SDK_PATH}" CACHE PATH "Path to the Raspberry Pi Pico SDK" FORCE)
+set(ENV{PICO_SDK_PATH} "${PICO_SDK_PATH}")
+message("PICO_SDK_PATH: ${PICO_SDK_PATH}")
+
+if(NOT DEFINED ENV{PICO_EXTRAS_PATH} OR "$ENV{PICO_EXTRAS_PATH}" STREQUAL "")
+    set(ENV{PICO_EXTRAS_PATH} "${DEFAULT_PICO_EXTRAS_PATH}")
+endif()
+set(PICO_EXTRAS_PATH "$ENV{PICO_EXTRAS_PATH}" CACHE PATH "Path to the PICO EXTRAS" FORCE)
+get_filename_component(PICO_EXTRAS_PATH "${PICO_EXTRAS_PATH}" REALPATH BASE_DIR "${CMAKE_CURRENT_LIST_DIR}")
+set(PICO_EXTRAS_PATH "${PICO_EXTRAS_PATH}" CACHE PATH "Path to the PICO EXTRAS" FORCE)
+set(ENV{PICO_EXTRAS_PATH} "${PICO_EXTRAS_PATH}")
+message("PICO_EXTRAS_PATH: ${PICO_EXTRAS_PATH}")
 
 # Include build functions from Pico SDK
-include($ENV{PICO_SDK_PATH}/pico_sdk_init.cmake)
-include($ENV{PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
+include(${PICO_SDK_PATH}/pico_sdk_init.cmake)
+include(${PICO_EXTRAS_PATH}/external/pico_extras_import.cmake)
 
 # Set name of project (as PROJECT_NAME) and C/C   standards
 project(rp C CXX)
 set(CMAKE_C_STANDARD 11)
+
+# malloc must return NULL on failure instead of panicking.
+#
+# This MUST come before pico_sdk_init(): the check that panics lives in the
+# SDK's own malloc.c, and pico_sdk_init() adds the SDK as a subdirectory, which
+# inherits compile definitions as they stand at that moment. Defined further
+# down, it would compile our sources with it and leave the SDK's malloc.c
+# untouched, which looks right and does nothing.
+#
+# The SDK default (PICO_MALLOC_PANIC 1) turns a failed allocation into
+# panic("Out of memory"), which defeats code written to handle NULL. FatFs's
+# directory creation is the case that matters: it asks for a buffer as large
+# as a cluster (32 KB on a large FAT32 card) and halves the request until it
+# fits, which it can only do if malloc is allowed to say no. Every allocation
+# in this firmware checks its result.
+if (NOT DEFINED ENV{PICO_MALLOC_PANIC})
+    set(ENV{PICO_MALLOC_PANIC} "0")
+endif()
+add_compile_definitions(PICO_MALLOC_PANIC=$ENV{PICO_MALLOC_PANIC})
+
 # Creates a pico-sdk subdirectory in our project for the libraries
 pico_sdk_init()
-
-add_subdirectory(settings)
 
 # Add u8g2 library
 add_subdirectory(u8g2)
 
-# Add HTTP client library
-add_subdirectory(httpc)
-
 # Tell CMake where to find other source code
-add_subdirectory($ENV{FATFS_SDK_PATH}/src build)
+add_subdirectory(${FATFS_SDK_PATH}/src build)
   
 # Tell CMake where to find the executable source file
 add_executable(${PROJECT_NAME} 
@@ -88,15 +116,20 @@ add_executable(${PROJECT_NAME}
 )
 
 pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/romemul.pio)
+pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/commemul.pio)
 
 target_sources(${PROJECT_NAME} PRIVATE
         aconfig.c
         blink.c
+        chandler.c
+        commemul.c
+        devdownload.c
         display.c
         display_term.c
         download.c
         emul.c
         gconfig.c
+        httpc/httpc.c
         hw_config.c
         network.c
         reset.c
@@ -104,6 +137,8 @@ target_sources(${PROJECT_NAME} PRIVATE
         sdcard.c
         select.c
         term.c
+        tprotocol.c
+        md5/md5.c
         settings/settings.c)
 
 # Create map/bin/hex/uf2 files
@@ -115,17 +150,16 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     hardware_flash           # Flash memory access
     no-OS-FatFS-SD-SDIO-SPI-RPi-Pico                # FATFS library   
     pico_stdlib              # Core functionality
-    pico_multicore           # Multicore support
-    httpc                    # HTTP client
-    settings                 # Custom settings library
+    pico_multicore          # Multicore support
+    pico_lwip_http           # lwIP's HTTP client, under httpc/
     u8g2                     # for display
 )
 
 # Conditionally link the CYW43 architecture library if supported
 if (PICO_CYW43_SUPPORTED)
     target_link_libraries(${PROJECT_NAME} PRIVATE
-#        pico_cyw43_arch_lwip_poll
-        pico_cyw43_arch_lwip_threadsafe_background
+        pico_cyw43_arch_lwip_poll
+#        pico_cyw43_arch_lwip_threadsafe_background
         )
 else()
     message(WARNING "CYW43 architecture not supported")
@@ -144,15 +178,48 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
 target_include_directories(${PROJECT_NAME} BEFORE PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/ff)
 
-# Needed to include lwipopts.h properly
-target_include_directories(${PROJECT_NAME} PRIVATE 
+# Needed to include lwipopts.h properly. settings/ holds settings.h;
+# settings.c is compiled directly into the target (add_executable above).
+target_include_directories(${PROJECT_NAME} PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     ${CMAKE_CURRENT_LIST_DIR}/include
+    ${CMAKE_CURRENT_LIST_DIR}/settings
     ${CMAKE_CURRENT_LIST_DIR}/..)
 
 
 # Use reduced space for ROMs
 pico_set_binary_type(${PROJECT_NAME} rp)
+
+# HTTPS downloads. APP_DOWNLOAD_HTTPS=1 in the environment builds TLS in:
+# mbedTLS, lwIP's ALTCP layer and the memory they need. Unset or 0 builds HTTP
+# only, with neither linked. The C code, lwipopts.h and the build ID all follow
+# the one definition, and httpc.c is compiled into this target, not a library
+# of its own, so it cannot be built with a different value.
+set(APP_DOWNLOAD_HTTPS "$ENV{APP_DOWNLOAD_HTTPS}")
+if(APP_DOWNLOAD_HTTPS STREQUAL "")
+    set(APP_DOWNLOAD_HTTPS 0)
+endif()
+if(NOT APP_DOWNLOAD_HTTPS MATCHES "^[01]$")
+    message(FATAL_ERROR "APP_DOWNLOAD_HTTPS must be 0 or 1, not '${APP_DOWNLOAD_HTTPS}'")
+endif()
+if(APP_DOWNLOAD_HTTPS)
+    # Core 0's stack takes SCRATCH_X as well: 8 KB (see memmap_rp.ld).
+    target_link_options(${PROJECT_NAME} PRIVATE
+        "-Wl,--defsym=__core0_stack_takes_scratch_x=1")
+    target_sources(${PROJECT_NAME} PRIVATE mbedtls_ms_time.c)
+    # mbedTLS itself is compiled -Os whatever the build type. At -O3 (CMake
+    # Release) every TLS download failed: the server closed the connection
+    # about 0.5 s into the handshake. Bisected on the device to
+    # library/gcm.c (AES-GCM, the suite servers pick) alone; the whole library
+    # stays at -Os, the configuration Booster ships and every test host passed
+    # with. TLS speed is set by the network, not by this.
+    file(GLOB MBEDTLS_LIBRARY_SOURCES ${PICO_SDK_PATH}/lib/mbedtls/library/*.c)
+    set_source_files_properties(${MBEDTLS_LIBRARY_SOURCES}
+        PROPERTIES COMPILE_OPTIONS "-Os")
+    target_link_libraries(${PROJECT_NAME} PRIVATE
+        pico_lwip_mbedtls    # lwIP's ALTCP-over-mbedTLS layer
+        pico_mbedtls)        # mbedTLS
+endif()
 
 # Fetch the values from the environment variables
 set(RELEASE_TYPE $ENV{RELEASE_TYPE})
@@ -174,7 +241,14 @@ if(NOT RELEASE_VERSION)
     else()
         set(VERSION_FILE_NAME "version-${RELEASE_TYPE}.txt")
     endif()
-    
+
+    # rp/<file>, as rp/build.sh reads it; a build that does not go through
+    # the scripts (VS Code) gets the same version.
+    set(VERSION_FILE_PATH "${CMAKE_CURRENT_LIST_DIR}/../${VERSION_FILE_NAME}")
+    if(EXISTS "${VERSION_FILE_PATH}")
+        file(READ "${VERSION_FILE_PATH}" RELEASE_VERSION)
+    endif()
+
     # Remove newline character if present
     string(STRIP "${RELEASE_VERSION}" RELEASE_VERSION)
 
@@ -189,6 +263,8 @@ if(NOT RELEASE_DATE)
         set(RELEASE_DATE ${CURRENT_DATE_TIME})
 endif()
 
+# DEBUG_MODE is "0" for a release build, which CMake reads as false: defaulting
+# to 1 here made every release build a debug build. Unset means release too.
 if (NOT _DEBUG)
         set(_DEBUG 0)
 endif()
@@ -213,6 +289,7 @@ message("RELEASE_TYPE: " ${RELEASE_TYPE})
 message("RELEASE_VERSION: " ${RELEASE_VERSION})
 message("RELEASE_DATE: " ${RELEASE_DATE})
 message("DEBUG_MODE: " ${_DEBUG})
+message("APP_DOWNLOAD_HTTPS: " ${APP_DOWNLOAD_HTTPS})
 message("LATEST_RELEASE_URL: " ${LATEST_RELEASE_URL})
 
 # Pass these values to the C compiler
@@ -236,24 +313,35 @@ add_definitions(-D_DEBUG=${_DEBUG})
 # Device/Computer type
 add_definitions(-DDISPLAY_ATARIST)
 
-# Assume both cores are safe for flash operations
-set(PICO_FLASH_ASSUME_CORE1_SAFE 0)
+# We don't modify the flash in Core 1
+add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 
-# Select HTTPS or HTTP downloads of the firmware
-add_definitions(-DAPP_DOWNLOAD_HTTPS=0)
+# Core 0's stack takes all of SCRATCH_Y (4 KB) instead of the SDK's 2 KB, and
+# a guard at its bottom turns an overflow into a HardFault instead of a silent
+# walk through SCRATCH_X into the cartridge window below it. Measured on an ST
+# with the setup menu: 1,696 bytes at the deepest. PICO_HEAP_SIZE is the heap
+# the link guarantees: a build whose static data leaves less fails to link.
+# Measured: 13.1 KB of heap at the peak after boot and the menu commands.
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    PICO_STACK_SIZE=0x1000
+    PICO_USE_STACK_GUARDS=1
+    PICO_HEAP_SIZE=0x8000)
+
+# HTTP only, or HTTP and HTTPS downloads (see APP_DOWNLOAD_HTTPS above)
+add_definitions(-DAPP_DOWNLOAD_HTTPS=${APP_DOWNLOAD_HTTPS})
 
 # build_id.h and build_id.c (RELEASE_BUILD_ID and the release_build_id symbol,
 # the git commit) are regenerated on every build; see build_id.cmake. They are
 # rewritten only when the ID changes, so only their users recompile. The symbol
 # is kept through --gc-sections so tools/dev/swd.py can read it over SWD.
-# A debug build's ID ends in +debug, and a build of another CMake type than
-# Release carries that type (first), so builds of one tree cannot be taken for
-# each other on the device.
+# A debug build's ID ends in +debug, an HTTPS build's in +https (before +debug)
+# and a build of another CMake type than Release carries that type (first), so
+# builds of one tree cannot be taken for each other on the device.
 set(BUILD_ID_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/build_id)
 add_custom_target(build_id
     COMMAND ${CMAKE_COMMAND} -DSRC_DIR=${CMAKE_CURRENT_LIST_DIR}
             -DOUT_DIR=${BUILD_ID_DIR} -DDEBUG_BUILD=${_DEBUG}
-            -DHTTPS_BUILD=0
+            -DHTTPS_BUILD=${APP_DOWNLOAD_HTTPS}
             -DCMAKE_TYPE=${CMAKE_BUILD_TYPE}
             -P ${CMAKE_CURRENT_LIST_DIR}/build_id.cmake
     BYPRODUCTS ${BUILD_ID_DIR}/build_id.h ${BUILD_ID_DIR}/build_id.c
@@ -268,16 +356,6 @@ target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--undefined=release_build_id")
 # .uf2 (byte-identical either way), and tools/dev/swd.py finds the cartridge
 # window, the build ID and its other addresses by symbol.
 target_link_options(${PROJECT_NAME} PRIVATE "-Wl,--gc-sections")
-
-# Enable clang-tidy (you need to have clang-tidy installed on your system)
-find_program(CLANG_TIDY_EXE NAMES clang-tidy)
-
-if(CLANG_TIDY_EXE)
-    set(CMAKE_C_CLANG_TIDY "${CLANG_TIDY_EXE}")
-    message(STATUS "Found clang-tidy: ${CLANG_TIDY_EXE}")
-else()
-    message(WARNING "clang-tidy not found, skipping linting")
-endif()
 
 # Find clang-format executable
 find_program(CLANG_FORMAT_BIN NAMES clang-format)

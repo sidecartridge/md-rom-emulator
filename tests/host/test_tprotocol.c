@@ -1,4 +1,4 @@
-// units:
+// units: rp/src/tprotocol.c
 /* The ROM3 command parser (rp/src/include/tprotocol.h): a keystroke frame as
  * the ST sends it, a frame with a bad checksum, and a frame cut short by a
  * silence longer than the parser waits. */

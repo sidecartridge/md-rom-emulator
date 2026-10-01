@@ -1,10 +1,9 @@
-// units:
-/* A defect the parser still has: it takes the payload size from the bus
- * without checking it against its buffer (MAX_PROTOCOL_PAYLOAD_SIZE), so a
- * frame that claims a larger payload writes past the buffer. Any program that
- * reads ROM3 sequentially can produce one: its reads are $ABCD, $ABCE, $ABCF,
- * a header, a command and a size of 43,983 bytes. Fails under the address
- * sanitizer until the parser drops such a frame. */
+// units: rp/src/tprotocol.c
+/* The parser drops a frame whose payload size is larger than its buffer
+ * (MAX_PROTOCOL_PAYLOAD_SIZE) instead of writing past it. Any program that
+ * reads ROM3 sequentially sends one: its reads are $ABCD, $ABCE, $ABCF, a
+ * header, a command and a size of 43,983 bytes. Under the address sanitizer a
+ * write past the buffer fails the test. */
 #include "tprotocol.h"
 
 #include "test.h"

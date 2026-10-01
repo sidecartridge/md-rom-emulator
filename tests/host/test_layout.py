@@ -6,8 +6,9 @@ constant: adding a constant both sides must agree on means adding a row. A
 mismatch is the "works on the RP, garbage on the ST" bug, so fix the sources,
 never the table.
 
-The self-check cartridge and the image tool must agree too: the pattern the
-cartridge checks is the one make_rom_images.py writes.
+The self-check cartridge and the tools must agree too: the pattern the
+cartridge checks is the one make_rom_images.py writes, and the reset agent's
+signature is where swd.py st-reset writes it.
 """
 
 import ast
@@ -99,7 +100,8 @@ def st_names():
 def rp_names():
     inc = os.path.join(RP_SRC, "include")
     return c_defines(*(os.path.join(inc, f) for f in
-                       ("constants.h", "display.h", "term.h", "tprotocol.h")))
+                       ("constants.h", "chandler.h", "display.h", "term.h",
+                        "tprotocol.h")))
 
 
 def window(st, name):
@@ -109,31 +111,56 @@ def window(st, name):
 
 # (what it is, the ST's value, the RP's value)
 PAIRS = [
+    ("cartridge code size", lambda st: st["CARTRIDGE_CODE_SIZE"],
+     lambda rp: rp["CHANDLER_CARTRIDGE_CODE_SIZE"]),
+    ("shared block", lambda st: window(st, "SHARED_BLOCK_ADDR"),
+     lambda rp: rp["CHANDLER_SHARED_BLOCK_OFFSET"]),
+    ("command sentinel", lambda st: window(st, "CMD_MAGIC_SENTINEL_ADDR"),
+     lambda rp: rp["CHANDLER_CMD_SENTINEL_OFFSET"]),
+    ("display command word, the sentinel",
+     lambda st: window(st, "CMD_MAGIC_SENTINEL_ADDR"),
+     lambda rp: rp["DISPLAY_COMMAND_ADDRESS"]),
+    ("random token", lambda st: window(st, "RANDOM_TOKEN_ADDR"),
+     lambda rp: rp["CHANDLER_RANDOM_TOKEN_OFFSET"]),
+    ("random token seed", lambda st: window(st, "RANDOM_TOKEN_SEED_ADDR"),
+     lambda rp: rp["CHANDLER_RANDOM_TOKEN_SEED_OFFSET"]),
+    ("reserved slot", lambda st: window(st, "RESERVED_SLOT_ADDR"),
+     lambda rp: rp["CHANDLER_RESERVED_OFFSET"]),
+    ("shared variables", lambda st: window(st, "SHARED_VARIABLES"),
+     lambda rp: rp["CHANDLER_SHARED_VARIABLES_OFFSET"]),
+    ("app buffers", lambda st: window(st, "APP_BUFFERS_ADDR"),
+     lambda rp: rp["CHANDLER_APP_BUFFERS_OFFSET"]),
+    ("high-resolution translation table", lambda st: window(st, "TRANSTABLE"),
+     lambda rp: rp["CHANDLER_HIGHRES_TRANSTABLE_OFFSET"]),
+    ("high-resolution translation table, display.h",
+     lambda st: window(st, "TRANSTABLE"),
+     lambda rp: rp["DISPLAY_HIGHRES_TRANSTABLE_ADDR"]),
+    ("app free area", lambda st: window(st, "APP_FREE_ADDR"),
+     lambda rp: rp["CHANDLER_APP_FREE_OFFSET"]),
     ("framebuffer", lambda st: window(st, "FRAMEBUFFER_ADDR"),
+     lambda rp: rp["CHANDLER_FRAMEBUFFER_OFFSET"]),
+    ("framebuffer, display.h", lambda st: window(st, "FRAMEBUFFER_ADDR"),
      lambda rp: rp["DISPLAY_BUFFER_OFFSET"]),
     ("framebuffer size", lambda st: st["FRAMEBUFFER_SIZE"],
+     lambda rp: rp["CHANDLER_FRAMEBUFFER_SIZE"]),
+    ("framebuffer size, display.h", lambda st: st["FRAMEBUFFER_SIZE"],
      lambda rp: rp["DISPLAY_BUFFER_SIZE"]),
-    ("display command word, after the framebuffer",
-     lambda st: window(st, "FRAMEBUFFER_ADDR") + st["FRAMEBUFFER_SIZE"],
-     lambda rp: rp["DISPLAY_BUFFER_OFFSET"] + rp["DISPLAY_COMMAND_ADDRESS_OFFSET"]),
-    ("high-resolution translation table", lambda st: window(st, "TRANSTABLE"),
-     lambda rp: rp["DISPLAY_HIGHRES_TRANSTABLE_OFFSET"]),
-    ("random token", lambda st: window(st, "RANDOM_TOKEN_ADDR"),
-     lambda rp: rp["TERM_RANDOM_TOKEN_OFFSET"]),
-    ("random token seed", lambda st: window(st, "RANDOM_TOKEN_SEED_ADDR"),
-     lambda rp: rp["TERM_RANDON_TOKEN_SEED_OFFSET"]),
-    ("shared variables", lambda st: window(st, "SHARED_VARIABLES"),
-     lambda rp: rp["TERM_SHARED_VARIABLES_OFFSET"]),
     ("ROM3 follows ROM4", lambda st: st["ROMCMD_START_ADDR"] - st["ROM4_ADDR"],
      lambda rp: rp["ROM_SIZE_BYTES"]),
     ("command header", lambda st: st["CMD_MAGIC_NUMBER"],
      lambda rp: rp["PROTOCOL_HEADER"]),
+    ("CMD_ST_HELLO", lambda st: st["CMD_ST_HELLO"],
+     lambda rp: rp["CHANDLER_ST_HELLO"]),
+    ("CMD_SET_SHARED_VAR", lambda st: st["CMD_SET_SHARED_VAR"],
+     lambda rp: rp["CHANDLER_SET_SHARED_VAR"]),
     ("CMD_NOP", lambda st: st["CMD_NOP"], lambda rp: rp["DISPLAY_COMMAND_NOP"]),
     ("CMD_RESET", lambda st: st["CMD_RESET"], lambda rp: rp["DISPLAY_COMMAND_RESET"]),
     ("CMD_BOOT_GEM", lambda st: st["CMD_BOOT_GEM"],
      lambda rp: rp["DISPLAY_COMMAND_CONTINUE"]),
     ("CMD_TERMINAL", lambda st: st["CMD_TERMINAL"],
      lambda rp: rp["DISPLAY_COMMAND_TERM"]),
+    ("CMD_START", lambda st: st["CMD_START"],
+     lambda rp: rp["DISPLAY_COMMAND_START"]),
     ("APP_TERMINAL", lambda st: st["APP_TERMINAL"], lambda rp: rp["APP_TERMINAL"]),
     ("APP_TERMINAL_START", lambda st: st["APP_TERMINAL_START"],
      lambda rp: rp["APP_TERMINAL_START"]),
@@ -165,6 +192,16 @@ class Layout(unittest.TestCase):
         self.assertEqual(cart["PATTERN_XOR"], tool.PATTERN_XOR)
         self.assertEqual(cart["PATTERN_FROM"], tool.SELFCHECK_PATTERN_FROM)
         self.assertEqual(cart["WINDOW_BYTES"], tool.WINDOW)
+
+    def test_agent_signature(self):
+        """swd.py st-reset writes the reset agent's signature where agent.s
+        reads it."""
+        agent = asm_equs(os.path.join(TOOLS, "selfcheck", "agent.s"))
+        with open(os.path.join(TOOLS, "swd.py"), encoding="utf-8") as f:
+            swd = f.read()
+        offset = int(re.search(r"^AGENT_SIG_OFFSET = (0x[0-9A-Fa-f]+)", swd,
+                               re.M).group(1), 16)
+        self.assertEqual(agent["AGENT_SIG_ADDR"] - 0xFA0000, offset)
 
 
 if __name__ == "__main__":

@@ -33,13 +33,17 @@ TIMERAWL = 0x40054028
 FLASH_END = 0x10200000  # 2 MB flash on the SidecarTridge Multi-device
 BOUNCE_MS = 15
 
-SYMBOLS = ("menuScreenActive", "keepActive", "_config_flash_start")
+SYMBOLS = ("keepActive", "_config_flash_start", "screen")
+# The template's menu flag. An app without it (the ROM Emulator) counts its
+# menu as shown when the terminal reads MENU_PROMPT.
+MENU_FLAG = "menuScreenActive"
+MENU_PROMPT = b"Select an option"
 
 
 class Harness:
     def __init__(self, elf: str | None):
         self.elf = swd.matching_elf(elf)
-        self.sym = swd.elf_symbols(self.elf, *SYMBOLS)
+        self.sym = swd.elf_symbols(self.elf, *SYMBOLS, MENU_FLAG)
         missing = [s for s in SYMBOLS if s not in self.sym]
         if missing:
             raise swd.SwdError(f"{self.elf} lacks {', '.join(missing)}")
@@ -48,10 +52,16 @@ class Harness:
     def byte(self, name: str) -> int:
         return swd.read_memory(self.sym[name][0], 1)[0]
 
+    def menu_shown(self) -> bool:
+        if MENU_FLAG in self.sym:
+            return bool(self.byte(MENU_FLAG))
+        address, size = self.sym["screen"]
+        return MENU_PROMPT in swd.read_memory(address, size)
+
     def state(self) -> dict:
         return {
             "uptime_us": swd.read_word(TIMERAWL),
-            "menu": self.byte("menuScreenActive"),
+            "menu": self.menu_shown(),
             "running": self.byte("keepActive"),
         }
 
@@ -77,7 +87,7 @@ class Harness:
         end = time.time() + timeout
         while time.time() < end:
             try:
-                if self.byte("menuScreenActive") and self.byte("keepActive"):
+                if self.menu_shown() and self.byte("keepActive"):
                     return True
             except swd.SwdError:
                 pass

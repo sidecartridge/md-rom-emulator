@@ -2,14 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-See also: `../md-microfirmware-template/CLAUDE.md` (the SidecarTridge microfirmware app template this project is based on — richer detail on the shared architecture, build flow, and working style; its `programming.md` documents the shared cartridge-region rules). **Caveat:** this repo forked from an *early* version of that template, so several template facts do not apply here — see "Divergences from the template" below.
+See also: `../md-microfirmware-template/CLAUDE.md` (the SidecarTridge microfirmware app template this project is based on — richer detail on the shared architecture, build flow, and working style; its `programming.md` documents the shared cartridge-region rules). Setup mode runs on that template's modules (at `6935f53`); what this app changes is listed in "Divergences from the template" below.
 
 ## Project overview
 
 **md-rom-emulator** is the SidecarTridge Multi-device ROM Emulator: a microfirmware app that makes an RP2040 (Raspberry Pi Pico / Pico W) board emulate a cartridge ROM for Atari ST/STE/Mega computers. It has two coupled firmwares:
 
 - `rp/` — RP2040-side firmware in C (pico-sdk, CMake).
-- `target/atarist/` — Atari-side firmware in m68k assembly (`src/main.s`), built with vasm/vlink through the `stcmd` wrapper (AtariST toolkit Docker image).
+- `target/atarist/` — Atari-side firmware in m68k assembly (`src/main.s`, `src/inc/`, `src/userfw.s`), built with vasm/vlink through the `stcmd` wrapper (AtariST toolkit Docker image).
 
 `AGENTS.md` in the repo root contains additional agent rules and style details; follow it.
 
@@ -53,7 +53,7 @@ Build-script caveats (from AGENTS.md — respect these):
 
 - **Host tests** (`tests/host`, from md-framebuffer-template): `make -C tests/host test` compiles firmware units with the host compiler under ASan and UBSan and runs them in seconds; CI runs them on every PR. `test_layout.py` checks that the ST side (`main.s`) and the RP side (`rp/src/include`) agree on every shared offset and command. A `bug_*.c` test shows a defect the firmware still has (`make -C tests/host known-bugs` passes only while each one fails); rename it to `test_*.c` when the defect is fixed.
 - **On the hardware** (`tools/dev/`, see its `README.md`): `flash.sh` builds and flashes, `console.py` captures the 921,600-baud console, `swd.py` reads and drives the running RP over SWD (`screen`, `text`, `heap`, `crash`, `select`, `key`, `window`, `gdb`, ...), `smoke.py` runs a whole session through the probe, `testserver.py` serves catalogs and downloads with every failure case, `hatari_check.py` runs cartridge images under Hatari on every TOS, `fill_card.py` puts test files on the card through the device's own downloads.
-- **Rebooting the ST without hands**: `swd.py st-reset` writes the setup menu's reset command and the signature of the remote reset agent that the self-check cartridge (`tools/dev/selfcheck/`) leaves in the ST's RAM. The agent survives every reset that keeps the ST powered and works from GEM or any ROM that keeps TOS's interrupts; a game that takes them over, or DiagROM, still needs the reset button. `st-reset` says beforehand who is listening. `swd.py boot-break` stops the RP at source lines during boot to take a different path (e.g. v2.1.2's autorun) without a rebuild.
+- **Rebooting the ST without hands**: `swd.py st-reset` writes the setup menu's reset command and the signature of the remote reset agent that the self-check cartridge (`tools/dev/selfcheck/`) leaves in the ST's RAM. The agent survives every reset that keeps the ST powered and works from GEM or any ROM that keeps TOS's interrupts; a game that takes them over, or DiagROM, still needs the reset button, and so does a cartridge that waits for a hardware reset (Ultimate Ripper's frozen screen: the agent's reset is a software one). `st-reset` says beforehand who is listening. `swd.py boot-break` stops the RP at source lines during boot to take a different path (e.g. v2.1.2's autorun) without a rebuild.
 - Validation otherwise: both firmwares compile, and if `target/` or the protocol changed, `target_firmware.h` was regenerated. Anything bus-facing is checked on the hardware.
 
 ## Architecture
@@ -73,38 +73,42 @@ App settings keys live in `aconfig.h` (`FOLDER`, `EMULATED`, `MODE`, `HTTP_CATAL
 
 ### ROM bus emulation core (`romemul.c` + `romemul.pio`)
 
-PIO state machines watch the Atari cartridge bus (16 address/data GPIOs multiplexed through latches starting at GPIO 6, READ/WRITE latch signals on GPIO 27/28, `!ROM4` on GPIO 22 and `!ROM3` on GPIO 26; see `constants.h`/`term.h`), and DMA channels serve 16-bit reads directly from RAM with no CPU involvement. ROM4 (`$FA0000`) is the first 64K bank of `ROM_IN_RAM`, ROM3 (`$FB0000`) the second. Time-critical handlers are `__not_in_flash_func`; never `DPRINTF` inside DMA IRQ callbacks.
+PIO state machines watch the Atari cartridge bus (16 address/data GPIOs multiplexed through latches starting at GPIO 6, READ/WRITE latch signals on GPIO 27/28, `!ROM4` on GPIO 22 and `!ROM3` on GPIO 26; see `constants.h`), and DMA channels serve 16-bit reads directly from RAM with no CPU involvement and no IRQ. Setup mode loads the template's 16-bit program, which serves ROM4 (`$FA0000`) from the lower 64 KB of `ROM_IN_RAM`, plus the command ring below. ROM mode loads `romemul_read_two_banks` (17 address bits, `init_romemul_two_banks()`): ROM4 from the lower 64 KB and ROM3 (`$FB0000`) from the upper, and nothing else, because the user's ROM owns the whole window. Every DMA channel and state machine is claimed, never hard-coded. Hot paths are `__not_in_flash_func`.
 
 ### Setup-mode communication (Atari ⇄ RP2040)
 
-- **Atari → RP:** the cartridge is read-only, so the target firmware "writes" by *reading* addresses in the ROM3 window (`$FB0000`). `term_dma_irq_handler_lookup` feeds each address to the `tprotocol.h` parser (header `0xABCD`, command id, payload size, payload, checksum) and only stashes the finished command; `term_loop()` (called from the main loop) handles it (`APP_TERMINAL` start/keystroke) and acknowledges by writing the command's random token at `$FAF000`, which the Atari polls; shared variables start at `$FAF200`.
-- **RP → Atari screen:** there is no text protocol. The RP renders a 320×200 monochrome framebuffer with u8g2 (`display.c`, `display_term.c`, VT52-subset terminal in `term.c`) *directly into ROM_IN_RAM* at `$FA8000`, and the target firmware copies it to video RAM (with a translation table at `$FA1000` for high-res).
-- **RP → Atari control:** a longword at framebuffer + 8000 carries display commands (`DISPLAY_COMMAND_RESET`, `…_CONTINUE` to boot GEM); the target polls it. Anything the RP writes into shared memory must be word-swapped (`WRITE_AND_SWAP_LONGWORD`, `CHANGE_ENDIANESS_BLOCK16` in `memfunc.h`).
-- Changing any of these offsets requires changing both `target/atarist/src/main.s` and the RP headers (`term.h`, `display.h`, `constants.h`), then regenerating `target_firmware.h`.
+- **Atari → RP:** the cartridge is read-only, so the target firmware "writes" by *reading* addresses in the ROM3 window (`$FB0000`). `commemul` captures every ROM3 address into a 16 KB DMA ring; `chandler_loop()` drains it through the `tprotocol` parser (header `0xABCD`, command id, payload size, payload, checksum), runs the registered callbacks (`term_command_cb` for the terminal), and answers at once by writing the command's token at `$FA2004` and a new seed at `$FA2008`, which the Atari polls. The ST's boot hello and its shared variables (machine, TOS version, from `$FA2010`) arrive the same way; on the hello the menu drops typed input and redraws.
+- **The poll tick:** `emul_pollTick()` runs `chandler_loop()`, `term_loop()` and `select_poll()`. The main loop and every long wait (Wi-Fi connect, catalog download, SD scan, the flash copy of a launch) call it, so the ST is answered and SELECT is seen during them.
+- **RP → Atari screen:** there is no text protocol. The RP renders a 320×200 monochrome framebuffer with u8g2 (`display.c`, `display_term.c`, VT52-subset terminal in `term.c`) *directly into ROM_IN_RAM* at `$FAE0C0` (the top of ROM4), and the target firmware copies it to video RAM (with a translation table at `$FA2100` for high resolution).
+- **RP → Atari control:** the command sentinel at `$FA2000` carries display commands (`DISPLAY_COMMAND_RESET`, `…_CONTINUE` to boot GEM, `…_START` to jump to `userfw`); the target polls it. Anything the RP writes into shared memory must be word-swapped (`WRITE_AND_SWAP_LONGWORD`, `CHANGE_ENDIANESS_BLOCK16` in `memfunc.h`).
+- The offsets live in `target/atarist/src/inc/sidecart_layout.s` and `rp/src/include/chandler.h` (and `display.h`); `tests/host/test_layout.py` checks that both sides agree. Changing one means changing both, then regenerating `target_firmware.h`.
 
 ### Memory map (`rp/src/memmap_rp.ld` — custom linker script, load-bearing)
 
 - Flash: app 1MB @0x10000000 · `ROM_TEMP` 128K @0x10100000 (staged ROM) · Booster app 768K @0x10120000 · config sectors + app lookup table at the top (0x101E0000+).
-- RAM: app half @0x20000000 · `ROM_IN_RAM` 128K @0x20020000 (2×64K banks served to the Atari).
+- RAM: `RAM` 128K @0x20000000 (static data, then the heap, which stops at `0x20020000`: `malloc` returns NULL, never memory in the window) · `ROM_IN_RAM` 128K @0x20020000 (2×64K banks served to the Atari) · core 0's 4 KB stack in `SCRATCH_Y` with a stack guard. Core 1 never starts.
 
 Changing this layout or flash usage risks clobbering the Booster app or config areas.
 
 ### Target firmware (`target/atarist/`)
 
-Single m68k source `src/main.s`, built by `Makefile` via vasm/vlink inside `stcmd` → `BOOT.BIN` → truncated/padded to exactly 64KB → embedded into the RP firmware as the boot/menu ROM the Atari actually executes in setup mode.
+The template's `src/main.s` and `src/inc/` (senders with retries, token and seed, the boot hello, the Mega STE cache), plus `src/userfw.s`, all built by `Makefile` via vasm/vlink inside `stcmd` → `BOOT.BIN` (the build stops past 8 KB of cartridge code) → padded to exactly 64KB → embedded into the RP firmware as the boot/menu ROM the Atari executes in setup mode.
 
 ### Support libraries in-tree
 
-`rp/src/settings/` (flash-backed key/value settings), `rp/src/httpc/` (lwIP HTTP client), `rp/src/u8g2/` (trimmed display library). These are subdirectory CMake libraries, not submodules.
+`rp/src/settings/` (flash-backed key/value settings) and `rp/src/httpc/` (lwIP HTTP client) are compiled into the firmware target, as in the template; `rp/src/u8g2/` (trimmed display library) is a subdirectory CMake library. None of them are submodules.
 
 ## Divergences from the template
 
-Where this repo differs from the current `md-microfirmware-template` (don't apply these template facts here):
+Setup mode is the template's at `6935f53`; every other file under `rp/src` and `target/atarist` is byte-identical to it. These differ:
 
-- **No `userfw.s` / 8KB cartridge budget / `chandler.h`.** The target is a single `target/atarist/src/main.s` (plus `src/inc/` helpers); the only size check is the 64KB cap in `target/atarist/build.sh`.
-- **Shared-region offsets differ:** framebuffer at `$FA8000` (not `$FAE0C0`), random token block at `$FAF000`. Offsets are defined in `main.s` and `rp/src/include/constants.h` — always use the named symbols.
-- **lwIP mode:** `pico_cyw43_arch_lwip_threadsafe_background` (template uses poll mode).
-- **No `tprotocol.c`** — only the header `rp/src/include/tprotocol.h` (macros).
+- **`emul.c`, `emul.h`:** this app's menu (`[B]rowse`, `[D]ownload`, `[S]ettings`, `[R]ipper`, `[L]aunch`, `[E]xit`, `[X]` Booster) and ROM mode on the template's skeleton. No `[F]irmware`: a debug build has a hidden `f` command that starts `userfw` for `tools/dev/st_harness.py`.
+- **`aconfig.*`:** this app's keys (`EMULATED`, `FOLDER`, `HTTP_CATALOG`, `HTTPS_CATALOG`, `MODE`), unchanged from v2.1.2.
+- **`constants.h`, `romemul.*`, `memmap_rp.ld`:** two 64 KB banks (`ROM_BANKS`, the two-bank PIO program, `RAM` and `ROM_IN_RAM` 128 KB each).
+- **`download.c`:** the saved file's name has its `%XX` escapes decoded, so `Buggy%20Boy.img` is saved as `Buggy Boy.img`.
+- **`tprotocol.h`:** a plain-C payload store for host builds (`tests/host`); the RP still uses the `strh` asm.
+- **`main.s`:** the SHIFT keys are checked again (the setup screen offers SHIFT to boot to the desktop). **`userfw.s`:** a stub that returns to TOS.
+- **HTTP only:** the HTTPS download profile (`APP_DOWNLOAD_HTTPS=1`) compiles but does not fit in this app's 128 KB of `RAM` yet.
 
 ## Working style
 

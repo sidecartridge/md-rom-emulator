@@ -2,8 +2,8 @@
  * @file memfunc.h
  * @brief Header file with the macros and functions of the memory functions.
  * Author: Diego Parrilla Santamaría
- * Date: August 2024-2025
- * Copyright: 2024-2025 - GOODDATA LABS SL
+ * Date: August 2024-2025, February 2026
+ * Copyright: 2024-2026 - GOODDATA LABS SL
  * Description: Header file with the macros and functions of the memory
  * functions.
  */
@@ -16,43 +16,73 @@
 #include "hardware/dma.h"
 #include "hardware/structs/xip_ctrl.h"
 
-#define COPY_FIRMWARE_TO_RAM(emulROM, emulROM_length)  \
-  do {                                                 \
-    COPY_FIRMWARE_TO_RAM_DMA(emulROM, emulROM_length); \
+// Copy a cartridge image into the ROM_IN_RAM window. emulROM_length is in
+// 16-bit words. The window is cleared first, so nothing from a previous run
+// (another app, a jump from Booster, a crash reboot) survives past the end of
+// the image. The DMA path reads through the XIP stream, which can only start
+// at a 4-byte aligned address; any other source is copied word by word.
+#define COPY_FIRMWARE_TO_RAM(emulROM, emulROM_length)              \
+  do {                                                             \
+    ERASE_FIRMWARE_IN_RAM();                                       \
+    if ((((uintptr_t)(emulROM)) & 3u) == 0u) {                     \
+      COPY_FIRMWARE_TO_RAM_DMA(emulROM, emulROM_length);           \
+    } else {                                                       \
+      DPRINTF("Image at 0x%08lX is not 4-byte aligned; copying "   \
+              "word by word\n",                                    \
+              (unsigned long)(uintptr_t)(emulROM));                \
+      COPY_FIRMWARE_TO_RAM_MEMCPY(emulROM, emulROM_length);        \
+    }                                                              \
   } while (0)
 
-#define ERASE_FIRMWARE_IN_RAM()                               \
-  do {                                                        \
-    memset((void *)&__rom_in_ram_start__, 0,                  \
-           ROM_SIZE_LONGWORDS *ROM_BANKS * sizeof(uint32_t)); \
-    DPRINTF("RAM for the firmware zeroed.\n");                \
+#define ERASE_FIRMWARE_IN_RAM()                                \
+  do {                                                         \
+    memset((void *)&__rom_in_ram_start__, 0,                   \
+           ROM_SIZE_LONGWORDS * ROM_BANKS * sizeof(uint32_t)); \
+    DPRINTF("RAM for the firmware zeroed.\n");                 \
   } while (0)
 
-#define COPY_FIRMWARE_TO_RAM_MEMCPY(emulROM, emulROM_length) \
-  do {                                                       \
-    memcpy(&__rom_in_ram_start__, emulROM, emulROM_length);  \
-    DPRINTF("Emulation firmware copied to RAM.\n");          \
+// emulROM_length is in 16-bit words, like COPY_FIRMWARE_TO_RAM.
+#define COPY_FIRMWARE_TO_RAM_MEMCPY(emulROM, emulROM_length)       \
+  do {                                                             \
+    memcpy((void *)&__rom_in_ram_start__, (const void *)(emulROM), \
+           (size_t)(emulROM_length) * sizeof(uint16_t));           \
+    DPRINTF("Emulation firmware copied to RAM.\n");                \
   } while (0)
 
 #define COPY_FIRMWARE_TO_RAM_DMA(emulROM, emulROM_length)                     \
   do {                                                                        \
     while (!(xip_ctrl_hw->stat & XIP_STAT_FIFO_EMPTY))                        \
       (void)xip_ctrl_hw->stream_fifo;                                         \
+    int dma_chan = dma_claim_unused_channel(false);                            \
+    if (dma_chan < 0) {                                                       \
+      DPRINTF("No DMA channel available for firmware copy. Using memcpy.\n"); \
+      size_t __copy_words = (size_t)(emulROM_length);                         \
+      uint16_t *__dst = (uint16_t *)&__rom_in_ram_start__;                    \
+      const uint16_t *__src = (const uint16_t *)(emulROM);                    \
+      for (size_t __i = 0; __i < __copy_words; ++__i) {                       \
+        __dst[__i] = __src[__i];                                              \
+      }                                                                        \
+      break;                                                                   \
+    }                                                                         \
     xip_ctrl_hw->stream_addr = (uint32_t)&(emulROM)[0];                       \
-    xip_ctrl_hw->stream_ctr = (emulROM_length) / 4;                           \
-    const uint dma_chan = dma_claim_unused_channel(true);                     \
+    xip_ctrl_hw->stream_ctr = (emulROM_length) / 2;                           \
     dma_channel_config cfg = dma_channel_get_default_config(dma_chan);        \
+    channel_config_set_transfer_data_size(&cfg, DMA_SIZE_32);                 \
     channel_config_set_read_increment(&cfg, false);                           \
     channel_config_set_write_increment(&cfg, true);                           \
     channel_config_set_dreq(&cfg, DREQ_XIP_STREAM);                           \
     dma_channel_configure(dma_chan, &cfg,                                     \
                           (void *)&__rom_in_ram_start__, /* Write addr */     \
                           (const void *)XIP_AUX_BASE,    /* Read addr */      \
-                          (emulROM_length) / 4,          /* Transfer count */ \
+                          (emulROM_length) / 2,          /* Transfer count */ \
                           true /* Start immediately! */                       \
     );                                                                        \
-    while (dma_channel_is_busy(dma_chan)) {                                   \
-      tight_loop_contents();                                                  \
+    dma_channel_wait_for_finish_blocking(dma_chan);                           \
+    dma_channel_unclaim((uint)dma_chan);                                      \
+    /* The stream moves 32-bit words: copy an odd trailing 16-bit word. */   \
+    if ((emulROM_length) & 1u) {                                              \
+      ((uint16_t *)&__rom_in_ram_start__)[(emulROM_length) - 1u] =            \
+          (emulROM)[(emulROM_length) - 1u];                                   \
     }                                                                         \
   } while (0)
 
@@ -105,11 +135,14 @@
 #define READ_LONGWORD(address, offset) \
   (*((volatile uint32_t *)((address) + (offset))))
 
-#define READ_AND_SWAP_LONGWORD(address, offset)                          \
-  ((((uint32_t)(*((volatile uint32_t *)((address) + (offset))) << 16) &  \
-     0xFFFF0000) |                                                       \
-    (((uint32_t)(*((volatile uint32_t *)((address) + (offset))) >> 16) & \
-      0xFFFF))))
+static inline uint32_t memfunc_readAndSwapLongword(
+    const volatile uint32_t *address) {
+  uint32_t raw = *address;
+  return (((raw << 16) & 0xFFFF0000u) | ((raw >> 16) & 0x0000FFFFu));
+}
+
+#define READ_AND_SWAP_LONGWORD(address, offset) \
+  memfunc_readAndSwapLongword((const volatile uint32_t *)((address) + (offset)))
 
 #define COPY_AND_SWAP_16BIT_DMA(dest, source, num_bytes)           \
   do {                                                             \
@@ -159,6 +192,34 @@
                             memory_shared_variables_offset +                  \
                             (p_shared_variable_index * 4))) =                 \
         p_shared_variable_value >> 16;                                        \
+  } while (0)
+
+/**
+ * @brief Macro to get a shared variable.
+ *
+ * This macro retrieves the 32-bit value of a shared variable at the specified
+ * index from the shared memory and assigns it to the provided destination
+ * variable.
+ *
+ * @param p_shared_variable_index The index of the shared variable.
+ * @param p_shared_variable_result The variable to store the retrieved value.
+ * @param memory_shared_address The base address of the shared memory.
+ * @param memory_shared_variables_offset The offset of the shared variables
+ * within the shared memory.
+ */
+#define GET_SHARED_VAR(p_shared_variable_index, p_shared_variable_result,     \
+                       memory_shared_address, memory_shared_variables_offset) \
+  do {                                                                        \
+    uint16_t high = *((volatile uint16_t *)(memory_shared_address +           \
+                                            memory_shared_variables_offset +  \
+                                            (p_shared_variable_index * 4)));  \
+    uint16_t low =                                                            \
+        *((volatile uint16_t *)(memory_shared_address +                       \
+                                memory_shared_variables_offset +              \
+                                (p_shared_variable_index * 4) + 2));          \
+    *p_shared_variable_result = ((uint32_t)high << 16) | low;                 \
+    DPRINTF("Getting shared variable %d = %x\n", p_shared_variable_index,     \
+            p_shared_variable_result);                                        \
   } while (0)
 
 /**
