@@ -22,8 +22,19 @@ Generated routes, for any name:
   fail-truncated*      a Content-Length the body never reaches, then close
   fail-stall*          headers, a little of the body, then nothing
   fail-loop*           a redirect to itself
+  *slow-*.img          the 64 KB pattern image in 4 KB pieces, one a second:
+                       a download that lasts 16 s and completes
   302, 301, rel, cd, 302cd, tohttps   the redirect cases of md-browser's
                        server, ending at file.bin (64 KB, printed MD5)
+  autorun/roms.csv     a catalog for the autorun run (point HTTP_CATALOG
+                       at it): AUTORUN_ROM, then autorun-on/.autorun (names
+                       AUTORUN_ROM) and autorun-off/.autorun (empty). Both
+                       save as .autorun; the empty one disarms it. Kept out
+                       of roms.csv, so a fill never arms it by accident.
+  failures/roms.csv    a catalog of every route above that fails or
+                       redirects, make_catalog.py's --cases rows and
+                       pattern-64k.img as the control: what the device does
+                       with each, into a folder of its own
 
 HTTPS uses a self-signed certificate made with openssl on first run, in
 tools/dev/builds/testserver-cert/: the firmware encrypts but does not verify.
@@ -32,8 +43,10 @@ test can check what the device asked for.
 """
 
 import argparse
+import csv
 import datetime
 import hashlib
+import io
 import os
 import ssl
 import subprocess
@@ -46,6 +59,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from make_rom_images import pattern  # noqa: E402
+from make_catalog import HEADER, row, rows_cases  # noqa: E402
 
 PAYLOAD = bytes(range(256)) * 256          # file.bin: 64 KB, deterministic
 TARGET = b"relative-redirect-target-payload\n" * 64
@@ -55,6 +69,38 @@ LOG = os.path.join(HERE, "logs", "testserver.log")
 PORTS = {"http": 80, "https": 443}
 ROOT = os.path.join(HERE, "builds", "testserver")
 LOG_LOCK = threading.Lock()
+AUTORUN_ROM = "DiagROMCart.rom"
+
+
+FAILURES = ["fail-404.img", "fail-500.img", "fail-html200.img",
+            "fail-truncated.img", "fail-stall.img", "fail-loop.img",
+            "302", "301", "rel", "cd", "302cd", "tohttps", "slow-pattern.img",
+            "a-slow-early.img"]
+
+
+def catalog(rows: list[list[str]]) -> bytes:
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL, lineterminator="\n")
+    writer.writerow(HEADER)
+    writer.writerows(rows)
+    return buf.getvalue().encode()
+
+
+def failures_catalog() -> bytes:
+    return catalog([row(name, name, "A failure or redirect route.", "test", "64")
+                    for name in FAILURES] + rows_cases()
+                   + [row("pattern-64k.img", "pattern-64k (control)",
+                          "Served whole.", "test", "64")])
+
+
+def autorun_catalog() -> bytes:
+    return catalog([
+        row(AUTORUN_ROM, "DiagROM (autorun)", "The autorun cartridge.", "test",
+            "128"),
+        row("autorun-on/.autorun", "Arm the autorun", "A .autorun naming "
+            + AUTORUN_ROM + ".", "test", "1"),
+        row("autorun-off/.autorun", "Disarm the autorun", "An empty .autorun.",
+            "test", "1")])
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -101,6 +147,15 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(600)
         elif name.startswith("fail-loop"):
             self.redirect(302, "/" + name)
+        elif "slow-" in name and name.endswith(".img"):
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(SYNTHETIC)))
+            self.end_headers()
+            for start in range(0, len(SYNTHETIC), 4096):
+                self.wfile.write(SYNTHETIC[start:start + 4096])
+                self.wfile.flush()
+                time.sleep(1)
         elif name.startswith("synthetic-") and name.endswith(".img"):
             self.send(200, SYNTHETIC)
         elif name == "file.bin":
@@ -121,6 +176,14 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(302, "/cd")
         elif name == "tohttps":
             self.redirect(302, f"https://{host}:{PORTS['https']}/file.bin")
+        elif name == "failures/roms.csv":
+            self.send(200, failures_catalog(), "text/csv")
+        elif name == "autorun/roms.csv":
+            self.send(200, autorun_catalog(), "text/csv")
+        elif name == "autorun-on/.autorun":
+            self.send(200, AUTORUN_ROM.encode() + b"\n")
+        elif name == "autorun-off/.autorun":
+            self.send(200, b"")
         else:
             path = os.path.realpath(os.path.join(ROOT, name))
             if (os.path.dirname(path) == os.path.realpath(ROOT)

@@ -38,7 +38,8 @@ def rows_from_dir(path: str) -> list[list[str]]:
     rows = []
     for name in sorted(os.listdir(path)):
         full = os.path.join(path, name)
-        if not os.path.isfile(full) or name.startswith("."):
+        # Not ROMs: hidden files, and catalogs (the folder serves its own).
+        if not os.path.isfile(full) or name.startswith(".") or name.endswith(".csv"):
             continue
         size_kb = (os.path.getsize(full) + 1023) // 1024
         rows.append(row(name, os.path.splitext(name)[0], "Test image.",

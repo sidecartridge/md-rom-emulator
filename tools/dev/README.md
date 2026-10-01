@@ -33,6 +33,19 @@ rebooted ST does not reset once more. `--wait` watches the cartridge DMA: the
 ST reading the cartridge header again means it booted, and reading the
 framebuffer again means it is back in the menu. The cartridge port has no
 reset line, so an ST running a ROM the user launched still needs its button.
+`boot-break` restarts the RP through OpenOCD's `reset halt` and stops core 0
+at source lines on the way up, in order, setting registers at each: a boot
+path taken differently without a rebuild. Code that runs from RAM gets a
+software breakpoint once a flash function (`main`) shows the boot has copied
+it; a register is written only after the PC is checked, and a stop never
+reached changes nothing.
+The self-check cartridge also leaves a remote reset agent in the ST's RAM
+(`selfcheck/agent.s`): a reset-resident page that TOS runs on every boot,
+which watches the cartridge window from the VBL queue and resets the ST when
+`st-reset` writes its signature, and a resvector hook that keeps the RAM
+valid, so it survives every reset that keeps the ST powered. It works in GEM
+and in any ROM that keeps TOS's interrupts; a game that takes them over, or
+DiagROM, needs the reset button. `st-reset` says beforehand who is listening.
 
 What differs here:
 
@@ -47,8 +60,8 @@ What differs here:
   the harnesses built on them (`tools_harness.py`'s mailbox checks, `st_harness.py`,
   `select_harness.py`'s menu checks, `download_harness.py`) have nothing to talk to, except `key`
   and `inject`, which use the parsed-command slot instead. `running`, `verify`, `build-id`, `read`,
-  `program`, `reset`, `select`, `screen`, `text`, `heap`, `crash`, `postmortem`, `window` and
-  `gdb` work now, and so do `console.py`, `flash.sh`, `stackdepth.py`, `measure_builds.sh` and the
+  `program`, `reset`, `select`, `screen`, `text`, `heap`, `crash`, `postmortem`, `window`,
+  `gdb` and `boot-break` work now, and so do `console.py`, `flash.sh`, `stackdepth.py`, `measure_builds.sh` and the
   tools below.
 
 ## Test data, servers and runs
@@ -62,6 +75,9 @@ python3 tools/dev/hatari_check.py --selfcheck DIR         # ... proven under Hat
 python3 tools/dev/smoke.py [--catalog] [--hands]          # a whole session through the probe
 python3 tools/dev/swd.py gdb --script tools/dev/gdb/suspects.gdb --seconds 60
 python3 tools/dev/swd.py st-reset --wait 30                # reboot the ST from its setup menu
+python3 tools/dev/swd.py st-reset --wait 30 [--rom]        # reboot the ST: the menu or the agent
+python3 tools/dev/swd.py boot-break emul.c:984@r7=255 0x20000310@pc=0x20000314,r0=4
+                                                          # v2.1.2: setup mode, past the .autorun
 python3 tools/dev/swd.py screen menu.png                  # the RP's framebuffer, as the ST shows it
 make -C tests/host test                                   # host tests, ASan and UBSan
 ```
@@ -73,7 +89,10 @@ make -C tests/host test                                   # host tests, ASan and
   writes (the write runs into Booster's flash).
 - `testserver.py` serves a folder (default `tools/dev/builds/testserver`) and generated failure
   routes: `fail-404*`, `fail-500*`, `fail-html200*`, `fail-truncated*`, `fail-stall*`,
-  `fail-loop*`, and `synthetic-NNNN.img` for paging tests. The firmware fetches catalog entries
+  `fail-loop*`, `*slow-*.img` (a 64 KB download that takes 16 s and completes),
+  `synthetic-NNNN.img` for paging tests, and two catalogs apart: `failures/roms.csv` (every failure
+  and redirect route, `make_catalog.py`'s `--cases` rows and a control), and `autorun/roms.csv`,
+  which arms (`autorun-on/.autorun`) and disarms (`autorun-off/.autorun`, empty) the autorun. The firmware fetches catalog entries
   from the catalog's own host on port 80, which is why those are the default ports. Requests are
   logged to `tools/dev/logs/testserver.log`.
 - The self-check cartridge (`selfcheck/selfcheck.s`) reads every patterned word of both banks

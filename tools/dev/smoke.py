@@ -171,7 +171,7 @@ class Session:
 
         # While the ST runs the setup menu: once a ROM runs, only its reset
         # button can reboot it.
-        verdict = swd.cmd_st_reset(argparse.Namespace(wait=30, offset=None, elf=self.elf))
+        verdict = swd.cmd_st_reset(argparse.Namespace(wait=30, offset=None, rom=False, elf=self.elf))
         self.step("st-reset", verdict == 0,
                   "the ST read the cartridge header again, then the framebuffer")
 

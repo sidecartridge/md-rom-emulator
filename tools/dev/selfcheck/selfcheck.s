@@ -16,6 +16,10 @@
 ; each word sent by reading $FB8000 + the word. Nothing answers it in ROM
 ; mode, so it is sent FRAME_REPEATS times and never waits. The verdict then
 ; stays on screen for VERDICT_FRAMES frames before TOS boots on.
+;
+; Last, it installs the remote reset agent (agent.s): from then on the probe
+; can reset the ST (`swd.py st-reset`) whatever the ST shows, as long as it
+; stays powered and nothing takes over its interrupts or tests its RAM.
 
 ROM4_ADDR           equ $FA0000
 WINDOW_BYTES        equ $20000          ; ROM4 and ROM3, 128 KB
@@ -104,6 +108,8 @@ selfcheck:
 	cmp.l _vbclock,d0
 	bhi.s .hold
 
+	bsr agent_install
+
 	movem.l (sp)+,d0-d7/a0-a6
 	rts
 
@@ -178,5 +184,7 @@ msg_read:       dc.b ", read ",0
 msg_expected:   dc.b ", expected ",0
 msg_newline:    dc.b 13,10,0
 	even
+
+	include "agent.s"
 
 selfcheck_end:
