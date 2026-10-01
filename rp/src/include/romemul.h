@@ -35,4 +35,12 @@ int init_romemul(bool copyFlashToRAM);
 // mode: the ST owns the whole window. Returns the read state machine, or -1.
 int init_romemul_two_banks(bool copyFlashToRAM);
 
+// Stops whichever engine is running: its state machines off, its DMA channels
+// aborted, the latch controls back at idle and the data lines as inputs.
+void romemul_stop(void);
+
+// The window offset of the last word the ST read, or -1 with no engine: the
+// channel that serves the bus keeps its read address at the word it served.
+int32_t romemul_lastReadOffset(void);
+
 #endif  // ROMEMUL_H

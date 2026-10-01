@@ -109,7 +109,11 @@ make -C tests/host test                                   # host tests, ASan and
   JSON report to `tools/dev/logs/smoke-<time>/`. After the launch it waits `--rom-seconds` (15),
   so the ROM (the self-check by default) finishes on the ST before SELECT brings the setup menu
   back under it, and its last step reboots the ST into the menu through the agent: a run leaves
-  the ST where it found it.
+  the ST where it found it. With the self-check, a `verdict` step reads its report from the ROM3 capture a
+  debug build runs in ROM mode (`swd.py ring`: `0x7f01` pass, `0x7f02` fail).
+- `select_harness.py short --expect rom|start` covers ROM mode's other outcomes: `rom` for the
+  autorun's blink (the press restarts the RP into the ROM it stored), `start` for the Delay wait
+  (the ROM goes live without a restart); it reads `romModeLiveUs`.
 - Probe sessions start from the test microfirmware, launched from Booster; never probe Booster
   itself. After flashing a firmware whose cartridge layout differs from the one the ST is running,
   the ST keeps the old cartridge code until it reboots: reset it through the old firmware's

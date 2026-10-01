@@ -15,6 +15,8 @@ does not), reads the terminal and the ST's screen, and checks what happened:
   select     the ROM given with --rom is picked by its number
   launch     [L]aunch: the RP restarts in ROM mode and the window holds
              exactly that file (swd.py window, against --images/<rom>)
+  verdict    the self-check's verdict from the ROM3 capture (debug builds;
+             only for selfcheck.img)
   select-back  after --rom-seconds, a SELECT press brings the setup menu back
   catalog    (--catalog) [D]ownload lists the catalog
   st-back    the ST reboots into the menu (swd.py st-reset, through the
@@ -41,7 +43,9 @@ it. Firmware on the template never starts core 1.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime
+import io
 import json
 import os
 import re
@@ -122,6 +126,24 @@ class Session:
         fb = swd.include_defines().get("DISPLAY_BUFFER_OFFSET", 0x8000)
         return (any(swd.AGENT_SIG_OFFSET <= o < swd.AGENT_SIG_OFFSET + 8 for o in seen)
                 or sum(fb <= o < 0x10000 for o in seen) >= 2)
+
+    def verdict(self) -> None:
+        """The self-check's verdict, from the ROM3 capture a debug build runs
+        in ROM mode (swd.py ring): $7F01 pass, $7F02 fail."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            swd.cmd_ring(argparse.Namespace(elf=self.elf, mark=False,
+                                            since_mark=False))
+        text = out.getvalue()
+        if "0x7f02" in text:
+            self.step("verdict", False, "the self-check reported a word that "
+                      "did not match: " + text.strip().splitlines()[0])
+        elif "0x7f01" in text:
+            self.step("verdict", True, "the ST read the whole window back")
+        else:
+            self.skip("verdict", "nothing in the ROM3 capture (a release "
+                      "build captures nothing in ROM mode, or the ST did not "
+                      "run the ROM)")
 
     def select_short(self) -> None:
         defs = swd.include_defines()
@@ -224,6 +246,8 @@ class Session:
         # the window, holds its verdict 5 s and installs the agent. A SELECT
         # before that puts the setup menu under the code the ST is running.
         time.sleep(a.rom_seconds)
+        if os.path.basename(a.rom) == "selfcheck.img":
+            self.verdict()
         self.reset_expected = True
         self.select_short()
         if a.park_core1:

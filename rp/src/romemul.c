@@ -14,6 +14,8 @@ static int lookupDataRomDmaChannel = -1;
 
 // Default PIO to use
 static PIO defaultPio = pio0;
+// The state machines the running engine uses, for romemul_stop().
+static uint32_t engineSmMask = 0;
 
 static int initRomEmulator(PIO pio) {
   // Configure DMAs
@@ -51,6 +53,7 @@ static int initRomEmulator(PIO pio) {
 
   // Claim a free state machine from the PIO read program
   uint smReadROM = pio_claim_unused_sm(pio, true);
+  engineSmMask |= 1u << smReadROM;
 
   // Start the state machine, executing the PIO read program
   romemul_read_program_init(pio, smReadROM, offsetReadROM, READ_ADDR_GPIO_BASE,
@@ -195,6 +198,7 @@ static int initTwoBankEmulator(PIO pio) {
     DPRINTF("Failed to claim the state machines for the two-bank ROM.\n");
     return -1;
   }
+  engineSmMask |= (1u << smMonitorRom3) | (1u << smMonitorRom4) | (1u << smRead);
   DPRINTF("Two-bank ROM: SM %d (ROM3) %d (ROM4) %d (read), DMA %d %d\n",
           smMonitorRom3, smMonitorRom4, smRead, readAddrRomDmaChannel,
           lookupDataRomDmaChannel);
@@ -287,3 +291,48 @@ int init_romemul_two_banks(bool copyFlashToRAM) {
   return smRead;
 }
 
+void romemul_stop(void) {
+  // The state machines first: no more bus cycles, no more DMA requests.
+  pio_set_sm_mask_enabled(defaultPio, engineSmMask, false);
+  engineSmMask = 0;
+
+  // The two channels chain to each other: abort them in one write.
+  uint32_t dmaMask = 0;
+  if (readAddrRomDmaChannel >= 0) {
+    dmaMask |= 1u << (uint)readAddrRomDmaChannel;
+  }
+  if (lookupDataRomDmaChannel >= 0) {
+    dmaMask |= 1u << (uint)lookupDataRomDmaChannel;
+  }
+  if (dmaMask != 0U) {
+    dma_hw->abort = dmaMask;
+    while ((dma_hw->abort & dmaMask) != 0U) {
+      tight_loop_contents();
+    }
+  }
+
+  // A state machine stopped mid-cycle leaves its side-set pins and pin
+  // directions as they were. Hand the latch controls back to the CPU at their
+  // idle level (high: both latches off), then the data lines as inputs.
+  const uint32_t controls =
+      (1u << READ_SIGNAL_GPIO_BASE) | (1u << WRITE_SIGNAL_GPIO_BASE);
+  gpio_put_masked(controls, controls);
+  gpio_set_dir_out_masked(controls);
+  gpio_set_function(READ_SIGNAL_GPIO_BASE, GPIO_FUNC_SIO);
+  gpio_set_function(WRITE_SIGNAL_GPIO_BASE, GPIO_FUNC_SIO);
+  const uint32_t data = ((1u << WRITE_DATA_PIN_COUNT) - 1u)
+                        << WRITE_DATA_GPIO_BASE;
+  gpio_set_dir_in_masked(data);
+  for (uint pin = WRITE_DATA_GPIO_BASE;
+       pin < WRITE_DATA_GPIO_BASE + WRITE_DATA_PIN_COUNT; pin++) {
+    gpio_set_function(pin, GPIO_FUNC_SIO);
+  }
+}
+
+int32_t romemul_lastReadOffset(void) {
+  if (lookupDataRomDmaChannel < 0) {
+    return -1;
+  }
+  return (int32_t)(dma_hw->ch[lookupDataRomDmaChannel].read_addr -
+                   (uint32_t)&__rom_in_ram_start__);
+}

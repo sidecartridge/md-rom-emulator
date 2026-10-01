@@ -73,7 +73,7 @@ App settings keys live in `aconfig.h` (`FOLDER`, `EMULATED`, `MODE`, `HTTP_CATAL
 
 ### ROM bus emulation core (`romemul.c` + `romemul.pio`)
 
-PIO state machines watch the Atari cartridge bus (16 address/data GPIOs multiplexed through latches starting at GPIO 6, READ/WRITE latch signals on GPIO 27/28, `!ROM4` on GPIO 22 and `!ROM3` on GPIO 26; see `constants.h`), and DMA channels serve 16-bit reads directly from RAM with no CPU involvement and no IRQ. Setup mode loads the template's 16-bit program, which serves ROM4 (`$FA0000`) from the lower 64 KB of `ROM_IN_RAM`, plus the command ring below. ROM mode loads `romemul_read_two_banks` (17 address bits, `init_romemul_two_banks()`): ROM4 from the lower 64 KB and ROM3 (`$FB0000`) from the upper, and nothing else, because the user's ROM owns the whole window. Every DMA channel and state machine is claimed, never hard-coded. Hot paths are `__not_in_flash_func`.
+PIO state machines watch the Atari cartridge bus (16 address/data GPIOs multiplexed through latches starting at GPIO 6, READ/WRITE latch signals on GPIO 27/28, `!ROM4` on GPIO 22 and `!ROM3` on GPIO 26; see `constants.h`), and DMA channels serve 16-bit reads directly from RAM with no CPU involvement and no IRQ. Setup mode loads the template's 16-bit program, which serves ROM4 (`$FA0000`) from the lower 64 KB of `ROM_IN_RAM`, plus the command ring below. ROM mode loads `romemul_read_two_banks` (17 address bits, `init_romemul_two_banks()`): ROM4 from the lower 64 KB and ROM3 (`$FB0000`) from the upper, and nothing else, because the user's ROM owns the whole window. Every DMA channel and state machine is claimed, never hard-coded, and `romemul_stop()` / `commemul_stop()` release the bus (state machines off, DMA aborted, the latch controls back at idle) before every reset and before the jump to Booster (`emul_quiesce()`). Before `[X]` jumps, the reset command stays in place until the ST has rebooted (its TOS reads the cartridge header); a launch instead holds it 500 ms and restarts the RP within the cartridge's own `PRE_RESET_WAIT` (about 2.4 s at 8 MHz), so TOS finds the new ROM. ROM mode is live 11.4 ms after reset (release) and records the boot race in RAM (`romModeLiveUs`, `romModeAccessBeforeLive`, `romModeFirstAccessUs`); a debug build also captures ROM3 reads in ROM mode, passively, so `swd.py ring` reads a test cartridge's reports. Hot paths are `__not_in_flash_func`.
 
 ### Setup-mode communication (Atari ⇄ RP2040)
 
@@ -107,6 +107,7 @@ Setup mode is the template's at `6935f53`; every other file under `rp/src` and `
 - **`constants.h`, `romemul.*`, `memmap_rp.ld`:** two 64 KB banks (`ROM_BANKS`, the two-bank PIO program, `RAM` and `ROM_IN_RAM` 128 KB each).
 - **`download.c`:** the saved file's name has its `%XX` escapes decoded, so `Buggy%20Boy.img` is saved as `Buggy Boy.img`.
 - **`tprotocol.h`:** a plain-C payload store for host builds (`tests/host`); the RP still uses the `strh` asm.
+- **`commemul.c`:** a `commemul_stop()`, which the template lacks.
 - **`main.s`:** the SHIFT keys are checked again (the setup screen offers SHIFT to boot to the desktop). **`userfw.s`:** a stub that returns to TOS.
 - **HTTP only:** the HTTPS download profile (`APP_DOWNLOAD_HTTPS=1`) compiles but does not fit in this app's 128 KB of `RAM` yet.
 
