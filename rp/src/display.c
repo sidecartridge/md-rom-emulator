@@ -1,8 +1,8 @@
 /**
  * File: display.c
  * Author: Diego Parrilla Santamaría
- * Date: December 2024
- * Copyright: 2024 - GOODDATA LABS SL
+ * Date: December 2024, February 2026
+ * Copyright: 2024-2026 - GOODDATA LABS SL
  * Description: Common functions for the display
  */
 
@@ -22,7 +22,6 @@ static unsigned char u8g2Buffer[DISPLAY_BUFFER_SIZE] = {0};
 #else
 static unsigned char *u8g2Buffer = NULL;
 #endif
-
 // Global u8g2 structure
 static u8g2_t u8g2 = {0};
 
@@ -76,13 +75,13 @@ u8g2_t *display_getU8g2Ref() { return &u8g2; }
 uint32_t display_getAddress() { return displayAddress; }
 
 // Setter function for display address
-void setDisplayAddress(uint32_t address) { displayAddress = address; }
+static void setDisplayAddress(uint32_t address) { displayAddress = address; }
 
 // Getter function for display command address
 uint32_t display_getCommandAddress() { return displayCommandAddress; }
 
 // Setter function for display command address
-void setDisplayCommandAddress(uint32_t address) {
+static void setDisplayCommandAddress(uint32_t address) {
   displayCommandAddress = address;
 }
 
@@ -92,7 +91,7 @@ uint32_t display_getHighresTranstableAddress() {
 }
 
 // Setter function for highres translation table address
-void setDisplaysHighresTranstableAddress(uint32_t address) {
+static void setDisplaysHighresTranstableAddress(uint32_t address) {
   displaysHighresTranstableAddress = address;
 }
 
@@ -121,10 +120,9 @@ void display_setupU8g2() {
   setDisplayAddress((unsigned int)&__rom_in_ram_start__ +
                     DISPLAY_BUFFER_OFFSET);
   setDisplayCommandAddress((unsigned int)&__rom_in_ram_start__ +
-                           DISPLAY_BUFFER_OFFSET +
-                           DISPLAY_COMMAND_ADDRESS_OFFSET);
+                           DISPLAY_COMMAND_ADDRESS);
   setDisplaysHighresTranstableAddress((unsigned int)&__rom_in_ram_start__ +
-                                      DISPLAY_HIGHRES_TRANSTABLE_OFFSET);
+                                      DISPLAY_HIGHRES_TRANSTABLE_ADDR);
   DPRINTF("Display buffer address: 0x%08x\n", (unsigned int)u8g2Buffer);
   DPRINTF("Display command address: 0x%08x\n", display_getCommandAddress());
   DPRINTF("Highres translation table address: 0x%08x\n",
@@ -160,6 +158,18 @@ void display_refresh() {
 #endif
 }
 
+void display_drawProductInfo() {
+  // Product info
+  char productStr[DISPLAY_MAX_CHARACTERS] = {0};
+  u8g2_SetFont(&u8g2, u8g2_font_squeezed_b7_tr);
+  snprintf(productStr, sizeof(productStr), "%s %s - %s", DISPLAY_PRODUCT_MSG,
+           RELEASE_VERSION, DISPLAY_COPYRIGHT_MESSAGE);
+  u8g2_DrawStr(
+      &u8g2,
+      LEFT_PADDING_FOR_CENTER(productStr, 68) * DISPLAY_NARROW_CHAR_WIDTH,
+      DISPLAY_HEIGHT, productStr);
+}
+
 void display_generateMaskTable(uint32_t memoryAddress) {
   for (int i = 0; i < DISPLAY_MASK_TABLE_SIZE; i++) {
     unsigned int mask = 0;
@@ -173,7 +183,7 @@ void display_generateMaskTable(uint32_t memoryAddress) {
 
     // Store the 16 bit result mask in the memory address
 #if DISPLAY_HIGHRES_INVERT == 1
-    WRITE_WORD(memory_address, i * 2, ~mask);
+    WRITE_WORD(memoryAddress, i * 2, ~mask);
 #else
     WRITE_WORD(memoryAddress, i * 2, mask);
 #endif
@@ -185,6 +195,15 @@ void display_generateMaskTable(uint32_t memoryAddress) {
 // They should be the same as the number of bytes in a row of chars
 void display_scrollup(uint16_t blankBytes) {
   // blank bytes is the number of bytes to blank out at the bottom of the screen
+  if (blankBytes == 0) {
+    return;
+  }
+
+  if (blankBytes >= DISPLAY_BUFFER_SIZE) {
+    memset(u8g2Buffer, 0, DISPLAY_BUFFER_SIZE);
+    return;
+  }
+
   memmove(u8g2Buffer, u8g2Buffer + blankBytes,
           DISPLAY_BUFFER_SIZE - blankBytes);
   memset(u8g2Buffer + DISPLAY_BUFFER_SIZE - blankBytes, 0, blankBytes);

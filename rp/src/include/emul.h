@@ -1,8 +1,8 @@
 /**
  * File: emul.h
  * Author: Diego Parrilla Santamaría
- * Date: January 20205
- * Copyright: 2025 - GOODDATA LABS SL
+ * Date: January 2025, October 2026
+ * Copyright: 2025-2026 - GOODDATA LABS SL
  * Description: Header for the ROM emulator core and setup features
  */
 
@@ -42,8 +42,8 @@
 
 typedef struct {
   char filename[MAX_FILENAME_LENGTH];
-  // You can add other fields (e.g. file size, type, etc.)
-  char path[MAX_PATH_SIZE];
+  // No path: the folder and the file name make it when it is needed. A ROM
+  // list is MAX_ROMS entries on the heap.
   char name[MAX_FILENAME_LENGTH];
   char description[MAX_PATH_SIZE];
   char tags[MAX_FILENAME_LENGTH];
@@ -93,5 +93,18 @@ typedef struct {
  * user interaction and potential system resets.
  */
 void emul_start();
+
+// App commands for `tools/dev/swd.py app NAME [WORDS...]`, debug builds only;
+// the name after DEVHOOKS_APP_ is the one the tool takes.
+//   heap_hold KB   hold KB more kilobytes of heap (0 releases everything);
+//                  answers 0 when the allocation is refused, so repeated calls
+//                  walk the heap down to a known remainder.
+#define DEVHOOKS_APP_HEAP_HOLD 1
+//   download       download the URL the host wrote into devdownloadState
+//                  (devdownload.h) to the app folder, then hash it; answers 1
+//                  when started, 0 while one runs.
+//                  tools/dev/download_harness.py drives it and reads the
+//                  outcome.
+#define DEVHOOKS_APP_DOWNLOAD 2
 
 #endif  // EMUL_H

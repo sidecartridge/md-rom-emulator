@@ -1,8 +1,8 @@
 /**
  * File: gconfig.h
  * Author: Diego Parrilla Santamaría
- * Date: November 2024
- * Copyright: 2024 - GOODDATA LABS SL
+ * Date: November 2024, February 2026
+ * Copyright: 2024-2026 - GOODDATA LABS SL
  * Description: Header file for the global configuration manager
  */
 

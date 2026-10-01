@@ -52,10 +52,13 @@ if [ "$make_status" -ne 0 ]; then
     exit $make_status
 fi
 
-# The image the RP serves is padded to 64 KB below; the cartridge code itself
-# has no smaller budget until it moves to the template's layout.
+# Cartridge code budget: header + code must fit in 8 KB
+# (CHANDLER_CARTRIDGE_CODE_SIZE in rp/src/include/chandler.h, mirrored as
+# CARTRIDGE_CODE_SIZE in target/atarist/src/main.s). Enforce here so the
+# build fails fast instead of silently overlapping the shared block.
 # stat directly on the host to avoid the stcmd banner contaminating stdout.
 boot_bin="$working_folder/dist/BOOT.BIN"
+cartridge_max=8192
 if [ ! -f "$boot_bin" ]; then
     echo "ERROR: $boot_bin not produced by stcmd make"
     exit 4
@@ -65,7 +68,13 @@ if [ "$(uname)" = "Darwin" ]; then
 else
     boot_size=$(stat -c %s "$boot_bin")
 fi
-echo "Cartridge code: $boot_size bytes"
+if [ "$boot_size" -gt "$cartridge_max" ]; then
+    echo "ERROR: cartridge code is $boot_size bytes; limit is $cartridge_max"
+    echo "       (CHANDLER_CARTRIDGE_CODE_SIZE in chandler.h /"
+    echo "        CARTRIDGE_CODE_SIZE in main.s)"
+    exit 5
+fi
+echo "Cartridge code: $boot_size / $cartridge_max bytes"
 
 #filename_tos="./dist/SIDECART.TOS"
 

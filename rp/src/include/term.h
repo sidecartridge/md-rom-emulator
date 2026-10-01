@@ -1,53 +1,27 @@
 /**
  * File: term.h
  * Author: Diego Parrilla Santamaría
- * Date: January 20205
- * Copyright: 2025 - GOODDATA LABS SL
+ * Date: January 20205, February 2026
+ * Copyright: 2025-2026 - GOODDATA LABS SL
  * Description: Header for the terminal
  */
 
 #ifndef TERM_H
 #define TERM_H
 
+#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#include "aconfig.h"
-#include "constants.h"
-#include "debug.h"
-#include "display_term.h"
-#include "hardware/dma.h"
-#include "memfunc.h"
-#include "reset.h"
-#include "time.h"
+#include "pico.h"
 #include "tprotocol.h"
-
-#define ADDRESS_HIGH_BIT 0x8000  // High bit of the address
-
-#ifndef ROM3_GPIO
-#define ROM3_GPIO 26
-#endif
 
 #ifndef ROM4_GPIO
 #define ROM4_GPIO 22
 #endif
 
-// Use the highest 4K of the shared memory for the terminal commands
-#define TERM_RANDOM_TOKEN_OFFSET \
-  0xF000  // Random token offset in the shared memory
-#define TERM_RANDON_TOKEN_SEED_OFFSET \
-  (TERM_RANDOM_TOKEN_OFFSET +         \
-   4)  // Random token seed offset in the shared memory: 0xF004
-
-// The shared variables are located in the + 0x200 offset
-#define TERM_SHARED_VARIABLES_OFFSET \
-  (TERM_RANDOM_TOKEN_OFFSET +        \
-   0x200)  // Shared variables offset in the shared memory: 0xF200
-
-// Shared variables for common use. Must be set in the init function
-#define TERM_HARDWARE_TYPE (0)     // Hardware type. 0xF200
-#define TERM_HARDWARE_VERSION (1)  // Hardware version.  0xF204
+// Random-token publish and shared-variable layout are owned by chandler
+// (see CHANDLER_RANDOM_TOKEN_OFFSET / CHANDLER_SHARED_VARIABLES_OFFSET in
+// chandler.h). The previous TERM_*_OFFSET / TERM_HARDWARE_* defines were
+// removed when chandler took over.
 
 // App commands for the terminal
 #define APP_TERMINAL 0x00  // The terminal app
@@ -59,7 +33,7 @@
 #ifdef DISPLAY_ATARIST
 // Terminal size for Atari ST
 #define TERM_SCREEN_SIZE_X 40
-#define TERM_SCREEN_SIZE_Y 25
+#define TERM_SCREEN_SIZE_Y 24  // Leave last line for status
 #define TERM_SCREEN_SIZE (TERM_SCREEN_SIZE_X * TERM_SCREEN_SIZE_Y)
 
 #define TERM_DISPLAY_BYTES_PER_CHAR 8
@@ -103,7 +77,14 @@ typedef struct {
   void (*handler)(const char *arg);
 } Command;
 
-void __not_in_flash_func(term_dma_irq_handler_lookup)(void);
+/**
+ * @brief chandler callback that publishes a parsed protocol command
+ *        into the terminal double-buffer for term_loop() to drain.
+ *
+ * Register with chandler_addCB() during application init.
+ */
+void __not_in_flash_func(term_command_cb)(TransmissionProtocol *protocol,
+                                          uint16_t *payloadPtr);
 
 void term_init(void);
 
@@ -136,6 +117,23 @@ void term_clearScreen(void);
  * commands.
  */
 void term_setCommands(const Command *cmds, size_t count);
+/**
+ * @brief Clears the terminal's input buffer.
+ *
+ * This function removes any pending characters in the input buffer,
+ * ensuring that subsequent input operations start with a clean state.
+ */
+void term_clearInputBuffer(void);
+
+/**
+ * @brief Retrieve the current terminal input buffer.
+ *
+ * This function returns a pointer to the buffer holding the input from the
+ * terminal. The buffer is used for processing terminal input.
+ *
+ * @return char* A pointer to the terminal's input buffer.
+ */
+char *term_getInputBuffer(void);
 
 // Generic commands to be used in the terminal
 // Manage application setttings
@@ -147,6 +145,9 @@ void term_cmdGet(const char *arg);
 void term_cmdPutInt(const char *arg);
 void term_cmdPutBool(const char *arg);
 void term_cmdPutString(const char *arg);
+void term_printNetworkInfo(void);
+void term_markMenuPromptCursor(void);
+void term_refreshMenuLiveInfo(void);
 
 void __not_in_flash_func(term_loop)();
 

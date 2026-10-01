@@ -132,7 +132,7 @@ pchar2	macro
 	pchar	\1
 	pchar	\2
 	movem.l	(sp)+,d0-d2/a0-a2
-	endmv
+	endm
 
 crlf	macro
 	movem.l	d0-d2/a0-a2,-(sp)
@@ -226,6 +226,8 @@ Setcolor	EQU	7
 Floprd		EQU	8
 Flopwr		EQU	9
 Flopfmt		EQU	10
+Mfpint		EQU	13
+Flopver		EQU	19		; $13: not 13, which is Mfpint
 Random		EQU	17
 
 ; System variables

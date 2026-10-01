@@ -1,8 +1,8 @@
 /**
  * File: debug.h
  * Author: Diego Parrilla Santamaría
- * Date: July 2023
- * Copyright: 2023 - GOODDATA LABS SL
+ * Date: July 2023, February 2026
+ * Copyright: 2023-2026 - GOODDATA LABS SL
  * Description: Header file for basic traces and debug messages
  */
 
@@ -40,7 +40,5 @@
 #define DPRINTF(fmt, ...)
 #define DPRINTFRAW(fmt, ...)
 #endif
-
-typedef void (*IRQInterceptionCallback)();
 
 #endif  // DEBUG_H

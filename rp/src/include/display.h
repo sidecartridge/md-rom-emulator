@@ -1,8 +1,8 @@
 /**
  * File: display.h
  * Author: Diego Parrilla Santamaría
- * Date: December 2024
- * Copyright: 2024 - GOODDATA LABS SL
+ * Date: December 2024, February 2026
+ * Copyright: 2024-2026 - GOODDATA LABS SL
  * Description: Header file for the shared displat functions
  */
 
@@ -55,24 +55,28 @@
 // Buffer size calculation: width * (height / 8)
 #define DISPLAY_BUFFER_SIZE \
   (uint32_t)((DISPLAY_WIDTH / DISPLAY_TILE_HEIGHT) * DISPLAY_HEIGHT)
-#define DISPLAY_COPYRIGHT_MESSAGE "(C)GOODDATA LABS SL 2023-25"
+#define DISPLAY_COPYRIGHT_MESSAGE "(C)GOODDATA LABS SL 2023-26"
 #define DISPLAY_PRODUCT_MSG "SidecarTridge Multi-Device"
 #define DISPLAY_RESET_WAIT_MESSAGE "Resetting the computer"
 #define DISPLAY_RESET_FORCE_MESSAGE "Reset manually if it doesn't boot."
 
-// Display buffer offset
-#define DISPLAY_BUFFER_OFFSET 0x8000
+// Display offsets are derived from the shared-region layout owned by
+// chandler.h. The framebuffer sits at the top of the 64 KB region; the
+// command sentinel and the high-res translation table both live in the
+// shared block at the bottom of the region.
+#include "chandler.h"
 
-// Commands offset. BUFFER_OFFSET + ADDRESS_OFFSET
-#define DISPLAY_COMMAND_ADDRESS_OFFSET 8000
-
-// Highres translate table offset: BUFFER_OFFSET + TRANSTABLE_OFFSET
-#define DISPLAY_HIGHRES_TRANSTABLE_OFFSET 0x1000
+#define DISPLAY_BUFFER_OFFSET           CHANDLER_FRAMEBUFFER_OFFSET
+#define DISPLAY_COMMAND_ADDRESS         CHANDLER_CMD_SENTINEL_OFFSET
+#define DISPLAY_HIGHRES_TRANSTABLE_ADDR CHANDLER_APP_BUFFERS_OFFSET
 
 // Commands sent to the active loop in the display terminal application
 #define DISPLAY_COMMAND_NOP 0x0       // Do nothing, clean the command buffer
 #define DISPLAY_COMMAND_RESET 0x1     // Reset the computer
 #define DISPLAY_COMMAND_CONTINUE 0x2  // Continue the boot process
+#define DISPLAY_COMMAND_TERMINAL \
+  0x3                              //  Terminal. Not used from RP to Computer.
+#define DISPLAY_COMMAND_START 0x4  // Continue boot process and emulation
 
 /**
  * @brief Sends a command to the display.
@@ -116,6 +120,15 @@ void display_setupU8g2();
  * content is updated.
  */
 void display_refresh();
+
+/**
+ * @brief Draws product information on the display.
+ *
+ * Sets the appropriate font, composes a string with the product message,
+ * release version, and copyright information, centers it using calculated left
+ * padding, and renders the text.
+ */
+void display_drawProductInfo();
 
 /**
  * @brief Generates a high-resolution mask table. Used to speed up high-res
