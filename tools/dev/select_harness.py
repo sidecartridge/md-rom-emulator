@@ -5,7 +5,10 @@ Each case presses SELECT through swd.py's GPIO input override, then reads the
 firmware's own state over SWD and says whether it matches the behaviour:
 
   bounce           15 ms press: ignored (the debounce is 30 ms)
-  short            short press: the RP restarts into the app
+  short            short press: the RP restarts into the app's setup menu.
+                   --expect rom: it restarts into ROM mode (autorun's end
+                   state); --expect start: no restart, the ROM goes live
+                   (the Delay wait)
   long             a press held past SELECT_LONG_RESET: factory reset (the
                    global settings are erased and the RP restarts into
                    Booster, which then clears every app's settings). Needs
@@ -34,6 +37,8 @@ FLASH_END = 0x10200000  # 2 MB flash on the SidecarTridge Multi-device
 BOUNCE_MS = 15
 
 SYMBOLS = ("keepActive", "_config_flash_start", "screen")
+# The ROM Emulator's ROM mode: the timer when the engine went live, 0 before.
+ROM_LIVE = "romModeLiveUs"
 # The template's menu flag. An app without it (the ROM Emulator) counts its
 # menu as shown when the terminal reads MENU_PROMPT.
 MENU_FLAG = "menuScreenActive"
@@ -43,7 +48,7 @@ MENU_PROMPT = b"Select an option"
 class Harness:
     def __init__(self, elf: str | None):
         self.elf = swd.matching_elf(elf)
-        self.sym = swd.elf_symbols(self.elf, *SYMBOLS, MENU_FLAG)
+        self.sym = swd.elf_symbols(self.elf, *SYMBOLS, MENU_FLAG, ROM_LIVE)
         missing = [s for s in SYMBOLS if s not in self.sym]
         if missing:
             raise swd.SwdError(f"{self.elf} lacks {', '.join(missing)}")
@@ -62,6 +67,8 @@ class Harness:
         return {
             "uptime_us": swd.read_word(TIMERAWL),
             "menu": self.menu_shown(),
+            "rom_live_us": (swd.read_word(self.sym[ROM_LIVE][0])
+                            if ROM_LIVE in self.sym else None),
             "running": self.byte("keepActive"),
         }
 
@@ -82,6 +89,18 @@ class Harness:
                 pass  # the debug port drops while the chip restarts
         return False
 
+    def wait_rom_live(self, timeout: float = 15.0) -> bool:
+        """True once ROM mode serves the bus (romModeLiveUs is set)."""
+        end = time.time() + timeout
+        while time.time() < end:
+            try:
+                if self.state()["rom_live_us"]:
+                    return True
+            except swd.SwdError:
+                pass
+            time.sleep(0.5)
+        return False
+
     def wait_menu(self, timeout: float = 30.0) -> bool:
         """True once the restarted app has drawn its setup menu."""
         end = time.time() + timeout
@@ -96,9 +115,12 @@ class Harness:
 
 
 def show(label: str, st: dict) -> None:
+    rom = st.get("rom_live_us")
+    live = "" if rom is None else (
+        f"; ROM mode live at {rom / 1000:.1f} ms" if rom else "; ROM mode not live")
     print(f"{label}: setup menu {'shown' if st['menu'] else 'not shown'}; "
           f"main loop {'running' if st['running'] else 'leaving'}; "
-          f"uptime {st['uptime_us'] / 1e6:.1f} s")
+          f"uptime {st['uptime_us'] / 1e6:.1f} s{live}")
 
 
 def verdict(ok: bool, what: str) -> int:
@@ -118,14 +140,24 @@ def case_bounce(h: Harness) -> int:
                    f"a {BOUNCE_MS} ms press is ignored")
 
 
-def case_short(h: Harness) -> int:
+def case_short(h: Harness, expect: str = "setup") -> int:
     before = h.state()
     show("before", before)
     h.press(swd.SELECT_SHORT_MS)
+    if expect == "start":
+        live = h.wait_rom_live()
+        after = h.state()
+        show("after ", after)
+        return verdict(live and after["uptime_us"] > before["uptime_us"],
+                       "a short press in the Delay wait starts the ROM, "
+                       "without a restart")
     reset = h.wait_reset(before["uptime_us"])
-    back = reset and h.wait_menu()
+    back = reset and (h.wait_rom_live() if expect == "rom" else h.wait_menu())
     if reset:
         show("after ", h.state())
+    if expect == "rom":
+        return verdict(reset and back, "a short press restarts the RP into "
+                       "ROM mode, the ROM live")
     return verdict(reset and back, "a short press restarts the RP into the "
                    "app's setup menu (reset the ST for its hello)")
 
@@ -178,6 +210,8 @@ def main() -> int:
     ap.add_argument("file", nargs="?", help="backup file (backup/restore/long)")
     ap.add_argument("--elf")
     ap.add_argument("--force", action="store_true")
+    ap.add_argument("--expect", choices=["setup", "rom", "start"],
+                    default="setup", help="short: what the press leads to")
     args = ap.parse_args()
     try:
         h = Harness(args.elf)
@@ -192,7 +226,7 @@ def main() -> int:
         if args.case == "bounce":
             return case_bounce(h)
         if args.case == "short":
-            return case_short(h)
+            return case_short(h, args.expect)
         return case_long(h, args.force, args.file or os.path.join(
             swd.HERE, "logs", time.strftime("settings-%Y%m%d-%H%M%S.bin")))
     except swd.SwdError as e:
