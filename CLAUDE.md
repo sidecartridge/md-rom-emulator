@@ -17,7 +17,7 @@ See also: `../md-microfirmware-template/CLAUDE.md` (the SidecarTridge microfirmw
 
 ## Build commands
 
-Prerequisites: `arm-none-eabi-*` toolchain, CMake 3.26+, Python, `stcmd` on PATH, git submodules initialized (`pico-sdk`, `pico-extras`, `fatfs-sdk` — do not vendor or change their pins).
+Prerequisites: `arm-none-eabi-*` toolchain, CMake 3.26+, Python, `stcmd` on PATH, git submodules initialized (`pico-sdk` 2.2.0, `pico-extras` sdk-2.2.0, `fatfs-sdk` v3.6.2, the template's — do not vendor them; their pins change only in a planned upgrade).
 
 ```sh
 # Full build (target + rp + dist packaging)
@@ -36,7 +36,7 @@ tools/dev/flash.sh debug            # or release; --build-only to just build
 
 Build-script caveats (from AGENTS.md — respect these):
 
-- **Avoid running `./build.sh` or `rp/build.sh` unless asked**: they delete `build/` and `dist/`, re-pin submodule tags (pico-sdk 2.1.0, pico-extras sdk-2.1.0, fatfs-sdk pinned commit), and patch `fatfs-sdk/src/include/ffconf.h` to enable `FF_USE_CHMOD`. For verification, use `tools/dev/flash.sh <debug|release> --build-only`: it builds out of tree in `tools/dev/builds/` with rp/build.sh's environment and build type, and never touches `rp/build` or the submodules. A direct compile only links if that `FF_USE_CHMOD` patch is already present in the submodule (`download.c` calls `f_chmod`); it shows up as a local modification in `fatfs-sdk` — leave it in place.
+- **Avoid running `./build.sh` or `rp/build.sh` unless asked**: they delete `build/` and `dist/`, and re-pin the submodule tags. For verification, use `tools/dev/flash.sh <debug|release> --build-only`: it builds out of tree in `tools/dev/builds/` with rp/build.sh's environment and build type, and never touches `rp/build` or the submodules. FatFs is configured by `rp/src/ff/ffconf.h` (it wins over the submodule's copy through a `BEFORE PRIVATE` include), so the submodules stay pristine.
 - `BOARD_TYPE` (env, default `pico_w`) selects `BOARD_TYPE_PICO_W`/`BOARD_TYPE_PICO` macros; the CYW43/lwIP WiFi stack is linked only when the board supports it (`pico_w`). `APP_UUID_KEY` (env) becomes `CURRENT_APP_UUID_KEY`; without it CMake uses the `4444…` dev UUID, which must match an app registered by the Booster or `main.c` jumps back to the Booster.
 - The RP firmware is **always compiled `MinSizeRel`** regardless of the build-type argument — `Release` breaks (memory issues). The build-type argument only controls `DEBUG_MODE` (UART debug output via `DPRINTF`) and artifact naming.
 - Every build carries a build ID in flash (`release_build_id`, from `rp/src/build_id.cmake`: the commit, `-dirty.<hash>` for uncommitted changes, `+minsizerel` for the current build type, `+debug`), and the ELF keeps its symbol table; `swd.py build-id` reads the ID off a running RP. Debug builds run the console at 921,600 baud.
@@ -103,8 +103,6 @@ Where this repo differs from the current `md-microfirmware-template` (don't appl
 
 - **No `userfw.s` / 8KB cartridge budget / `chandler.h`.** The target is a single `target/atarist/src/main.s` (plus `src/inc/` helpers); the only size check is the 64KB cap in `target/atarist/build.sh`.
 - **Shared-region offsets differ:** framebuffer at `$FA8000` (not `$FAE0C0`), random token block at `$FAF000`. Offsets are defined in `main.s` and `rp/src/include/constants.h` — always use the named symbols.
-- **No `rp/src/ff/ffconf.h` override.** FatFs config is patched *into the submodule* by `rp/build.sh` (sed enables `FF_USE_CHMOD` in `fatfs-sdk/src/include/ffconf.h`). A stray `ffconf.h.bak` at the root is a byproduct of that patch.
-- **Submodule pins:** pico-sdk 2.1.0 / pico-extras sdk-2.1.0 (template uses 2.2.0).
 - **lwIP mode:** `pico_cyw43_arch_lwip_threadsafe_background` (template uses poll mode).
 - **No `tprotocol.c`** — only the header `rp/src/include/tprotocol.h` (macros).
 
@@ -118,7 +116,7 @@ Follow the "Working style" and "Editing guardrails" sections of `../md-microfirm
 - **No power-cycle series**: the machines are 40 years old. Reboot through the menu, `st-reset` or the agent; a single cold start only when the cold start itself is under test, asked first with the reason.
 - **Don't commit, push or open a PR until Diego's go-ahead** at the end of the work; then do all three.
 - **No AI attribution anywhere**: no "Generated with Claude Code", no `Co-Authored-By: Claude` trailers, no AI mentions in commits, PRs, comments, or docs. Write messages as the human author.
-- Never modify the submodules (`pico-sdk/`, `pico-extras/`, `fatfs-sdk/`) or their pins.
+- Never modify the submodules (`pico-sdk/`, `pico-extras/`, `fatfs-sdk/`). Their pins change only in a planned upgrade, in `rp/build.sh`, `tools/dev/flash.sh` and the recorded commits together.
 - Don't add features to `main.c` — feature work starts in `emul.c` or a new module.
 
 ## Releases / CI

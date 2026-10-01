@@ -68,8 +68,9 @@ cd rp
 ./build.sh <board_type> <build_type>
 ```
 Notes:
-- `rp/build.sh` **pins submodule tags**, patches FatFs `ffconf.h` to enable
-  `FF_USE_CHMOD`, and deletes `rp/build/`.
+- `rp/build.sh` **pins submodule tags** (pico-sdk 2.2.0, pico-extras sdk-2.2.0,
+  fatfs-sdk v3.6.2) and deletes `rp/build/`; FatFs is configured by
+  `rp/src/ff/ffconf.h`, so the submodules stay pristine.
 - `rp/build.sh` always configures with `-DCMAKE_BUILD_TYPE=MinSizeRel`
   (ignores the passed build type for CMake).
 - Both `rp/build.sh` and the root `build.sh` delete/replace `dist/`.

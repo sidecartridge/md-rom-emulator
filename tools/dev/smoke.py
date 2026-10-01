@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """A whole session on the hardware, driven through the Debug Probe.
 
-    python3 tools/dev/smoke.py [--rom pattern-128k.rom] [--images DIR]
+    python3 tools/dev/smoke.py [--rom selfcheck.img] [--images DIR]
                                [--catalog] [--hands] [--elf ELF]
 
 With the RP in its setup menu, it types into the menu (swd.py key, which uses
@@ -9,7 +9,8 @@ the devhooks mailbox when the firmware has one and the command slot when it
 does not), reads the terminal and the ST's screen, and checks what happened:
 
   menu       the menu comes up
-  st-reset   the ST reboots from the menu (swd.py st-reset) and comes back
+  st-reset   the ST reboots (swd.py st-reset) and comes back to the menu;
+             skipped when nothing on the ST is listening
   browse     [B]rowse lists the card, pages forward and back
   select     the ROM given with --rom is picked by its number
   launch     [L]aunch: the RP restarts in ROM mode and the window holds
@@ -114,6 +115,12 @@ class Session:
                     f"targets {swd.CORES[1]}",
                     "mww 0x%08x 0x%08x" % (swd.DHCSR, swd.DHCSR_RELEASE | 0x3))
 
+    def st_listening(self) -> bool:
+        seen = swd.st_reads(self.elf)
+        fb = swd.include_defines().get("DISPLAY_BUFFER_OFFSET", 0x8000)
+        return (any(swd.AGENT_SIG_OFFSET <= o < swd.AGENT_SIG_OFFSET + 8 for o in seen)
+                or sum(fb <= o < 0x10000 for o in seen) >= 2)
+
     def select_short(self) -> None:
         defs = swd.include_defines()
         ctrl = swd.IO_BANK0 + 4 + 8 * defs["SELECT_GPIO"]
@@ -169,11 +176,16 @@ class Session:
         if not self.step("menu", self.wait_for("Select an option")):
             return self.finish()
 
-        # While the ST runs the setup menu: once a ROM runs, only its reset
-        # button can reboot it.
-        verdict = swd.cmd_st_reset(argparse.Namespace(wait=30, offset=None, rom=False, elf=self.elf))
-        self.step("st-reset", verdict == 0,
-                  "the ST read the cartridge header again, then the framebuffer")
+        # Only while something on the ST listens: the setup menu, or the
+        # remote reset agent the self-check cartridge leaves in its RAM.
+        if self.st_listening():
+            verdict = swd.cmd_st_reset(argparse.Namespace(
+                wait=30, offset=None, rom=False, elf=self.elf))
+            self.step("st-reset", verdict == 0,
+                      "the ST read the cartridge header again, then the framebuffer")
+        else:
+            self.skip("st-reset", "nothing on the ST reads the cartridge: it "
+                      "needs its reset button once")
 
         self.typeline("b")
         listed = self.wait_for("Page 1")
@@ -239,7 +251,9 @@ class Session:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
-    ap.add_argument("--rom", default="pattern-128k.rom")
+    # The self-check by default: it leaves the remote reset agent on the ST,
+    # so the next run can reboot it without hands.
+    ap.add_argument("--rom", default="selfcheck.img")
     ap.add_argument("--images", default=os.path.join(HERE, "builds", "testserver"),
                     help="where the ROM files the card holds are on this machine")
     ap.add_argument("--catalog", action="store_true")
