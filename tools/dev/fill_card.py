@@ -28,7 +28,7 @@ import swd  # noqa: E402  (same folder)
 LOG = os.path.join(HERE, "logs", "console.log")
 PROMPTS = {"catalog": "ROM number>", "confirm": "Press RETURN to load",
            "menu": "Select an option"}
-DONE_RE = re.compile(r"Written file (\S+)|Error[^\n]*download[^\n]*|"
+DONE_RE = re.compile(r"Written file [^\n]+|Error[^\n]*download[^\n]*|"
                      r"download_start\(\): Error[^\n]*", re.I)
 
 

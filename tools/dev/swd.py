@@ -18,8 +18,11 @@ Usage:
     python3 tools/dev/swd.py reset
     python3 tools/dev/swd.py screen OUT.png [--elf ELF] [--scale N]
     python3 tools/dev/swd.py window FILE [--no-flash] [--elf ELF]
-    python3 tools/dev/swd.py st-reset [--wait S] [--offset N] [--elf ELF]
+    python3 tools/dev/swd.py st-reset [--wait S] [--rom] [--offset N] [--elf ELF]
     python3 tools/dev/swd.py debug-pause on|off
+    python3 tools/dev/swd.py stack paint|peak
+    python3 tools/dev/swd.py boot-break STOP [STOP ...] [--via SYMBOL]
+                                        [--timeout S] [--elf ELF]
     python3 tools/dev/swd.py shared [--elf ELF] [--all]
     python3 tools/dev/swd.py text [--elf ELF]
     python3 tools/dev/swd.py select short|long|release [--hold-ms MS] [--force]
@@ -78,6 +81,17 @@ given 16-bit payload words after the random token, and `app` an app command
 named by a DEVHOOKS_APP_<NAME> define in rp/src/include, with optional 16-bit
 payload words, for example `app my_command 16`. The template defines none: an
 app adds its own, and registers the handler with devhooks_setAppHandler().
+
+`boot-break` restarts the RP through OpenOCD's `reset halt` and stops core 0
+at each STOP on the way up, in order (FILE:LINE, the first place the line was
+compiled into, or 0xADDRESS, then @REG=VALUE,... to set there), then lets it
+run on: a boot path taken differently without a rebuild. On v2.1.2,
+`boot-break emul.c:984@r7=255 0x20000310@pc=0x20000314,r0=4 --park-core1`
+boots a ROM-mode device into setup mode and steps over the autorun's f_open
+call as if it found no file, so a card with a .autorun still reaches the menu.
+Step over the call: faking its result after it ran leaves the file open, and
+FatFs then refuses to replace it. The addresses and registers are the
+build's: read them from `arm-none-eabi-objdump -dl`.
 
 `crash` explains the last reboot without stopping the RP: the watchdog reason
 and scratch registers, with code addresses resolved to source lines.
@@ -602,24 +616,50 @@ def st_reads(elf: str, samples: int = 8) -> list[int]:
     return [v - base for v in values if base <= v < base + WINDOW_BYTES]
 
 
+# The remote reset agent the self-check cartridge leaves in the ST's RAM
+# (tools/dev/selfcheck/agent.s): its signature, AGENT_SIG_ADDR - $FA0000.
+AGENT_SIG_OFFSET = 0x9F44
+AGENT_SIG = (0x52535421, 0x4147454E)    # "RST!", "AGEN"
+
+
 def cmd_st_reset(args: argparse.Namespace) -> int:
-    """Reboot the ST the way the setup menu does: the reset command in the
-    word its menu loop polls every frame, then the no-op again so the rebooted
-    ST does not reset once more. Works while the ST runs the setup menu, not
-    inside a ROM the user launched."""
+    """Reboot the ST through whichever of the two things on it that watch the
+    cartridge window is running: the setup menu's loop, which polls its
+    command word every frame, or the remote reset agent the self-check
+    cartridge leaves in RAM, which looks for its signature every vertical
+    blank (in GEM, or in a ROM that keeps TOS's interrupts). Both are written,
+    then every word goes back to what it was, so the rebooted ST does not
+    reset again and a ROM in the window stays whole. A ROM that took the ST
+    over (a game, DiagROM) still needs the reset button."""
     elf = matching_elf(args.elf)
     defs = include_defines()
     reset = defs.get("CHANDLER_CMD_RESET", defs.get("DISPLAY_COMMAND_RESET", 1))
-    nop = defs.get("CHANDLER_CMD_NOP", defs.get("DISPLAY_COMMAND_NOP", 0))
     # --offset: the ST runs another firmware's menu loop (the one flashed
     # before this ELF), which polls its own word: the template's sentinel is
     # at 0x2000 of the window, v2.1.2's command word at 0x9f40.
-    address = (cartridge_window(elf) + int(args.offset, 0) if args.offset
-               else st_command_word(elf))
-    write_st_command(address, reset)
+    base = cartridge_window(elf)
+    address = base + int(args.offset, 0) if args.offset else st_command_word(elf)
+    agent = base + AGENT_SIG_OFFSET
+    # Who is listening: the agent reads its signature every vertical blank,
+    # the menu reads the framebuffer every frame; the bus DMA keeps the last
+    # address the ST read.
+    fb = defs.get("CHANDLER_FRAMEBUFFER_OFFSET", defs.get("DISPLAY_BUFFER_OFFSET"))
+    seen = st_reads(elf)
+    if any(AGENT_SIG_OFFSET <= o < AGENT_SIG_OFFSET + 8 for o in seen):
+        print("the remote reset agent is watching")
+    elif fb is not None and sum(fb <= o < 0x10000 for o in seen) >= 2:
+        print("the setup menu is watching")
+    else:
+        print("nothing on the ST is reading the cartridge: if this does not "
+              "reboot it, it needs its reset button", file=sys.stderr)
+    writes = [(address, reset), (agent, AGENT_SIG[0]), (agent + 4, AGENT_SIG[1])]
+    saved = {a: read_word(a) for a, _ in writes}
+    swap = lambda v: ((v << 16) | (v >> 16)) & 0xFFFFFFFF   # as write_st_command
+    openocd(*[f"mww 0x{a:08x} 0x{swap(v):08x}" for a, v in writes])
     time.sleep(0.6)
-    write_st_command(address, nop)
-    print(f"reset command written at 0x{address:08x}, then the no-op")
+    openocd(*[f"mww 0x{a:08x} 0x{saved[a]:08x}" for a, _ in reversed(writes)])
+    print(f"reset command written at 0x{address:08x} and the agent's signature at "
+          f"0x{agent:08x}, then the words as they were")
     if not args.wait:
         return 0
     fb = defs.get("CHANDLER_FRAMEBUFFER_OFFSET", defs.get("DISPLAY_BUFFER_OFFSET"))
@@ -629,6 +669,9 @@ def cmd_st_reset(args: argparse.Namespace) -> int:
         offsets = st_reads(elf)
         if any(o < 0x100 for o in offsets):
             booted = True          # the cartridge header: TOS looked for it
+            if args.rom:
+                print("the ST booted through the cartridge")
+                return 0
         if booted and sum(fb <= o < 0x10000 for o in offsets) >= 2:
             print("the ST booted through the cartridge and is back in the "
                   "menu loop")
@@ -652,6 +695,216 @@ def cmd_debug_pause(args: argparse.Namespace) -> int:
     value = 0x7 if args.state == "on" else 0x0
     openocd(f"mww 0x{TIMER_DBGPAUSE:08x} 0x{value:x}")
     print(f"timer debug pause {args.state} (DBGPAUSE 0x{value:x}) until the next reset")
+    return 0
+
+
+RAM_BASE = 0x20000000
+
+
+def line_addresses(elf: str, location: str) -> list[int]:
+    """Where FILE:LINE's code starts, in program order: one address per place
+    the line was compiled into (an inlined function's line has several)."""
+    path, line = location.rsplit(":", 1)
+    suffix = "/" + path.lstrip("/")
+    marker = re.compile(r"^(/\S+):(\d+)(?: \(discriminator \d+\))?$")
+    insn = re.compile(r"^\s*([0-9a-f]+):\t")
+    out = subprocess.run(["arm-none-eabi-objdump", "-dl", elf],
+                         capture_output=True, text=True, check=True).stdout
+    found, wanted = [], False
+    for text in out.splitlines():
+        m = marker.match(text)
+        if m:
+            wanted = m.group(1).endswith(suffix) and int(m.group(2)) == int(line)
+            continue
+        m = insn.match(text)
+        if m and wanted:
+            found.append(int(m.group(1), 16))
+            wanted = False
+    return found
+
+
+def parse_stop(elf: str, text: str) -> tuple[str, int, list[tuple[str, int]]]:
+    """A boot-break stop, "LOCATION[@REG=VALUE,...]": its label, its address
+    and the registers to set there."""
+    location, _, sets_text = text.partition("@")
+    if location.lower().startswith("0x"):
+        address = int(location, 16)
+    else:
+        found = line_addresses(elf, location)
+        if not found:
+            raise SwdError(f"no code for {location} in {elf}")
+        address = found[0]
+        if len(found) > 1:
+            print(f"{location} is at " + ", ".join(f"0x{a:08x}" for a in found)
+                  + "; stopping at the first", flush=True)
+    sets = []
+    for item in filter(None, sets_text.split(",")):
+        reg, _, value = item.partition("=")
+        sets.append((reg, int(value, 0)))
+    return location, address, sets
+
+
+def cmd_boot_break(args: argparse.Namespace) -> int:
+    """Restart the RP and stop core 0 at each STOP on the way up, in order,
+    setting registers there, then let it run on: a boot path taken
+    differently without a rebuild (an f_open made to report no file, a mode
+    read as another).
+
+    The restart is OpenOCD's `reset halt`, which holds both cores at the boot
+    ROM's first instruction: a hardware breakpoint set before the
+    watchdog-style reset does not survive it. The RP2040's hardware
+    breakpoints only cover flash, so for code that runs from RAM (copied
+    there at boot) core 0 first stops at --via, a flash function reached after
+    the copy, and software breakpoints go in then. One OpenOCD runs the whole
+    boot through its TCL port: each stop's breakpoint goes in only after the
+    one before it was hit, its registers are written only once the PC is
+    checked, and every breakpoint comes out again, so a stop that is never
+    reached changes nothing."""
+    elf = matching_elf(args.elf)
+    stops = [parse_stop(elf, s) for s in args.stops]
+    if any(address >= RAM_BASE for _, address, _ in stops):
+        via = elf_symbols(elf, args.via).get(args.via)
+        if not via:
+            raise SwdError(f"no {args.via} in {elf}")
+        stops.insert(0, (args.via, via[0] & ~1, []))
+    server = openocd_command() + [
+        "-c", f"tcl_port {TCL_PORT}", "-c", "gdb_port disabled",
+        "-c", "telnet_port disabled"]
+    proc = subprocess.Popen(server, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    reached = 0
+    try:
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line or f"port {TCL_PORT}" in line:
+                break
+        threading.Thread(target=proc.stdout.read, daemon=True).start()
+        sock = tcl_server()
+        if sock is None:
+            raise SwdError("OpenOCD did not start its TCL server")
+        with sock:
+            def run(command: str) -> str:
+                return tcl(sock, "capture {" + command + "}")
+
+            def pc() -> int | None:
+                m = re.search(r"pc \(/32\): (0x[0-9a-f]+)", run("reg pc"))
+                return int(m.group(1), 16) if m else None
+
+            run(f"targets {CORES[0]}")
+            run("reset halt")
+            for label, address, sets in stops:
+                kind = " hw" if address < RAM_BASE else ""
+                run(f"bp 0x{address:08x} 2{kind}")
+                run("resume")
+                run(f"wait_halt {int(args.timeout * 1000)}")
+                if pc() is None:          # still running: stop it to clean up
+                    run("halt")
+                    run("wait_halt 2000")
+                here = pc()
+                run(f"rbp 0x{address:08x}")
+                if here != address:
+                    print(f"core 0 did not stop at {label} (0x{address:08x}) "
+                          f"within {args.timeout:g} s; nothing set there",
+                          file=sys.stderr)
+                    break
+                before = ", ".join(
+                    f"{r}=" + re.search(r": (0x[0-9a-f]+)", run(f"reg {r}")).group(1)
+                    for r, _ in sets)
+                for r, v in sets:
+                    run(f"reg {r} 0x{v:x}")
+                reached += 1
+                print(f"stopped at {label} (0x{address:08x})"
+                      + (f": {before} -> " + ", ".join(f"{r}=0x{v:x}" for r, v in sets)
+                         if sets else ""), flush=True)
+            run("resume")
+            if args.park_core1:
+                # Core 1 runs from flash: halt it before core 0 writes flash
+                # (v2.1.2's settings-save lock-up), with the timer running.
+                run(f"mww 0x{TIMER_DBGPAUSE:08x} 0x0")
+                run(f"targets {CORES[1]}")
+                run(f"mww 0x{DHCSR:08x} 0x{DHCSR_RELEASE | 0x3:08x}")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    released = CORES[:1] if args.park_core1 else CORES
+    if any(read_word(DHCSR, core) & DHCSR_S_HALT for core in released):
+        cmd_resume(args)
+        if args.park_core1:
+            openocd(f"targets {CORES[1]}",
+                    f"mww 0x{DHCSR:08x} 0x{DHCSR_RELEASE | 0x3:08x}")
+    if reached < len(stops):
+        return 3
+    print("running on")
+    return 0
+
+
+SCRATCH_X = 0x20040000          # core 1's stack bank
+SCRATCH_Y = 0x20041000          # core 0's stack bank
+SCRATCH_END = 0x20042000
+STACK_PAINT = 0x5AFE57AC        # a word no stack frame is likely to hold
+STACK_MARGIN = 64               # left untouched below each live stack pointer
+
+
+def cmd_stack(args: argparse.Namespace) -> int:
+    """Paint the free part of both stack banks (SCRATCH_X, SCRATCH_Y) with a
+    known word, or report how deep each stack has gone since. Painting halts
+    both cores for a moment, so no interrupt frame lands on a word being
+    painted; the bus keeps being served by the DMA meanwhile. SRAM survives
+    a watchdog reset, so a paint also measures the next boot."""
+    if args.action == "paint":
+        try:
+            # Halt both cores, then read each one's main stack pointer
+            # through its own debug registers (DCRSR register 17 is MSP):
+            # OpenOCD's `reg sp` does not answer for core 1 here.
+            cmds = ["halt"]
+            for core in CORES:
+                cmds += [f"targets {core}", "mww 0xe000edf4 17", "sleep 1",
+                         "mdw 0xe000edf8"]
+            out = openocd(*cmds, check=False)
+            sps = [int(v, 16) for v in re.findall(r"0xe000edf8: ([0-9a-f]+)", out)]
+            if len(sps) < 2:
+                raise SwdError("could not read both stack pointers")
+            sp0, sp1 = sps[0], sps[1]
+            # Core 1 runs only if its stack pointer is inside its own bank.
+            if SCRATCH_X <= sp1 < SCRATCH_Y:
+                regions = [(SCRATCH_X, sp1 - STACK_MARGIN),
+                           (SCRATCH_Y, sp0 - STACK_MARGIN)]
+            else:
+                regions = [(SCRATCH_X, sp0 - STACK_MARGIN)]
+            fills = [f"mww 0x{lo & ~3:08x} 0x{STACK_PAINT:08x} "
+                     f"{((hi & ~3) - (lo & ~3)) // 4}"
+                     for lo, hi in regions if hi > lo]
+            openocd(*fills)
+        finally:
+            # A fresh session releases both cores (C_HALT and C_DEBUGEN):
+            # in the session that halted them, the release does not take.
+            cmd_resume(args)
+        for lo, hi in regions:
+            print(f"painted 0x{lo:08x}-0x{hi:08x}")
+        print(f"core 0 sp 0x{sp0:08x}, core 1 sp 0x{sp1:08x}")
+        return 0
+    data = read_memory(SCRATCH_X, SCRATCH_END - SCRATCH_X)
+    words = struct.unpack(f"<{len(data) // 4}I", data)
+    for name, lo, top in (("core 1's bank (SCRATCH_X)", SCRATCH_X, SCRATCH_Y),
+                          ("core 0's bank (SCRATCH_Y)", SCRATCH_Y, SCRATCH_END)):
+        first = (lo - SCRATCH_X) // 4
+        last = (top - SCRATCH_X) // 4
+        painted = [i for i in range(first, last) if words[i] == STACK_PAINT]
+        if not painted:
+            print(f"{name}: no paint left")
+            continue
+        # The lowest word still painted from the bottom up: everything above
+        # the first unpainted word was reached by a stack.
+        low = first
+        while low < last and words[low] == STACK_PAINT:
+            low += 1
+        reached = SCRATCH_X + 4 * low
+        print(f"{name}: untouched up to 0x{reached:08x}, "
+              f"{top - reached} bytes reached from the top 0x{top:08x}")
     return 0
 
 
@@ -1525,10 +1778,28 @@ def build_parser() -> argparse.ArgumentParser:
     wn.add_argument("--elf")
     wn.set_defaults(func=cmd_window)
 
+    stk = sub.add_parser("stack", help="paint both stack banks, or report "
+                         "how deep the stacks have gone since")
+    stk.add_argument("action", choices=("paint", "peak"))
+    stk.set_defaults(func=cmd_stack)
+
     dp = sub.add_parser("debug-pause", help="whether the RP's timer stops "
                         "while a core is halted in debug (on after every reset)")
     dp.add_argument("state", choices=("on", "off"))
     dp.set_defaults(func=cmd_debug_pause)
+
+    bb = sub.add_parser("boot-break", help="restart the RP, stop core 0 at "
+                        "source lines on the way up, set registers, run on")
+    bb.add_argument("stops", nargs="+", metavar="STOP",
+                    help="LOCATION[@REG=VALUE,...] in boot order; LOCATION is "
+                    "FILE:LINE (emul.c:197) or an address (0x...)")
+    bb.add_argument("--via", default="main", help="a flash function reached "
+                    "after the boot copies RAM code (for a location in RAM)")
+    bb.add_argument("--park-core1", action="store_true", help="leave core 1 "
+                    "halted and the timer running (v2.1.2: before a flash write)")
+    bb.add_argument("--timeout", type=float, default=20)
+    bb.add_argument("--elf")
+    bb.set_defaults(func=cmd_boot_break)
 
     sr = sub.add_parser("st-reset", help="reboot the ST from its setup menu, "
                         "as the menu itself does")
@@ -1537,6 +1808,9 @@ def build_parser() -> argparse.ArgumentParser:
     sr.add_argument("--offset", help="window offset of the word the ST's "
                     "loop polls, when it runs another firmware's cartridge "
                     "code (0x2000 for the template's sentinel)")
+    sr.add_argument("--rom", action="store_true", help="the RP serves a ROM, "
+                    "not the setup menu: with --wait, booting through the "
+                    "cartridge is enough")
     sr.add_argument("--elf")
     sr.set_defaults(func=cmd_st_reset)
 
