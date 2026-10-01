@@ -95,12 +95,12 @@ Notes:
 
 ---
 ## Tests
-- There is **no first-party test suite** in this repo.
-- Validation is typically done by building the target and RP firmware.
-- Submodules (e.g. `pico-sdk/`) contain their own tests; they are not part of the
-  app workflow.
-**Single-test note:** there is no test runner for this app. If you must run a
-single SDK test, use the SDK’s own CMake targets under its `test/` directory.
+- Host tests: `make -C tests/host test` (firmware units under ASan and UBSan,
+  plus the ST/RP shared-layout check). One test: `make -C tests/host
+  build/test_tprotocol && tests/host/build/test_tprotocol`, or
+  `cd tests/host && python3 -m unittest test_layout`.
+- On the hardware, through the Debug Probe: `tools/dev/` (see its README).
+- Validation otherwise is building the target and RP firmware.
 
 ---
 ## Code style guidelines

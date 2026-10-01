@@ -29,12 +29,17 @@ Prerequisites: `arm-none-eabi-*` toolchain, CMake 3.26+, Python, `stcmd` on PATH
 
 # RP-only
 cd rp && ./build.sh <board_type> <build_type>
+
+# Day to day: build out of tree, flash through the probe, verify over SWD
+tools/dev/flash.sh debug            # or release; --build-only to just build
 ```
 
 Build-script caveats (from AGENTS.md — respect these):
 
-- **Avoid running `./build.sh` or `rp/build.sh` unless asked**: they delete `build/` and `dist/`, re-pin submodule tags (pico-sdk 2.1.0, pico-extras sdk-2.1.0, fatfs-sdk pinned commit), and patch `fatfs-sdk/src/include/ffconf.h` to enable `FF_USE_CHMOD`. For verification, compile directly (e.g. `cd rp/build && cmake ../src -DCMAKE_BUILD_TYPE=MinSizeRel && make -j4` with `PICO_SDK_PATH`, `PICO_EXTRAS_PATH`, `FATFS_SDK_PATH`, `BOARD_TYPE` set).
+- **Avoid running `./build.sh` or `rp/build.sh` unless asked**: they delete `build/` and `dist/`, re-pin submodule tags (pico-sdk 2.1.0, pico-extras sdk-2.1.0, fatfs-sdk pinned commit), and patch `fatfs-sdk/src/include/ffconf.h` to enable `FF_USE_CHMOD`. For verification, use `tools/dev/flash.sh <debug|release> --build-only`: it builds out of tree in `tools/dev/builds/` with rp/build.sh's environment and build type, and never touches `rp/build` or the submodules. A direct compile only links if that `FF_USE_CHMOD` patch is already present in the submodule (`download.c` calls `f_chmod`); it shows up as a local modification in `fatfs-sdk` — leave it in place.
+- `BOARD_TYPE` (env, default `pico_w`) selects `BOARD_TYPE_PICO_W`/`BOARD_TYPE_PICO` macros; the CYW43/lwIP WiFi stack is linked only when the board supports it (`pico_w`). `APP_UUID_KEY` (env) becomes `CURRENT_APP_UUID_KEY`; without it CMake uses the `4444…` dev UUID, which must match an app registered by the Booster or `main.c` jumps back to the Booster.
 - The RP firmware is **always compiled `MinSizeRel`** regardless of the build-type argument — `Release` breaks (memory issues). The build-type argument only controls `DEBUG_MODE` (UART debug output via `DPRINTF`) and artifact naming.
+- Every build carries a build ID in flash (`release_build_id`, from `rp/src/build_id.cmake`: the commit, `-dirty.<hash>` for uncommitted changes, `+minsizerel` for the current build type, `+debug`), and the ELF keeps its symbol table; `swd.py build-id` reads the ID off a running RP. Debug builds run the console at 921,600 baud.
 - Versioning comes from `version.txt` at the root (copied into `rp/` and `target/` by the root script). `make tag` tags and pushes the current version.
 
 ## Lint / format
@@ -44,9 +49,11 @@ Build-script caveats (from AGENTS.md — respect these):
 - Naming: functions/variables `camelBack` (functions commonly `module_camelBack`, e.g. `emul_start`, `term_printString`); fixed-width types for firmware interfaces.
 - `rp/build/compile_commands.json` exists after any CMake configure (`CMAKE_EXPORT_COMPILE_COMMANDS=ON`).
 
-## Tests
+## Tests and developer tools
 
-There is no first-party test suite (`tests/atarist` is empty). Validation = both firmwares compile, and if `target/` or the protocol changed, `target_firmware.h` was regenerated.
+- **Host tests** (`tests/host`, from md-framebuffer-template): `make -C tests/host test` compiles firmware units with the host compiler under ASan and UBSan and runs them in seconds; CI runs them on every PR. `test_layout.py` checks that the ST side (`main.s`) and the RP side (`rp/src/include`) agree on every shared offset and command. A `bug_*.c` test shows a defect the firmware still has (`make -C tests/host known-bugs` passes only while each one fails); rename it to `test_*.c` when the defect is fixed.
+- **On the hardware** (`tools/dev/`, see its `README.md`): `flash.sh` builds and flashes, `console.py` captures the 921,600-baud console, `swd.py` reads and drives the running RP over SWD (`screen`, `text`, `heap`, `crash`, `select`, `key`, `window`, `gdb`, ...), `smoke.py` runs a whole session through the probe, `testserver.py` serves catalogs and downloads with every failure case, `hatari_check.py` runs cartridge images under Hatari on every TOS, `fill_card.py` puts test files on the card through the device's own downloads.
+- Validation otherwise: both firmwares compile, and if `target/` or the protocol changed, `target_firmware.h` was regenerated. Anything bus-facing is checked on the hardware.
 
 ## Architecture
 
@@ -54,14 +61,25 @@ There is no first-party test suite (`tests/atarist` is empty). Validation = both
 
 `rp/src/main.c` overclocks the RP2040 (`RP2040_CLOCK_FREQ_KHZ`, ≥225MHz needed for remote commands), loads the global config (`gconfig.c`) and per-app settings (`aconfig.c`) from dedicated flash sectors, and jumps to the **Booster app** (a separate firmware resident at 0x10120000) if settings are missing. Otherwise it calls `emul_start()` in `rp/src/emul.c` — the app's real entry point and main loop.
 
-### Two runtime modes (chosen at boot in `emul_start`)
+### Runtime modes (chosen at boot in `emul_start` from the `MODE` app setting)
 
-1. **ROM emulation mode** — if a ROM is selected in settings: the ROM image staged in the `ROM_TEMP` flash region is copied into a dedicated RAM region, PIO+DMA emulation starts, and core logic just waits for the SELECT button (which reboots into setup / back to Booster).
-2. **Setup/terminal mode** — no ROM selected (or SELECT pressed): runs a command-driven terminal UI (`term.c`, command table in `emul.c`) shown on the Atari via the embedded target firmware. Features: browse ROMs on microSD (FatFs, `sdcard.c`), download ROMs over WiFi (`network.c` + `httpc/` lwIP HTTP client, Pico W only), settings management, Delay/Ripper mode (`select.c` handles the physical SELECT button).
+App settings keys live in `aconfig.h` (`FOLDER`, `EMULATED`, `MODE`, `HTTP_CATALOG`); WiFi credentials/mode are *global* settings (`gconfig`) owned by the Booster.
+
+1. **ROM emulation** — `MODE` = `ROM_MODE_DIRECT` (0) or `ROM_MODE_DELAY` (1): the ROM staged in `ROM_TEMP` flash is DMA-copied into `ROM_IN_RAM` and PIO+DMA emulation starts. Delay/Ripper mode first waits for a SELECT press before starting emulation. While emulating, a SELECT press writes `MODE=ROM_MODE_SETUP` and resets the RP; a long press resets and erases flash (`select.c`).
+2. **Setup/terminal** — `MODE` = `ROM_MODE_SETUP` (255): the embedded target firmware is served as the cartridge instead, and a command-driven terminal UI runs (`term.c`, command table in `emul.c`). Boot sequence: SD init → autorun check → WiFi STA connect (Pico W) → download the ROM catalog CSV (`download.c` + `httpc/`) → menu loop. Features: browse ROMs on microSD (`/roms` by default), download ROMs to SD, settings editing, toggle Delay mode, launch, exit to desktop, return to Booster.
+
+**Launching a ROM** (`storeFileToFlash` in `emul.c`) copies the file from SD into `ROM_TEMP` flash with every 16-bit word byte-swapped (the Atari is big-endian), skipping a 4-byte zero header on STEEM `.stc` images. Accepted extensions: `img`, `rom`, `stc`, `bin`. **Autorun:** if `<romsFolder>/.autorun` exists and names a ROM, setup mode flashes it, sets `MODE=ROM_MODE_DIRECT`, and blinks the LED forever (no reset) — used for diagnostic cartridges on machines with broken keyboards or screens.
 
 ### ROM bus emulation core (`romemul.c` + `romemul.pio`)
 
-PIO state machines watch the Atari cartridge bus (17 bus bits, ROM4/ROM3 selects) and DMA channels serve 16-bit reads directly from RAM with no CPU involvement. Time-critical handlers are `__not_in_flash_func`. The Atari→RP2040 command channel works the same way: the target firmware performs magic-address reads that the PIO/DMA path decodes as a protocol (`tprotocol.h`, header `0xABCD`) — the Atari "writes" by reading addresses.
+PIO state machines watch the Atari cartridge bus (16 address/data GPIOs multiplexed through latches starting at GPIO 6, READ/WRITE latch signals on GPIO 27/28, `!ROM4` on GPIO 22 and `!ROM3` on GPIO 26; see `constants.h`/`term.h`), and DMA channels serve 16-bit reads directly from RAM with no CPU involvement. ROM4 (`$FA0000`) is the first 64K bank of `ROM_IN_RAM`, ROM3 (`$FB0000`) the second. Time-critical handlers are `__not_in_flash_func`; never `DPRINTF` inside DMA IRQ callbacks.
+
+### Setup-mode communication (Atari ⇄ RP2040)
+
+- **Atari → RP:** the cartridge is read-only, so the target firmware "writes" by *reading* addresses in the ROM3 window (`$FB0000`). `term_dma_irq_handler_lookup` feeds each address to the `tprotocol.h` parser (header `0xABCD`, command id, payload size, payload, checksum) and only stashes the finished command; `term_loop()` (called from the main loop) handles it (`APP_TERMINAL` start/keystroke) and acknowledges by writing the command's random token at `$FAF000`, which the Atari polls; shared variables start at `$FAF200`.
+- **RP → Atari screen:** there is no text protocol. The RP renders a 320×200 monochrome framebuffer with u8g2 (`display.c`, `display_term.c`, VT52-subset terminal in `term.c`) *directly into ROM_IN_RAM* at `$FA8000`, and the target firmware copies it to video RAM (with a translation table at `$FA1000` for high-res).
+- **RP → Atari control:** a longword at framebuffer + 8000 carries display commands (`DISPLAY_COMMAND_RESET`, `…_CONTINUE` to boot GEM); the target polls it. Anything the RP writes into shared memory must be word-swapped (`WRITE_AND_SWAP_LONGWORD`, `CHANGE_ENDIANESS_BLOCK16` in `memfunc.h`).
+- Changing any of these offsets requires changing both `target/atarist/src/main.s` and the RP headers (`term.h`, `display.h`, `constants.h`), then regenerating `target_firmware.h`.
 
 ### Memory map (`rp/src/memmap_rp.ld` — custom linker script, load-bearing)
 
@@ -93,12 +111,17 @@ Where this repo differs from the current `md-microfirmware-template` (don't appl
 
 Follow the "Working style" and "Editing guardrails" sections of `../md-microfirmware-template/CLAUDE.md`: think before coding, simplicity first, surgical changes, goal-driven execution. In particular:
 
+- **Work on the hardware yourself, through the Debug Probe (hard rule).** Flash, reset, press SELECT (short and the 10 s factory-reset press), type keys, read the ST's screen as a PNG, the heap, the stack, the counters and the crash reason, and set breakpoints or step with GDB, over SWD (`tools/dev/swd.py`, OpenOCD, `arm-none-eabi-gdb`) and the debug UART (`tools/dev/console.py`). Until `tools/dev/` is in this repo, run the template's copy from `../md-microfirmware-template/tools/dev/`, which reaches the device only through the probe and the UART. Where no devhook exists yet, use GDB (write the variable, call the function). Check the probe and the console port first (`swd.py running`); if they're missing, that is the one thing to ask for.
+- **Never use SWD or GDB while Booster runs** (only when developing Booster itself), and never jump to Booster (`[X]`) during a probe session. Every probe session starts from the **test microfirmware**, launched from Booster by Diego; our build is then flashed over it with `tools/dev/flash.sh ... --probe`. Booster's deploy API is not used: SWD and GDB only.
+- **Ask Diego only for what needs hands**: a cold power cycle of the ST (it powers the RP), swapping machines or SD cards, the ST's own keyboard inside a user's ROM, a real card or power pull, the Wi-Fi AP. Put all of them in one list, once, with the fewest cycles that answer the question. Never ask him to press or type what the probe can.
+- **Don't commit, push or open a PR until Diego's go-ahead** at the end of the work; then do all three.
 - **No AI attribution anywhere**: no "Generated with Claude Code", no `Co-Authored-By: Claude` trailers, no AI mentions in commits, PRs, comments, or docs. Write messages as the human author.
 - Never modify the submodules (`pico-sdk/`, `pico-extras/`, `fatfs-sdk/`) or their pins.
 - Don't add features to `main.c` — feature work starts in `emul.c` or a new module.
 
 ## Releases / CI
 
-- GitHub Actions (`.github/workflows/build.yml`) builds `pico_w release` on PRs using the AtariST toolkit Docker image for `stcmd`.
-- `upload_s3.sh` publishes `dist/` artifacts to S3; it sources the untracked local `secrets.sh` for credentials — never commit or print it.
+- GitHub Actions `build.yml` builds `pico_w release` on PRs using the AtariST toolkit Docker image for `stcmd`.
+- `release.yml` runs on `v*` tags: builds, creates the GitHub release, and uploads the `.uf2`/`.json` to S3. The release notes are the top of `CHANGELOG.md` up to the first `---` line, so new entries go at the top and end with `---`. `version.txt` holds the `v`-prefixed version that `make tag` (root Makefile) pushes.
+- `upload_s3.sh` is the manual S3 publish path; it sources the untracked local `secrets.sh` for credentials — never commit or print it.
 - Full-build artifacts land in `dist/`: `<APP_UUID>-<VERSION>.uf2`, `<APP_UUID>.json` (from the `desc/app.json` template), `rp.uf2.md5sum`.
