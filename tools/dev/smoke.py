@@ -15,8 +15,10 @@ does not), reads the terminal and the ST's screen, and checks what happened:
   select     the ROM given with --rom is picked by its number
   launch     [L]aunch: the RP restarts in ROM mode and the window holds
              exactly that file (swd.py window, against --images/<rom>)
-  select-back  a SELECT press brings the setup menu back
+  select-back  after --rom-seconds, a SELECT press brings the setup menu back
   catalog    (--catalog) [D]ownload lists the catalog
+  st-back    the ST reboots into the menu (swd.py st-reset, through the
+             agent the self-check left); skipped when nothing listens
 
 Between steps it fails the run if the RP restarted when nothing asked it to
 (its microsecond timer went backwards) or the heap's headroom fell under
@@ -218,6 +220,10 @@ class Session:
             file=rom_path, no_flash=False, elf=self.elf))
         self.step("launch", verdict == 0, f"window check against {rom_path}")
 
+        # The ST runs the ROM to its end first: the self-check boots, reads
+        # the window, holds its verdict 5 s and installs the agent. A SELECT
+        # before that puts the setup menu under the code the ST is running.
+        time.sleep(a.rom_seconds)
         self.reset_expected = True
         self.select_short()
         if a.park_core1:
@@ -230,6 +236,15 @@ class Session:
             self.typeline("d")
             self.step("catalog", self.wait_for("Page 1", 60))
             self.typeline("m")
+
+        if self.st_listening():
+            verdict = swd.cmd_st_reset(argparse.Namespace(
+                wait=30, offset=None, rom=False, elf=self.elf))
+            self.step("st-back", verdict == 0,
+                      "the ST rebooted into the menu")
+        else:
+            self.skip("st-back", "nothing on the ST reads the cartridge: it "
+                      "needs its reset button once")
 
         if self.ask("Power the ST off, wait 5 s, power it on"):
             self.reset_expected = True
@@ -262,6 +277,9 @@ def main() -> int:
                     help="hold core 1 halted (firmware with a core-1 SELECT watcher)")
     ap.add_argument("--heap-floor", type=int, default=8192)
     ap.add_argument("--boot-seconds", type=float, default=5)
+    ap.add_argument("--rom-seconds", type=float, default=15,
+                    help="how long the launched ROM runs on the ST before "
+                         "the SELECT press")
     ap.add_argument("--elf")
     args = ap.parse_args()
     try:

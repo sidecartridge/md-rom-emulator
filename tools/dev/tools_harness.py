@@ -39,6 +39,10 @@ def check(name, ok, detail=""):
     return ok
 
 
+def skip(name, why):
+    print(f"  SKIP  {name}  ({why})")
+
+
 def run(*args, timeout=600):
     p = subprocess.run(args, cwd=REPO, capture_output=True, text=True, timeout=timeout)
     return p.returncode, p.stdout + p.stderr
@@ -174,14 +178,16 @@ def device_checks(do_reset):
           rc == 0 and rc2 == 0 and cur.wait(r"Injected command 0001") and
           "Available commands" in text())
     to_menu()
+    # 8 KB: this checks the hook, not the headroom. The ROM Emulator's menu
+    # has about 20 KB free, not 16 KB of it in one block.
     before = heap_in_use_kb()
-    rc, out = swdpy("app", "heap_hold", "16")
+    rc, out = swdpy("app", "heap_hold", "8")
     held = heap_in_use_kb()
     rc2, _ = swdpy("app", "heap_hold", "0")
     after = heap_in_use_kb()
-    check("app heap_hold 16 holds 16 KB, 0 releases it",
+    check("app heap_hold 8 holds 8 KB, 0 releases it",
           rc == 0 and rc2 == 0 and None not in (before, held, after)
-          and abs(held - before - 16.0) < 0.6 and abs(after - before) < 0.6,
+          and abs(held - before - 8.0) < 0.6 and abs(after - before) < 0.6,
           f"in use {before} -> {held} -> {after} KB")
 
     print("counters, ring (no halt)")
@@ -213,7 +219,13 @@ def device_checks(do_reset):
     data = bytes(int(x, 16) for ln in
                  re.findall(r"0x[0-9a-f]+: ((?:[0-9a-f]{2} ?)+)", out)[1:]
                  for x in ln.split())
-    check("select: the menu shows it pressed", re.search(rb"SELECT +: Pressed", data) is not None)
+    # The template's menu shows SELECT's state; the ROM Emulator's (v2.1.2's
+    # menu, without menuScreenActive) does not.
+    if "menuScreenActive" in swd.elf_symbols(elf, "menuScreenActive"):
+        check("select: the menu shows it pressed",
+              re.search(rb"SELECT +: Pressed", data) is not None)
+    else:
+        skip("select: the menu shows it pressed", "this menu has no SELECT line")
     check("select: override cleared afterwards",
           (swd.read_word(ctrl) >> swd.INOVER_SHIFT) & 3 == 0)
 

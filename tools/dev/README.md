@@ -26,6 +26,13 @@ and `ROM_TEMP` with a ROM file as the ST reads it; `gdb` runs GDB on the
 running RP through the same OpenOCD server as `postmortem`, with the app's
 commands (`gdb/rom-emulator.gdb`) and, with `--seconds`, a timed unattended
 run of breakpoint scripts (`gdb/suspects.gdb`) that leaves the RP running.
+`gdb` and `postmortem` start OpenOCD's GDB server without its memory map
+(`gdb_memory_map disable`): building the map probes the flash bank, which left
+XIP off, so the firmware stopped and the probe read zeros from flash until a
+reset. GDB gets the flash as a read-only region of its own instead, so
+breakpoints there are still hardware ones. `gdb` also turns the timer's debug
+pause off once attached, so the firmware's waits keep running during a timed
+session.
 `st-reset` reboots the ST the way the setup menu's own `[E]xit` does: the
 reset command in the word the ST's menu loop polls every frame (the template's
 sentinel, or v2.1.2's word after the framebuffer), then the no-op again so the
@@ -45,24 +52,23 @@ which watches the cartridge window from the VBL queue and resets the ST when
 `st-reset` writes its signature, and a resvector hook that keeps the RAM
 valid, so it survives every reset that keeps the ST powered. It works in GEM
 and in any ROM that keeps TOS's interrupts; a game that takes them over, or
-DiagROM, needs the reset button. `st-reset` says beforehand who is listening.
+DiagROM, needs the reset button. Its reset is a software one (through the reset
+vector), so a cartridge that waits for a hardware reset, as Ultimate Ripper
+does for its frozen screen, needs the button too. `st-reset` says beforehand
+who is listening.
 
 What differs here:
 
 - The cartridge window is 128 KB at `0x20020000` (ROM4 in the lower half, ROM3 in the upper half),
   not the template's 64 KB at `0x20030000`. The tools find it through the ELF's
   `__rom_in_ram_start__`, and the framebuffer through `DISPLAY_BUFFER_OFFSET` in
-  `rp/src/include/display.h` (`0x8000` into the window).
+  `rp/src/include/display.h` (`0xE0C0` into the window, the top of ROM4, as in the template).
 - `flash.sh` checks the submodule pins and uses the CMake build type (MinSizeRel) of this
   repository's `rp/build.sh`.
-- This firmware does not have the template's ROM3 command ring (`commemul.c`, `chandler.c`) or
-  the devhooks mailbox yet. Until it does, `counters`, `ring`, `shared`, `key`, `inject`, `app` and
-  the harnesses built on them (`tools_harness.py`'s mailbox checks, `st_harness.py`,
-  `select_harness.py`'s menu checks, `download_harness.py`) have nothing to talk to, except `key`
-  and `inject`, which use the parsed-command slot instead. `running`, `verify`, `build-id`, `read`,
-  `program`, `reset`, `select`, `screen`, `text`, `heap`, `crash`, `postmortem`, `window`,
-  `gdb` and `boot-break` work now, and so do `console.py`, `flash.sh`, `stackdepth.py`, `measure_builds.sh` and the
-  tools below.
+- The setup menu is this app's, not the template's: `select_harness.py` counts the menu as shown
+  when the terminal reads its prompt (the ELF has no `menuScreenActive`), `tools_harness.py` skips
+  the template's SELECT line, and `st_harness.py` starts `sttest.s` with a debug build's hidden
+  `f` command (there is no `[F]irmware`).
 
 ## Test data, servers and runs
 
@@ -100,7 +106,10 @@ make -C tests/host test                                   # host tests, ASan and
   as a `$7F01`/`$7F02` frame through ROM3 reads for a ROM3 capture to decode.
 - `smoke.py` drives the menu with `swd.py key`, checks each step on the terminal text and the
   window, fails when the RP restarts unasked or the heap runs low, and writes screen PNGs and a
-  JSON report to `tools/dev/logs/smoke-<time>/`.
+  JSON report to `tools/dev/logs/smoke-<time>/`. After the launch it waits `--rom-seconds` (15),
+  so the ROM (the self-check by default) finishes on the ST before SELECT brings the setup menu
+  back under it, and its last step reboots the ST into the menu through the agent: a run leaves
+  the ST where it found it.
 - Probe sessions start from the test microfirmware, launched from Booster; never probe Booster
   itself. After flashing a firmware whose cartridge layout differs from the one the ST is running,
   the ST keeps the old cartridge code until it reboots: reset it through the old firmware's
@@ -236,12 +245,12 @@ and PIO stopped. If an old build shows that symptom, run `swd.py reset` or power
 applies to a VS Code debug session's restart button.
 
 OpenOCD loads small routines into a RAM work area (`verify_image`'s CRC, the flash-size probe of a GDB
-connect). `rp2040.cfg` puts it at `0x20010000`, inside this firmware's RAM, where it once overwrote
+connect, when GDB still asked for a memory map). `rp2040.cfg` puts it at `0x20010000`, inside this firmware's RAM, where it once overwrote
 the Wi-Fi driver's async context and the next `cyw43_arch_poll()` HardFaulted. `swd.py` gives every
 run that does not write flash a 4 KB work area in `SCRATCH_X` instead, backed up and restored: that
 is core 1's stack, and this firmware never starts core 1. A firmware that does must move it. Flash
-writes keep the default, with the cores halted and a reset after. Do not attach GDB (`postmortem`)
-while the RP is rebooting: the flash probe of the connect, landing while boot2 sets up XIP, left
+writes keep the default, with the cores halted and a reset after. GDB's connect no longer probes
+the flash (see `gdb` above); when it did, a connect during boot, while boot2 sets up XIP, also left
 flash unreadable and the firmware executing zeros until the next reset.
 
 A halted RP can still be read. Halting core 1 also pauses the RP2040's timer, so after a debugger
@@ -338,7 +347,7 @@ python3 tools/dev/download_harness.py                        # real downloads, c
 - `st_harness.py` tests the command path from the ST's side. It copies the tree to
   `builds/sttree`, puts `sttest.s` in place of `userfw.s`, builds and flashes that debug firmware,
   resets the ST through the sentinel so it runs the new cartridge code, and starts the tests with
-  `[F]irmware`. The ST reports each result as a `$7Fxx` command, which the setup terminal logs:
+  the debug build's hidden `f` command. The ST reports each result as a `$7Fxx` command, which the setup terminal logs:
   - T0: the return address into TOS the cartridge hands over, the machine and TOS, and on a
     Mega STE its speed and cache at the handover, which must be the user's setting.
   - T1: `d0 = 0` with Z set after each sender.

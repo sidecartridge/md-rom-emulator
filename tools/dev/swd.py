@@ -1462,12 +1462,23 @@ def gdb_command() -> str:
     raise SwdError("no arm-none-eabi-gdb: set ARM_GDB_PATH")
 
 
+# OpenOCD's GDB server without its memory map. GDB asks for the map when it
+# attaches, and building it probes the flash bank through the bootrom, which
+# leaves the flash out of XIP: the firmware stops at its next cache miss and
+# the probe reads zeros from flash until a reset. GDB gets the flash as a
+# read-only region of its own instead, so a breakpoint there is still a
+# hardware one.
+GDB_SERVER_NO_MAP = ["-c", "gdb_memory_map disable"]
+GDB_FLASH_REGION = ["-ex", "set mem inaccessible-by-default off",
+                    "-ex", "mem 0x10000000 0x11000000 ro"]
+
+
 def cmd_postmortem(args: argparse.Namespace) -> int:
     elf = matching_elf(args.elf)
     gdb = gdb_command()
     server = openocd_command() + [
         "-c", f"gdb_port {GDB_PORT}", "-c", "tcl_port disabled",
-        "-c", "telnet_port disabled"]
+        "-c", "telnet_port disabled"] + GDB_SERVER_NO_MAP
     if args.leave_halted:
         # OpenOCD resumes the target when GDB detaches, unless told not to.
         for core in CORES:
@@ -1546,7 +1557,7 @@ def cmd_gdb(args: argparse.Namespace) -> int:
     gdb = gdb_command()
     server = openocd_command() + [
         "-c", f"gdb_port {GDB_PORT}", "-c", f"tcl_port {TCL_PORT}",
-        "-c", "telnet_port disabled"]
+        "-c", "telnet_port disabled"] + GDB_SERVER_NO_MAP
     proc = subprocess.Popen(server, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True)
     try:
@@ -1567,7 +1578,12 @@ def cmd_gdb(args: argparse.Namespace) -> int:
         threading.Thread(target=proc.stdout.read, daemon=True).start()
         argv = [gdb, "-nx", "-q", elf,
                 "-ex", "set pagination off", "-ex", "set confirm off",
+                *GDB_FLASH_REGION,
                 "-ex", f"target extended-remote localhost:{GDB_PORT}",
+                # The timer keeps running while GDB holds the cores in debug
+                # (swd.py debug-pause off): with it paused, every sleep in the
+                # firmware waits for the session to end.
+                "-ex", f"monitor mww 0x{TIMER_DBGPAUSE:08x} 0",
                 "-x", os.path.join(GDB_DIR, "rom-emulator.gdb")]
         for script in args.script:
             argv += ["-x", script]
