@@ -16,7 +16,7 @@
 # PICO_OPENOCD_PATH (see swd.py), RELEASE_DATE (default: the date of the HEAD
 # commit, so builds of one commit are byte-identical), APP_DOWNLOAD_HTTPS=1 for
 # a build with HTTPS downloads (in tools/dev/builds/<type>-https),
-# RP_CMAKE_BUILD_TYPE for a CMake type other than Release (as rp/build.sh).
+# RP_CMAKE_BUILD_TYPE for a CMake type other than rp/build.sh's (MinSizeRel).
 set -Eeo pipefail
 trap 'echo "ERROR: ${BASH_SOURCE[0]}: failed at line ${LINENO}" >&2' ERR
 
@@ -66,8 +66,9 @@ mkdir -p "$OUT" "$HERE/builds/elf"
 
 # Same environment as rp/build.sh, without its submodule checkout: this script
 # is for fast iteration and the pins are only verified, never changed.
-for pin in "pico-sdk tags/2.2.0" "pico-extras tags/sdk-2.2.0" \
-           "fatfs-sdk tags/v3.6.2"; do
+# The pins are rp/build.sh's; keep the two lists the same.
+for pin in "pico-sdk tags/2.1.0" "pico-extras tags/sdk-2.1.0" \
+           "fatfs-sdk 6bdb39f96fe8b897aff12bf3416e32515792e318"; do
   set -- $pin
   if [ "$(git -C "$REPO/$1" rev-parse HEAD)" != "$(git -C "$REPO/$1" rev-parse "$2^{commit}")" ]; then
     echo "WARNING: $1 is not at $2; run rp/build.sh once to pin it" >&2
@@ -85,12 +86,12 @@ fi
 export RELEASE_DATE
 
 echo "Building $NAME from $SRC"
-# Same CMake build type as rp/build.sh: Release, unless RP_CMAKE_BUILD_TYPE says
-# otherwise (MinSizeRel to compare, Debug to step through the code).
+# Same CMake build type as rp/build.sh: MinSizeRel, unless RP_CMAKE_BUILD_TYPE
+# says otherwise (Release to compare, Debug to step through the code).
 if [ -n "${RP_CMAKE_BUILD_TYPE:-}" ]; then
   echo "WARNING: RP_CMAKE_BUILD_TYPE=$RP_CMAKE_BUILD_TYPE: not a shipping build"
 fi
-cmake -S "$SRC" -B "$OUT" -DCMAKE_BUILD_TYPE="${RP_CMAKE_BUILD_TYPE:-Release}" \
+cmake -S "$SRC" -B "$OUT" -DCMAKE_BUILD_TYPE="${RP_CMAKE_BUILD_TYPE:-MinSizeRel}" \
   > "$OUT/cmake.log" 2>&1 \
   || { tail -20 "$OUT/cmake.log"; exit 1; }
 make -C "$OUT" -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" > "$OUT/make.log" 2>&1 \

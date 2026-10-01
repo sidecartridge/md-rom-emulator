@@ -41,7 +41,9 @@ build() {
   arm-none-eabi-size -A "$bdir/rp.elf" | grep -E '^\.(text|rodata|data|bss)\s'
   local bss_end
   bss_end=$(grep '__bss_end__ = \.' "$bdir/rp.elf.map" | awk '{print $1}')
-  printf "heap (bss end to 0x20030000): %d bytes\n" $((0x20030000 - bss_end))
+  # RAM ends where the cartridge window starts (rp/src/memmap_rp.ld).
+  ram_end=$(arm-none-eabi-nm "$bdir/rp.elf" | awk '$3 == "__rom_in_ram_start__" {print "0x" $1}')
+  printf "heap (bss end to %s): %d bytes\n" "$ram_end" $((ram_end - bss_end))
 }
 
 build minsizerel-rel MinSizeRel 0

@@ -4,6 +4,90 @@ Host-side tools for working on this microfirmware with the hardware attached: a 
 Multi-device on an Atari ST, with a Raspberry Pi Debug Probe wired to the RP2040's SWD pins and to
 its debug UART (GPIO 0/1). Python tools use the standard library only.
 
+
+## In this repository
+
+These tools come from the sibling repositories that built and verified them, and are kept as close
+to their source as this firmware allows, so a fix travels both ways with a plain diff:
+
+| File | Source | Commit |
+| --- | --- | --- |
+| `console.py`, `flash.sh`, `swd.py`, `stackdepth.py`, `measure_builds.sh`, `tools_harness.py`, `select_harness.py`, `st_harness.py`, `sttest.s`, `download_harness.py`, `power_cycles.py`, this README | md-microfirmware-template | `6935f53` |
+| `testserver.py` (extended) | md-browser's redirect and TLS test server | none: kept outside git there |
+| `hatari_check.py` (its Hatari runs) | md-drives-emulator's `hatari_tests.py` | `1c09e49` |
+| `smoke.py` (its shape) | md-devops' `smoke.py` | `495b6f9` |
+| `make_rom_images.py`, `make_catalog.py`, `selfcheck/`, `gdb/` | this repository | |
+| `../../tests/host/` (framework and shims) | md-framebuffer-template | `0af40ae` |
+
+Added to `swd.py` here, and worth taking back: `key` and `inject` fall back to
+the firmware's parsed-command slot (`lastProtocol`, `lastProtocolValid`) when
+the ELF has no devhooks mailbox; `window FILE` compares the cartridge window
+and `ROM_TEMP` with a ROM file as the ST reads it; `gdb` runs GDB on the
+running RP through the same OpenOCD server as `postmortem`, with the app's
+commands (`gdb/rom-emulator.gdb`) and, with `--seconds`, a timed unattended
+run of breakpoint scripts (`gdb/suspects.gdb`) that leaves the RP running.
+`st-reset` reboots the ST the way the setup menu's own `[E]xit` does: the
+reset command in the word the ST's menu loop polls every frame (the template's
+sentinel, or v2.1.2's word after the framebuffer), then the no-op again so the
+rebooted ST does not reset once more. `--wait` watches the cartridge DMA: the
+ST reading the cartridge header again means it booted, and reading the
+framebuffer again means it is back in the menu. The cartridge port has no
+reset line, so an ST running a ROM the user launched still needs its button.
+
+What differs here:
+
+- The cartridge window is 128 KB at `0x20020000` (ROM4 in the lower half, ROM3 in the upper half),
+  not the template's 64 KB at `0x20030000`. The tools find it through the ELF's
+  `__rom_in_ram_start__`, and the framebuffer through `DISPLAY_BUFFER_OFFSET` in
+  `rp/src/include/display.h` (`0x8000` into the window).
+- `flash.sh` checks the submodule pins and uses the CMake build type (MinSizeRel) of this
+  repository's `rp/build.sh`.
+- This firmware does not have the template's ROM3 command ring (`commemul.c`, `chandler.c`) or
+  the devhooks mailbox yet. Until it does, `counters`, `ring`, `shared`, `key`, `inject`, `app` and
+  the harnesses built on them (`tools_harness.py`'s mailbox checks, `st_harness.py`,
+  `select_harness.py`'s menu checks, `download_harness.py`) have nothing to talk to, except `key`
+  and `inject`, which use the parsed-command slot instead. `running`, `verify`, `build-id`, `read`,
+  `program`, `reset`, `select`, `screen`, `text`, `heap`, `crash`, `postmortem`, `window` and
+  `gdb` work now, and so do `console.py`, `flash.sh`, `stackdepth.py`, `measure_builds.sh` and the
+  tools below.
+
+## Test data, servers and runs
+
+```bash
+python3 tools/dev/make_rom_images.py DIR                  # pattern images: every word checkable
+python3 tools/dev/make_catalog.py OUT.csv --dir DIR --cases
+python3 tools/dev/testserver.py                           # the catalog and downloads, ports 80/443
+tools/dev/selfcheck/build.sh DIR                          # the self-check cartridge
+python3 tools/dev/hatari_check.py --selfcheck DIR         # ... proven under Hatari, every TOS
+python3 tools/dev/smoke.py [--catalog] [--hands]          # a whole session through the probe
+python3 tools/dev/swd.py gdb --script tools/dev/gdb/suspects.gdb --seconds 60
+python3 tools/dev/swd.py st-reset --wait 30                # reboot the ST from its setup menu
+python3 tools/dev/swd.py screen menu.png                  # the RP's framebuffer, as the ST shows it
+make -C tests/host test                                   # host tests, ASan and UBSan
+```
+
+- `make_rom_images.py` writes images whose word at `$FA0000 + 2*i` is `i ^ 0xA55A`, so `swd.py
+  window` and the self-check cartridge can check every word: 64 KB, 128 KB, a STEEM `.stc`, a
+  zero-headed image without a STEEM header, 40,001 bytes, an empty file, a long name, and
+  `oversize-132k.ROM`, which must never be launched on a firmware that does not bound its flash
+  writes (the write runs into Booster's flash).
+- `testserver.py` serves a folder (default `tools/dev/builds/testserver`) and generated failure
+  routes: `fail-404*`, `fail-500*`, `fail-html200*`, `fail-truncated*`, `fail-stall*`,
+  `fail-loop*`, and `synthetic-NNNN.img` for paging tests. The firmware fetches catalog entries
+  from the catalog's own host on port 80, which is why those are the default ports. Requests are
+  logged to `tools/dev/logs/testserver.log`.
+- The self-check cartridge (`selfcheck/selfcheck.s`) reads every patterned word of both banks
+  through the cartridge port at boot, prints PASS or the first bad address, and sends the verdict
+  as a `$7F01`/`$7F02` frame through ROM3 reads for a ROM3 capture to decode.
+- `smoke.py` drives the menu with `swd.py key`, checks each step on the terminal text and the
+  window, fails when the RP restarts unasked or the heap runs low, and writes screen PNGs and a
+  JSON report to `tools/dev/logs/smoke-<time>/`.
+- Probe sessions start from the test microfirmware, launched from Booster; never probe Booster
+  itself. After flashing a firmware whose cartridge layout differs from the one the ST is running,
+  the ST keeps the old cartridge code until it reboots: reset it through the old firmware's
+  command word (`swd.py st-reset --offset 0x2000` after the template's layout), and confirm the
+  ST's screen before going on.
+
 ## Firmware support these tools rely on
 
 - Debug builds run the console at 921,600 baud (`PICO_DEFAULT_UART_BAUD_RATE` in
@@ -53,7 +137,7 @@ tools/dev/flash.sh debug --src /tmp/src   # build a copy of rp/src (for example 
 
 Builds out of tree in `tools/dev/builds/<type>`, incrementally. It does not touch `rp/build` or
 the submodules, and warns when a submodule is not at the version `rp/build.sh` pins. It builds
-with the same CMake build type as `rp/build.sh` (Release; `RP_CMAKE_BUILD_TYPE` overrides it,
+with the same CMake build type as `rp/build.sh` (MinSizeRel; `RP_CMAKE_BUILD_TYPE` overrides it,
 with a warning, in a folder of its own). The m68k
 image is not rebuilt: after changing `target/atarist`, run `target/atarist/build.sh` first (it
 regenerates `rp/src/include/target_firmware.h`), then `flash.sh`.
@@ -80,7 +164,7 @@ a hung RP. Memory is read while the CPU keeps running.
 python3 tools/dev/swd.py running tools/dev/builds/debug/rp.elf   # booted this firmware?
 python3 tools/dev/swd.py verify tools/dev/builds/debug/rp.elf    # flash identical to the ELF?
 python3 tools/dev/swd.py build-id                                # which build is on the RP?
-python3 tools/dev/swd.py read 0x2003e0c0 8000 fb.bin             # dump memory
+python3 tools/dev/swd.py read 0x20028000 8000 fb.bin             # dump memory
 python3 tools/dev/swd.py program tools/dev/builds/debug/rp.elf   # flash through the probe
 python3 tools/dev/swd.py screen menu.png                         # the setup menu as the ST shows it
 python3 tools/dev/swd.py text                                    # the setup menu as text
@@ -205,9 +289,9 @@ catches short-lived allocations between samples. A shortage shows as a peak with
 before the stack, or as plenty of free bytes but a small largest block (fragmentation). `--watch
 SECONDS` samples until Ctrl-C; `--csv FILE` appends every sample for later comparison. If the
 heap changes while it is read, the chunk walk is retried once and otherwise reported as failed.
-In this template the heap's limit, `__StackLimit`, is the end of `RAM`, where the 64 KB cartridge
-window starts (`rp/src/memmap_rp.ld`), so the size `heap` reports stops short of the window and a
-request that does not fit gets NULL.
+The heap's limit is `__StackLimit` in `rp/src/memmap_rp.ld`. In this firmware it is still the end
+of the 128 KB cartridge window (`0x20040000`), not the end of `RAM`, so the size `heap` reports
+includes the window, and an allocation can be handed addresses the ST reads.
 
 OpenOCD is `$OPENOCD`, `openocd` on `PATH`, or `../pico/openocd/src/openocd`; its scripts come
 from `$PICO_OPENOCD_PATH`, the variable `.vscode/launch.json` uses. A command that fails on a

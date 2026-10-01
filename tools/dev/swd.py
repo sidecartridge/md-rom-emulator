@@ -17,6 +17,9 @@ Usage:
     python3 tools/dev/swd.py resume
     python3 tools/dev/swd.py reset
     python3 tools/dev/swd.py screen OUT.png [--elf ELF] [--scale N]
+    python3 tools/dev/swd.py window FILE [--no-flash] [--elf ELF]
+    python3 tools/dev/swd.py st-reset [--wait S] [--offset N] [--elf ELF]
+    python3 tools/dev/swd.py debug-pause on|off
     python3 tools/dev/swd.py shared [--elf ELF] [--all]
     python3 tools/dev/swd.py text [--elf ELF]
     python3 tools/dev/swd.py select short|long|release [--hold-ms MS] [--force]
@@ -25,6 +28,7 @@ Usage:
     python3 tools/dev/swd.py inject COMMAND_ID [WORD ...] [--elf ELF]
     python3 tools/dev/swd.py crash [--elf ELF]
     python3 tools/dev/swd.py postmortem [--elf ELF] [--leave-halted]
+    python3 tools/dev/swd.py gdb [--script FILE ...] [--seconds S] [--elf ELF]
     python3 tools/dev/swd.py heap [--elf ELF] [--watch SECONDS] [--csv FILE]
     python3 tools/dev/swd.py ring [--mark | --since-mark] [--elf ELF]
 
@@ -102,10 +106,13 @@ import glob
 import os
 import re
 import shutil
+import signal
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import zlib
 
@@ -201,11 +208,47 @@ TRANSIENT = re.compile(r"Failed to read memory|Error connecting DP|"
 ATTEMPTS = 4
 
 
+TCL_PORT = 6666
+
+
+def tcl_server() -> socket.socket | None:
+    """A running OpenOCD's TCL server (`swd.py gdb` opens one), or None.
+    Only one program can hold the probe: while GDB is attached, the other
+    commands go through the OpenOCD it uses."""
+    try:
+        sock = socket.create_connection(("127.0.0.1", TCL_PORT), timeout=0.3)
+    except OSError:
+        return None
+    sock.settimeout(60)
+    return sock
+
+
+def tcl(sock: socket.socket, command: str) -> str:
+    sock.sendall(command.encode() + b"\x1a")
+    data = b""
+    while not data.endswith(b"\x1a"):
+        chunk = sock.recv(65536)
+        if not chunk:
+            break
+        data += chunk
+    return data.rstrip(b"\x1a").decode(errors="replace")
+
+
 def openocd(*commands: str, check: bool = True, work_area: bool = False) -> str:
     """Run OpenOCD with `init`, the commands and `exit`; return its output.
     A run that failed on a transient debug-port error is repeated. Only a run
     that writes flash, with the cores halted, asks for OpenOCD's default work
-    area (see openocd_command)."""
+    area (see openocd_command). When an OpenOCD is already running with its
+    TCL server (a `swd.py gdb` session), the commands go to it instead."""
+    sock = tcl_server()
+    if sock is not None:
+        with sock:
+            out = "\n".join(tcl(sock, "capture {" + c + "}") for c in commands)
+            if any(c.startswith("targets ") for c in commands):
+                tcl(sock, "targets " + CORES[0])
+        if check and re.search(r"^Error", out, re.M):
+            raise SwdError("openocd failed: " + out.strip()[-300:])
+        return out
     args = openocd_command(work_area) + ["-c", "init"]
     for c in commands:
         args += ["-c", c]
@@ -462,6 +505,153 @@ def cmd_screen(args: argparse.Namespace) -> int:
     lit = sum(bin(b).count("1") for b in fb)
     print(f"wrote {args.out} ({FB_WIDTH * args.scale}x{FB_HEIGHT * args.scale}, "
           f"{lit} pixels lit) from 0x{base + offset:08x}")
+    return 0
+
+
+WINDOW_BYTES = 128 * 1024
+ST_ROM4 = 0xFA0000
+
+
+def st_words(mem: bytes) -> bytes:
+    """RP memory holds the ST's big-endian words byte-swapped; undo it."""
+    out = bytearray(len(mem))
+    out[0::2], out[1::2] = mem[1::2], mem[0::2]
+    return bytes(out)
+
+
+def rom_image(path: str) -> bytes:
+    """A ROM file as the loader stores it: a STEEM image loses its 4-byte
+    zero header (the loader's rule: 4 zero bytes, then whole flash sectors)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    if len(data) > 4 and (len(data) - 4) % 4096 == 0 and data[:4] == bytes(4):
+        data = data[4:]
+    return data
+
+
+def cmd_window(args: argparse.Namespace) -> int:
+    """Is the ROM the ST reads exactly this file? Checks the cartridge window
+    (what the bus serves) and ROM_TEMP in flash (what a reboot copies in)."""
+    elf = matching_elf(args.elf)
+    image = rom_image(args.file)
+    places = [("window", cartridge_window(elf))]
+    if not args.no_flash:
+        rom_temp = elf_symbols(elf, "_rom_temp_start").get("_rom_temp_start")
+        if rom_temp:
+            places.append(("ROM_TEMP", rom_temp[0]))
+    failed = False
+    for name, address in places:
+        st = st_words(read_memory(address, WINDOW_BYTES))
+        size = min(len(image), WINDOW_BYTES)
+        diff = next((i for i in range(size) if st[i] != image[i]), None)
+        if len(image) > WINDOW_BYTES:
+            print(f"{name}: the file is {len(image)} bytes, more than the "
+                  f"{WINDOW_BYTES}-byte window")
+            failed = True
+        if diff is None:
+            print(f"{name}: PASS, {size} bytes match")
+        else:
+            bank = "ROM4" if diff < 0x10000 else "ROM3"
+            print(f"{name}: FAIL at ${ST_ROM4 + diff:06X} ({bank}): "
+                  f"reads 0x{st[diff]:02x}, the file has 0x{image[diff]:02x}")
+            failed = True
+        tail = st[size:]
+        if tail:
+            erased = tail.count(0xFF)
+            zero = tail.count(0)
+            other = len(tail) - erased - zero
+            print(f"  after the ROM, {len(tail)} bytes: {erased} erased "
+                  f"(0xff), {zero} zero, {other} other" +
+                  (" (left over from an earlier ROM?)" if other else ""))
+    return 3 if failed else 0
+
+
+DMA_BASE = 0x50000000
+DMA_CHANNELS = 8
+
+
+def st_command_word(elf: str) -> int:
+    """Where the RP leaves a command for the ST's menu loop: the template's
+    sentinel, or before it the word after the framebuffer."""
+    defs = include_defines()
+    base = cartridge_window(elf)
+    if "CHANDLER_CMD_SENTINEL_OFFSET" in defs:
+        return base + defs["CHANDLER_CMD_SENTINEL_OFFSET"]
+    return (base + defs["DISPLAY_BUFFER_OFFSET"] +
+            defs["DISPLAY_COMMAND_ADDRESS_OFFSET"])
+
+
+def write_st_command(address: int, value: int) -> None:
+    """The ST reads the long as two big-endian words: store it word-swapped,
+    as the firmware's WRITE_AND_SWAP_LONGWORD does."""
+    swapped = ((value << 16) | (value >> 16)) & 0xFFFFFFFF
+    openocd(f"mww 0x{address:08x} 0x{swapped:08x}")
+
+
+def st_reads(elf: str, samples: int = 8) -> list[int]:
+    """The last cartridge addresses the ST read, as offsets into the window:
+    the DMA channel that serves the bus keeps its read address at the word it
+    served last."""
+    base = cartridge_window(elf)
+    cmds = []
+    for _ in range(samples):
+        cmds += [f"mdw 0x{DMA_BASE + 0x40 * ch:08x}" for ch in range(DMA_CHANNELS)]
+        cmds.append("sleep 20")
+    out = openocd(*cmds, check=False)
+    values = [int(v, 16) for v in re.findall(r"0x500000[0-9a-f]{2}: ([0-9a-f]+)", out)]
+    return [v - base for v in values if base <= v < base + WINDOW_BYTES]
+
+
+def cmd_st_reset(args: argparse.Namespace) -> int:
+    """Reboot the ST the way the setup menu does: the reset command in the
+    word its menu loop polls every frame, then the no-op again so the rebooted
+    ST does not reset once more. Works while the ST runs the setup menu, not
+    inside a ROM the user launched."""
+    elf = matching_elf(args.elf)
+    defs = include_defines()
+    reset = defs.get("CHANDLER_CMD_RESET", defs.get("DISPLAY_COMMAND_RESET", 1))
+    nop = defs.get("CHANDLER_CMD_NOP", defs.get("DISPLAY_COMMAND_NOP", 0))
+    # --offset: the ST runs another firmware's menu loop (the one flashed
+    # before this ELF), which polls its own word: the template's sentinel is
+    # at 0x2000 of the window, v2.1.2's command word at 0x9f40.
+    address = (cartridge_window(elf) + int(args.offset, 0) if args.offset
+               else st_command_word(elf))
+    write_st_command(address, reset)
+    time.sleep(0.6)
+    write_st_command(address, nop)
+    print(f"reset command written at 0x{address:08x}, then the no-op")
+    if not args.wait:
+        return 0
+    fb = defs.get("CHANDLER_FRAMEBUFFER_OFFSET", defs.get("DISPLAY_BUFFER_OFFSET"))
+    booted = False
+    deadline = time.monotonic() + args.wait
+    while time.monotonic() < deadline:
+        offsets = st_reads(elf)
+        if any(o < 0x100 for o in offsets):
+            booted = True          # the cartridge header: TOS looked for it
+        if booted and sum(fb <= o < 0x10000 for o in offsets) >= 2:
+            print("the ST booted through the cartridge and is back in the "
+                  "menu loop")
+            return 0
+    print("the ST " + ("booted but did not reach the menu loop"
+                       if booted else "did not boot through the cartridge") +
+          f" within {args.wait:g} s", file=sys.stderr)
+    return 3
+
+
+TIMER_DBGPAUSE = 0x4005402C
+
+
+def cmd_debug_pause(args: argparse.Namespace) -> int:
+    """The RP2040's timer stops while a core is halted in debug (DBGPAUSE,
+    0x7 after every reset). With the probe attached, a core that runs into a
+    breakpoint instruction (fatfs-sdk's crash handler ends in one) halts, the
+    timer stops, and the other core freezes in its next sleep_ms, which is not
+    what happens without a probe. `off` keeps the timer running, as in the
+    field, until the next reset."""
+    value = 0x7 if args.state == "on" else 0x0
+    openocd(f"mww 0x{TIMER_DBGPAUSE:08x} 0x{value:x}")
+    print(f"timer debug pause {args.state} (DBGPAUSE 0x{value:x}) until the next reset")
     return 0
 
 
@@ -906,8 +1096,46 @@ def mailbox_request(elf: str, kind: int, command_id: int, words: list[int],
                    "is the main loop running?")
 
 
+def send_protocol_slot(elf: str, command_id: int, words: list[int],
+                       timeout: float = 5.0) -> bool:
+    """Firmware without the mailbox: write the frame where its ROM3 interrupt
+    leaves a parsed command (lastProtocol, then lastProtocolValid) and wait
+    for the main loop to take it. False when the ELF has no such slot."""
+    sym = elf_symbols(elf, "lastProtocol", "lastProtocolValid")
+    if len(sym) < 2:
+        return False
+    slot, flag = sym["lastProtocol"][0], sym["lastProtocolValid"][0]
+
+    def pending() -> bool:
+        return read_memory(flag, 1)[0] != 0
+
+    deadline = time.monotonic() + timeout
+    while pending():
+        if time.monotonic() > deadline:
+            raise SwdError("the firmware kept another command pending")
+        time.sleep(0.1)
+    # TransmissionProtocol: command_id, payload_size, bytes_read,
+    # final_checksum (16 bits each), then the payload. The flag goes last:
+    # the main loop acts as soon as it is set, and clears it when done.
+    commands = [f"mwh 0x{slot:08x} {command_id}",
+                f"mwh 0x{slot + 2:08x} {len(words) * 2}"]
+    for i, word in enumerate(words):
+        commands.append(f"mwh 0x{slot + 8 + 2 * i:08x} {word & 0xFFFF}")
+    commands.append(f"mwb 0x{flag:08x} 1")
+    openocd(*commands)
+    while pending():
+        if time.monotonic() > deadline:
+            raise SwdError(f"not taken within {timeout:g} s: "
+                           "is the main loop running?")
+        time.sleep(0.1)
+    return True
+
+
 def send_protocol(elf: str, command_id: int, words: list[int]) -> None:
     # The payload starts with the random token, which only matters to the ST.
+    if (MAILBOX_SYMBOL not in elf_symbols(elf, MAILBOX_SYMBOL)
+            and send_protocol_slot(elf, command_id, [0, 0] + words)):
+        return
     for _ in range(10):
         if mailbox_request(elf, KIND_PROTOCOL, command_id, [0, 0] + words):
             return
@@ -1047,6 +1275,64 @@ def cmd_postmortem(args: argparse.Namespace) -> int:
         return 0
     # OpenOCD leaves debug mode enabled (C_DEBUGEN) after GDB detaches; clear
     # it on both cores so the RP runs exactly as before the halt.
+    return cmd_resume(args)
+
+
+GDB_DIR = os.path.join(HERE, "gdb")
+
+
+def cmd_gdb(args: argparse.Namespace) -> int:
+    """GDB on the running RP, through the same OpenOCD server as postmortem.
+
+    Loads tools/dev/gdb/rom-emulator.gdb (the app's commands) and each
+    --script. Without --seconds it is an interactive session. With it, the
+    scripts set their breakpoints and the RP runs for that long, printing what
+    each breakpoint's commands print; then GDB interrupts, resumes both cores
+    and detaches, so the RP is left running as it was."""
+    elf = matching_elf(args.elf)
+    gdb = gdb_command()
+    server = openocd_command() + [
+        "-c", f"gdb_port {GDB_PORT}", "-c", f"tcl_port {TCL_PORT}",
+        "-c", "telnet_port disabled"]
+    proc = subprocess.Popen(server, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True)
+    try:
+        deadline = time.monotonic() + 10
+        ready = False
+        while time.monotonic() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            if f"port {GDB_PORT}" in line:
+                ready = True
+                break
+        if not ready:
+            raise SwdError("OpenOCD did not start its GDB server")
+        # Other swd.py commands reach the probe through this OpenOCD's TCL
+        # server while GDB is attached (tcl_server()); drain its output so it
+        # never blocks on a full pipe.
+        threading.Thread(target=proc.stdout.read, daemon=True).start()
+        argv = [gdb, "-nx", "-q", elf,
+                "-ex", "set pagination off", "-ex", "set confirm off",
+                "-ex", f"target extended-remote localhost:{GDB_PORT}",
+                "-x", os.path.join(GDB_DIR, "rom-emulator.gdb")]
+        for script in args.script:
+            argv += ["-x", script]
+        if args.seconds is None:
+            return subprocess.call(argv)
+        gdb_proc = subprocess.Popen(argv + ["-ex", "continue"],
+                                    stdin=subprocess.PIPE, text=True)
+        time.sleep(args.seconds)
+        gdb_proc.send_signal(signal.SIGINT)
+        time.sleep(1)
+        gdb_proc.communicate("monitor resume\ndetach\nquit\n", timeout=30)
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    # As after postmortem: clear the debug enable GDB leaves on both cores.
     return cmd_resume(args)
 
 
@@ -1220,6 +1506,39 @@ def build_parser() -> argparse.ArgumentParser:
     pm.add_argument("--elf")
     pm.add_argument("--leave-halted", action="store_true")
     pm.set_defaults(func=cmd_postmortem)
+
+    gd = sub.add_parser("gdb", help="GDB on the running RP, with the app's "
+                        "commands (tools/dev/gdb); --seconds for a timed, "
+                        "unattended run of breakpoint scripts")
+    gd.add_argument("--script", action="append", default=[],
+                    help="a GDB script to load (repeatable)")
+    gd.add_argument("--seconds", type=float,
+                    help="run this long, then resume both cores and detach")
+    gd.add_argument("--elf")
+    gd.set_defaults(func=cmd_gdb)
+
+    wn = sub.add_parser("window", help="compare the cartridge window and "
+                        "ROM_TEMP with a ROM file, as the ST reads them")
+    wn.add_argument("file")
+    wn.add_argument("--no-flash", action="store_true",
+                    help="check the window only, not ROM_TEMP")
+    wn.add_argument("--elf")
+    wn.set_defaults(func=cmd_window)
+
+    dp = sub.add_parser("debug-pause", help="whether the RP's timer stops "
+                        "while a core is halted in debug (on after every reset)")
+    dp.add_argument("state", choices=("on", "off"))
+    dp.set_defaults(func=cmd_debug_pause)
+
+    sr = sub.add_parser("st-reset", help="reboot the ST from its setup menu, "
+                        "as the menu itself does")
+    sr.add_argument("--wait", type=float, default=0,
+                    help="seconds to wait for the ST to boot back into the menu")
+    sr.add_argument("--offset", help="window offset of the word the ST's "
+                    "loop polls, when it runs another firmware's cartridge "
+                    "code (0x2000 for the template's sentinel)")
+    sr.add_argument("--elf")
+    sr.set_defaults(func=cmd_st_reset)
 
     sc = sub.add_parser("screen", help="render the framebuffer as a PNG")
     sc.add_argument("out")
