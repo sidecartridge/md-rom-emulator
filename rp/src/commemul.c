@@ -153,3 +153,12 @@ void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback) {
 }
 
 uint32_t commemul_getOverruns(void) { return commOverruns; }
+
+void commemul_stop(void) {
+  if (!commInitialized) {
+    return;
+  }
+  pio_sm_set_enabled(commPio, (uint)commSm, false);
+  dma_channel_abort((uint)commDmaChannel);
+  commInitialized = false;
+}

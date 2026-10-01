@@ -40,6 +40,9 @@
 // is held. The ST reads the sentinel once per pass of its menu loop (measured
 // on an ST: within 42 ms); the hold is well over that.
 #define SENTINEL_HOLD_MS 500
+// The longest the jump to Booster waits for the ST to reboot: past main.s's
+// PRE_RESET_WAIT at 8 MHz (about 2.4 s).
+#define BOOSTER_HANDOVER_MAX_MS 4000
 
 // The largest file ROM_TEMP takes: two 64 KB banks, plus the 4 zero bytes a
 // STEEM cartridge image starts with.
@@ -174,6 +177,40 @@ static void emul_serviceFor(uint32_t ms) {
   while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
     chandler_loop();
   }
+}
+
+// Nothing of this app's runs past a reset or the jump to Booster: the bus
+// engine and the command ring stop first (the jump itself masks and clears
+// the interrupts, reset.h).
+static void emul_quiesce(void) {
+  romemul_stop();
+  commemul_stop();
+}
+
+static void emul_quiesceAndReset(void) {
+  emul_quiesce();
+  reset_device();
+}
+
+static void emul_quiesceAndFactoryReset(void) {
+  emul_quiesce();
+  reset_deviceAndEraseFlash();
+}
+
+// After the reset command: true once the ST has rebooted, which shows as a
+// read of the cartridge header (the first 256 bytes, TOS's cartridge checks;
+// the menu loop never reads there). False after maxMs, when nothing on the ST
+// was listening (the desktop, a ROM).
+static bool emul_waitForStReboot(uint32_t maxMs) {
+  absolute_time_t until = make_timeout_time_ms(maxMs);
+  while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
+    chandler_loop();
+    int32_t offset = romemul_lastReadOffset();
+    if (offset >= 0 && offset < 0x100) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // What every long wait runs, so the ST's commands are answered and SELECT is
@@ -388,26 +425,27 @@ static AutorunResult autorunIfRequested(void) {
                        ROM_MODE_DIRECT);
   settings_save(aconfig_getContext(), true);
 
-  // Blink green LED (if available) forever instead of resetting
-#ifdef BLINK_H
+  // Blink the LED (if available) forever instead of resetting. The ST and
+  // SELECT stay serviced: a short press restarts the RP, which boots into the
+  // ROM just stored (MODE is ROM_MODE_DIRECT now), as v2.1.2 did.
   DPRINTF("Autorun successful. Blinking LED to indicate autorun mode.\n");
   bool ledOn = false;
+  uint32_t toggledUs = time_us_32();
   while (1) {
+    emul_pollTick();
+    if (time_us_32() - toggledUs < AUTORUN_BLINK_MS * 1000U) {
+      continue;
+    }
+    toggledUs = time_us_32();
     ledOn = !ledOn;
+#ifdef BLINK_H
     if (ledOn) {
       blink_on();
     } else {
       blink_off();
     }
-    sleep_ms(AUTORUN_BLINK_MS);
-  }
-#else
-  DPRINTF(
-      "Autorun successful. Entering infinite loop to indicate autorun mode.\n");
-  while (1) {
-    sleep_ms(AUTORUN_BLINK_MS);
-  }
 #endif
+  }
   return AUTORUN_OK;  // Not reached on success, keeps signature consistent
 }
 
@@ -1140,10 +1178,47 @@ static void __not_in_flash_func(romModeWaitForSelect)(void) {
   }
 }
 
+// ROM mode's boot race, read over SWD (release ELFs keep their symbols):
+//   romModeLiveUs            the timer when the engine started; a reset
+//                            zeroes the timer, so it is the time from reset
+//   romModeAccessBeforeLive  1 when the ST had already read the cartridge
+//                            then: the !ROM4 falling-edge latch was set
+//   romModeFirstAccessUs     the ST's first cartridge access after that, 0
+//                            while there has been none
+volatile uint32_t romModeLiveUs = 0;
+volatile uint32_t romModeAccessBeforeLive = 0;
+volatile uint32_t romModeFirstAccessUs = 0;
+
+#define ROM4_EDGE_FALL_BITS (GPIO_IRQ_EDGE_FALL << (4 * (ROM4_GPIO % 8)))
+
+// One-shot: records the first access and switches itself off, with register
+// writes only (no flash code in an interrupt).
+static void __not_in_flash_func(romModeFirstAccessIrq)(void) {
+  if ((gpio_get_irq_event_mask(ROM4_GPIO) & GPIO_IRQ_EDGE_FALL) == 0U) {
+    return;
+  }
+  gpio_acknowledge_irq(ROM4_GPIO, GPIO_IRQ_EDGE_FALL);
+  romModeFirstAccessUs = time_us_32();
+  hw_clear_bits(&io_bank0_hw->proc0_irq_ctrl.inte[ROM4_GPIO / 8],
+                ROM4_EDGE_FALL_BITS);
+}
+
+// Called the moment the engine serves the bus: takes the time, reads the
+// latch of edges since reset, then arms the one-shot for the next access.
+static void romModeMarkLive(void) {
+  romModeLiveUs = time_us_32();
+  romModeAccessBeforeLive =
+      (io_bank0_hw->intr[ROM4_GPIO / 8] & ROM4_EDGE_FALL_BITS) != 0U;
+  gpio_acknowledge_irq(ROM4_GPIO, GPIO_IRQ_EDGE_FALL);
+  gpio_add_raw_irq_handler(ROM4_GPIO, romModeFirstAccessIrq);
+  gpio_set_irq_enabled(ROM4_GPIO, GPIO_IRQ_EDGE_FALL, true);
+  irq_set_enabled(IO_IRQ_BANK0, true);
+}
+
 static void romMode(int appModeValue) {
   select_configure();
   select_setResetCallback(romModeSelectPressed);
-  select_setLongResetCallback(reset_deviceAndEraseFlash);
+  select_setLongResetCallback(emul_quiesceAndFactoryReset);
 
   if (appModeValue == ROM_MODE_DELAY) {
     // Delay/Ripper mode: the ST boots without the cartridge, as the old
@@ -1160,6 +1235,18 @@ static void romMode(int appModeValue) {
   if (init_romemul_two_banks(false) < 0) {
     panic("init_romemul_two_banks failed: PIO/DMA claim returned <0");
   }
+  romModeMarkLive();
+#if defined(_DEBUG) && (_DEBUG != 0)
+  // Debug builds only: capture the ST's ROM3 reads, driving nothing and
+  // answering nothing (the window is the ROM's), so `swd.py ring` reads what
+  // a test cartridge sends, such as the self-check's verdict.
+  if (commemul_init() < 0) {
+    DPRINTF("ROM3 capture not started\n");
+  }
+#endif
+  DPRINTF("ROM mode live at %lu us; the ST read the cartridge before: %s\n",
+          (unsigned long)romModeLiveUs,
+          romModeAccessBeforeLive ? "yes" : "no");
 
 #ifdef BLINK_H
   blink_on();
@@ -1168,6 +1255,9 @@ static void romMode(int appModeValue) {
   DPRINTF("ROM emulation mode started. Waiting for SELECT button\n");
   romModeWaitForSelect();
   DPRINTF("SELECT button pressed: back to the setup menu\n");
+
+  // Engine off, then the save, then the reset.
+  emul_quiesce();
 
   // Set the ROM emulation mode to 255 (setup menu)
   settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
@@ -1237,8 +1327,8 @@ void emul_start() {
   // made while a wait cannot poll. A short press restarts the RP. A press held
   // for SELECT_LONG_RESET is a factory reset.
   select_configure();
-  select_setResetCallback(reset_device);
-  select_setLongResetCallback(reset_deviceAndEraseFlash);
+  select_setResetCallback(emul_quiesceAndReset);
+  select_setLongResetCallback(emul_quiesceAndFactoryReset);
 
   // 5. The SD card. Static, not on the stack: FatFs keeps a pointer to it
   // while the card is mounted.
@@ -1427,13 +1517,24 @@ void emul_start() {
   // long enough for the ST's menu loop to see it, and keep answering: a
   // keystroke in flight would otherwise keep the ST in its send, retrying,
   // until the hold was over.
+  // The ST resets when its menu loop reads the command, after its own
+  // PRE_RESET_WAIT (main.s: about 2.4 s at 8 MHz). A launch restarts the RP
+  // within that wait, so the ST's TOS finds the new ROM.
   emul_serviceFor(SLEEP_LOOP_MS);
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_RESET);
-  emul_serviceFor(SENTINEL_HOLD_MS);
   if (getResetDevice()) {
-    // Reset the device
-    reset_device();
+    emul_serviceFor(SENTINEL_HOLD_MS);
+    emul_quiesceAndReset();
   } else {
+    // Booster: keep the command until the ST has rebooted (its TOS has read
+    // this cartridge's header), then put the no-op back, so the ST cannot
+    // reset again on this menu, and only then stop the engines and hand the
+    // window over.
+    bool stRebooted = emul_waitForStReboot(BOOSTER_HANDOVER_MAX_MS);
+    SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_NOP);
+    DPRINTF("The ST %s\n", stRebooted
+                                ? "rebooted: its cartridge header was read"
+                                : "did not reboot (nothing listening)");
     // Before jumping to the booster app, clean the settings: no ROM selected,
     // setup mode
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, "");
@@ -1443,6 +1544,7 @@ void emul_start() {
 
     // Jump to the booster app
     DPRINTF("Jumping to the booster app...\n");
+    emul_quiesce();
     reset_jump_to_booster();
   }
 }

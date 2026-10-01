@@ -27,4 +27,8 @@ void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback);
 // were dropped (also readable over SWD as commOverruns).
 uint32_t commemul_getOverruns(void);
 
+// Stops the capture: the state machine off and its DMA channel aborted, so
+// nothing of it runs past a reset or the jump to Booster.
+void commemul_stop(void);
+
 #endif  // COMMEMUL_H
