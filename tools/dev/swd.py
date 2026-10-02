@@ -117,6 +117,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import functools
 import ast
 import glob
 import os
@@ -309,13 +310,18 @@ def read_memory(address: int, length: int) -> bytes:
     return data
 
 
-def elf_symbols(elf: str, *names: str) -> dict[str, tuple[int, int]]:
-    """Address and size of each named symbol present in the ELF."""
+@functools.lru_cache(maxsize=4)
+def elf_nm(elf: str, mtime: float) -> str:
     nm = shutil.which("arm-none-eabi-nm")
     if not nm:
         raise SwdError("arm-none-eabi-nm not on PATH")
-    out = subprocess.run([nm, "-S", elf], capture_output=True, text=True,
-                         check=True).stdout
+    return subprocess.run([nm, "-S", elf], capture_output=True, text=True,
+                          check=True).stdout
+
+
+def elf_symbols(elf: str, *names: str) -> dict[str, tuple[int, int]]:
+    """Address and size of each named symbol present in the ELF."""
+    out = elf_nm(os.path.abspath(elf), os.path.getmtime(elf))
     found = {}
     for line in out.splitlines():
         parts = line.split()
@@ -1355,7 +1361,7 @@ def mailbox_request(elf: str, kind: int, command_id: int, words: list[int],
             "<III", read_memory(base + MB_ACK, MB_RESULT + 4 - MB_ACK))
         if new_ack == ack + 1:
             return result
-        time.sleep(0.1)
+        time.sleep(0.02)
     raise SwdError(f"no acknowledge within {timeout:g} s: "
                    "is the main loop running?")
 
@@ -1414,21 +1420,58 @@ NAMED_KEYS = {"up": (0, 72), "down": (0, 80), "left": (0, 75),
               "space": (32, 57)}
 
 
-def cmd_key(args: argparse.Namespace) -> int:
-    elf = matching_elf(args.elf)
-    defs = include_defines()
-    if args.char in NAMED_KEYS:
-        ascii_code, scan = NAMED_KEYS[args.char]
-    elif len(args.char) == 1:
-        ascii_code, scan = ord(args.char), args.scan
+def send_key(elf: str, defs: dict[str, int], char: str, shift: bool = False,
+             scan: int = 0) -> None:
+    if char in NAMED_KEYS:
+        ascii_code, scan = NAMED_KEYS[char]
+    elif len(char) == 1:
+        ascii_code = ord(char)
     else:
         raise SwdError("CHAR must be one character or one of "
                        + ", ".join(NAMED_KEYS))
     command_id = (defs["APP_TERMINAL"] << 8) | defs["APP_TERMINAL_KEYSTROKE"]
     param = (ascii_code | (scan << defs["TERM_KEYBOARD_SCAN_SHIFT"]) |
-             ((1 if args.shift else 0) << defs["TERM_KEYBOARD_SHIFT_SHIFT"]))
+             ((1 if shift else 0) << defs["TERM_KEYBOARD_SHIFT_SHIFT"]))
     send_protocol(elf, command_id, [param & 0xFFFF, param >> 16])
+
+
+def cmd_key(args: argparse.Namespace) -> int:
+    send_key(matching_elf(args.elf), include_defines(), args.char, args.shift,
+             args.scan)
     print(f"key {args.char!r} sent")
+    return 0
+
+
+def cmd_type(args: argparse.Namespace) -> int:
+    """Type a line, a key at a time, through one OpenOCD: each `swd.py key`
+    starts its own, about a second per key."""
+    elf = matching_elf(args.elf)
+    defs = include_defines()
+    keys = ["space" if c == " " else c for c in args.text]
+    keys += ["return"] * args.enter
+    proc = None
+    if tcl_server() is None:
+        proc = subprocess.Popen(
+            openocd_command() + ["-c", f"tcl_port {TCL_PORT}",
+                                 "-c", "gdb_port disabled",
+                                 "-c", "telnet_port disabled"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 10
+        while tcl_server() is None:
+            if proc.poll() is not None or time.monotonic() > deadline:
+                raise SwdError("openocd did not start its TCL server")
+            time.sleep(0.1)
+    try:
+        for key in keys:
+            send_key(elf, defs, key)
+    finally:
+        if proc is not None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    print(f"typed {len(keys)} keys")
     return 0
 
 
@@ -1825,6 +1868,12 @@ def build_parser() -> argparse.ArgumentParser:
     k.add_argument("--scan", type=int, default=0)
     k.add_argument("--elf")
     k.set_defaults(func=cmd_key)
+
+    t = sub.add_parser("type", help="type a line as the ST would, quickly")
+    t.add_argument("text")
+    t.add_argument("--enter", action="store_true", help="then RETURN")
+    t.add_argument("--elf")
+    t.set_defaults(func=cmd_type)
 
     ap = sub.add_parser("app", help="send an app command (DEVHOOKS_APP_*)")
     ap.add_argument("name")

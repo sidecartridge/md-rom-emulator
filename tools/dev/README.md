@@ -75,7 +75,7 @@ What differs here:
 ```bash
 python3 tools/dev/make_rom_images.py DIR                  # pattern images: every word checkable
 python3 tools/dev/make_catalog.py OUT.csv --dir DIR --cases
-python3 tools/dev/testserver.py                           # the catalog and downloads, ports 80/443
+python3 tools/dev/testserver.py                           # the catalog and downloads, ports 80/443/8443
 tools/dev/selfcheck/build.sh DIR                          # the self-check cartridge
 python3 tools/dev/hatari_check.py --selfcheck DIR         # ... proven under Hatari, every TOS
 python3 tools/dev/smoke.py [--catalog] [--hands]          # a whole session through the probe
@@ -93,7 +93,8 @@ make -C tests/host test                                   # host tests, ASan and
   zero-headed image without a STEEM header, 40,001 bytes, an empty file, a long name, the three
   files `make_catalog.py --cases` names (so their downloads succeed), and `oversize-132k.ROM`, which must never be launched on a firmware that does not bound its flash
   writes (the write runs into Booster's flash).
-- `testserver.py` serves a folder (default `tools/dev/builds/testserver`) and generated failure
+- `testserver.py` serves a folder (default `tools/dev/builds/testserver`) over HTTP (port 80) and
+  HTTPS, with an RSA certificate on 443 and an ECDSA P-256 one on 8443 (`--ecdsa-port`), and generated failure
   routes: `fail-404*`, `fail-500*`, `fail-html200*`, `fail-truncated*`, `fail-stall*`,
   `fail-loop*`, `*slow-*.img` (a 64 KB download that takes 16 s and completes; `*slow-long-*.img`
   160 s, long enough to pull the SD card by hand in the middle of it),
@@ -181,7 +182,8 @@ tools/dev/flash.sh debug --build-only     # build only
 tools/dev/flash.sh debug --src /tmp/src   # build a copy of rp/src (for example a patched linker script)
 ```
 
-Builds out of tree in `tools/dev/builds/<type>`, incrementally. It does not touch `rp/build` or
+Builds out of tree in `tools/dev/builds/<type>`, incrementally, the profile releases ship (HTTP and
+HTTPS downloads; `APP_DOWNLOAD_HTTPS=0` builds HTTP only, in `tools/dev/builds/<type>-http`). It does not touch `rp/build` or
 the submodules, and warns when a submodule is not at the version `rp/build.sh` pins. It builds
 with the same CMake build type as `rp/build.sh` (MinSizeRel; `RP_CMAKE_BUILD_TYPE` overrides it,
 with a warning, in a folder of its own). The m68k
@@ -225,6 +227,7 @@ python3 tools/dev/select_harness.py long --force                 # 10 s press: f
 python3 tools/dev/select_harness.py restore settings.bin         # put the settings back
 python3 tools/dev/swd.py key g                                   # a keystroke, as if typed on the ST
 python3 tools/dev/swd.py key down                                # a named key: up down left right esc return space
+python3 tools/dev/swd.py type "put_str FOLDER /roms" --enter     # a line, through one OpenOCD: about 20 keys a second
 python3 tools/dev/swd.py app heap_hold 16                        # hold 16 KB more heap (0 releases)
 python3 tools/dev/swd.py app wifi 0                              # Wi-Fi down as a lost network (1: up)
 python3 tools/dev/swd.py inject 0x0001 0x0067 0                  # any protocol command
