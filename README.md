@@ -10,7 +10,7 @@
 
 </div>
 
-This is a microfirmware app for the SidecarTridge Multi-device that emulates the cartridge ROM of a Atari ST/STE/Mega ST/Mega STE computer. 
+This is a microfirmware app for the SidecarTridge Multi-device that emulates the cartridge ROM of an Atari ST, STE, Mega ST, Mega STE or Falcon computer: pick a ROM image from the microSD card or download one from the internet catalog, and the computer runs it as if a physical cartridge were plugged in.
 
 > 🛒 **Get the hardware:** [SidecarTridge Multi-device](https://sidecartridge.com/products/sidecartridge-multidevice-atari-st/)
 
@@ -18,69 +18,120 @@ This is a microfirmware app for the SidecarTridge Multi-device that emulates the
 
 To install the ROM Emulator app on your SidecarTridge Multi-device:
 
-1. Launch the **Booster App** on your SidecarTridge  Multi-device..
+1. Launch the **Booster App** on your SidecarTridge Multi-device.
 2. Open the Booster web interface.
 3. In the **Apps** tab, select **"ROM Emulator"** from the list of available apps.
-4. Click **"Download"** to install the app to your SidecarTridge’s microSD card.
+4. Click **"Download"** to install the app to your SidecarTridge's microSD card.
 5. Once installed, select the app and click **"Launch"** to activate it.
 
-After launching, the app will automatically run every time your Atari computer is powered on.
+After launching, the app runs every time your Atari computer is powered on. An update installed from Booster keeps your settings, your selected ROM and its mode.
 
 ## 🕹️ Usage
 
-If there is no ROM binary file loaded, the app will display a **setup screen**. If there is already a ROM loaded, the app will attempt to run it immediately after powering on your Atari. To return to the setup screen, press **`SELECT`** on your Multi-device and reboot.
+When no ROM has been launched, the computer shows the **setup screen**. When one has, the computer runs it at every power-on and reset, until you press **`SELECT`** on the Multi-device (see [The SELECT button](#-the-select-button)).
 
-### ⚙️ Setup Screen Commands
+![The setup screen](images/setup-menu.png)
 
-| Command | Description |
-|---------|-------------|
-| **[B]rowse** | Browse the ROM files on the microSD card. |
-| **[D]ownload** | Download a ROM file from the internet. |
-| **[S]ettings** | Configure the low level settings for the ROM emulator. |
-| **[R]Ripper** | Enable or Disable the Delay/Ripper mode. It does not load the ROM file until the **`SELECT`** button is pressed. |
-| **[L]aunch** | Launch the selected ROM file, if available. |
-| **[E]xit to Desktop** | Exit to desktop without loading the ROM. |
-| **[X] Return to the Booster menu** | Exit setup and return to the Booster Loader main menu. |
+The bar at the top shows the microSD card's and the Wi-Fi's icons. Each section shows its state: the selected ROM and the Delay/Ripper mode, the card, the network and the last download. A message, such as a ROM just selected, shows for a few seconds on a dark band above the prompt.
 
-### ⬇️ Browsing or Downloading ROM Files
+### ⚙️ Setup Screen Keys
 
-The menu's options take a single key, with no RETURN. When you select the **[B]rowse** option, the app will display a list of available ROM files on the microSD card. Move through it with the cursor keys (UP/DOWN, LEFT/RIGHT a page), RETURN shows a ROM's details, and RETURN again selects it; **[L]aunch** then loads it.
-When you select the **[D]ownload** option, the app will show you the list of available ROM files from the internet. RETURN on a ROM's details downloads it to your microSD card, with its progress on the screen, and selects it; ESC goes back to the menu while the download goes on.
+Each option is a single key, with no RETURN:
 
-**[S]ettings** takes typed commands (`print`, `get KEY`, `put_str KEY VALUE`, `save`, ...), each ended with RETURN; `m` and RETURN go back to the menu.
+| Key | Description |
+|-----|-------------|
+| **B** | Browse the ROM files on the microSD card. |
+| **D** | Download a ROM file from the internet catalog. |
+| **L** | Launch the selected ROM. |
+| **R** | Turn the Delay/Ripper mode on or off. |
+| **S** | Settings: change the app's settings with typed commands. |
+| **E** | Exit to the desktop without loading a ROM. |
+| **X** | Return to the Booster menu. |
+| **M** | Draw the menu again. |
 
-The catalog and the ROMs come over HTTPS, from `https://roms.sidecartridge.com/roms.csv` by default. To use a catalog of your own, set its URL in the `HTTPS_CATALOG` setting (**[S]ettings**); it can be `https://` or `http://`, and the ROMs are fetched from the same server. The connection is encrypted, but the server's certificate is not verified.
+The SHIFT keys no longer boot the desktop from the setup screen: use **E**.
+
+### 💾 Browsing the ROMs on the microSD Card
+
+**B** lists the ROM files in the ROM folder (`/roms` by default; the `FOLDER` setting). Files ending in `.img`, `.rom`, `.stc` or `.bin` are listed; a ROM can be up to 128 KB (`.stc` images carry 4 more bytes at the start).
+
+![The ROMs on the microSD card](images/browse.png)
+
+Move with the cursor keys: UP and DOWN through the list, LEFT and RIGHT a page at a time. RETURN shows the ROM's details:
+
+![A ROM's details](images/browse-details.png)
+
+RETURN again selects it, and the setup screen comes back with it as the ROM to launch. ESC goes back.
+
+### ⬇️ Downloading ROMs from the Catalog
+
+**D** lists the ROMs in the internet catalog. The app keeps a copy of the catalog on the microSD card and refreshes it in the background whenever the network comes up, so the list is there even when the network is not (the screen says so).
+
+![The ROM catalog](images/catalog.png)
+
+RETURN on a ROM shows its details:
+
+![A catalog entry's details](images/catalog-details.png)
+
+RETURN again downloads it to the ROM folder, with its progress on the screen. ESC goes back to the setup screen while the download goes on, its progress shown in the Catalog section.
+
+![A download in progress](images/download.png)
+
+When it is complete, the ROM is selected, ready to launch:
+
+![After a download](images/download-done.png)
+
+The catalog and the ROMs come over HTTPS, from `https://roms.sidecartridge.com/roms.csv` by default. To use a catalog of your own, set its URL in the `HTTPS_CATALOG` setting; it can be `https://` or `http://`, and its ROMs are fetched from the same server. The connection is encrypted, but the server's certificate is not verified. Wi-Fi is set up in Booster; if the network drops, the app joins it again by itself.
+
+### 🛠️ Settings
+
+**S** opens the settings, which take typed commands, each ended with RETURN: `print` lists them, `get KEY` shows one, `put_str KEY VALUE` changes a text setting (`put_int` and `put_bool` the others), and `save` keeps the changes. `m` and RETURN, or ESC, go back to the setup screen.
+
+![The settings](images/settings.png)
+
+| Setting | Meaning |
+|---------|---------|
+| `FOLDER` | The ROM folder on the microSD card. |
+| `HTTPS_CATALOG` | The catalog's URL. |
+| `EMULATED` | The selected ROM. |
+| `MODE` | 255 for the setup screen; 0 runs the ROM, 1 waits for `SELECT` first (Delay/Ripper). |
 
 ### 🚀 Launching a ROM
 
-When you select the **[L]aunch** option, the app will attempt to run the selected ROM file. If the ROM is valid and compatible, it will be loaded into memory and executed. The computer will then behave as if the ROM was loaded from a physical cartridge, even after a power cycle or reset.
+**L** writes the selected ROM to the Multi-device's flash memory, with its progress on the screen, reads it back, and resets the computer into it. The computer then behaves as if the ROM were on a physical cartridge, at every reset and power-on. A ROM that cannot be launched (missing, empty, larger than 128 KB) is refused with the reason, and the previous one stays.
 
-To return to the setup screen, press **`SELECT`** on your Multi-device and reboot.
+### 🔘 The SELECT Button
 
-### 🔁 System Reset Behavior
-
-The ROM Emulator app is **resistant to system resets**. Pressing the reset button on your Atari will load again the ROM file, if available, or return to the setup screen if no ROM is loaded. 
-
-### 🔌 Power Cycling
-
-The ROM Emulator app is designed to be **persistent across power cycles**. When you power off and on your Atari, the app will automatically load the last selected ROM file, if available, or return to the setup screen if no ROM is loaded.
+- **A short press while a ROM runs** brings the setup screen back: press it, then reset the computer.
+- **In Delay/Ripper mode,** the first press starts the ROM (see below).
+- **Holding it for 10 seconds** is a factory reset: the Multi-device's settings are erased and it starts Booster.
 
 ### ❌ Delay/Ripper Mode
 
-The ROM Emulator app includes a **Delay/Ripper mode** that allows you to load the ROM file only when you press the **`SELECT`** button on your Multi-device. This is useful for debugging or testing purposes, as it prevents the ROM from being loaded automatically when the app starts.
-To enable or disable the Delay/Ripper mode, select the **[R]Ripper** option in the setup screen. When enabled, the app will not load the ROM file until you press the **`SELECT`** button.
+The **Delay/Ripper mode** loads the ROM only when you press the **`SELECT`** button on your Multi-device: the computer boots without the cartridge until then. To turn it on or off, press **R** in the setup screen before launching.
 
 The Ripper mode was useful combined with tools like [Ultimate Ripper](https://www.atarimania.com/utility-atari-st-ultimate-ripper_s20034.html). To use it, follow these steps:
-1. Download the Ultimate Ripper ROM file from the internet repository (option `D`).
-2. Enable the Ripper mode in the setup screen (option `R`).
-3. Launch the Ultimate Ripper ROM file (option `L`).
+1. Download the Ultimate Ripper ROM file from the catalog (**D**).
+2. Turn the Ripper mode on in the setup screen (**R**).
+3. Launch the Ultimate Ripper ROM file (**L**).
 4. Now reset or power cycle your Atari computer and load your own application or game.
 5. When you want to rip the ROM, press the **`SELECT`** button on your Multi-device. The game or application should continue running.
-6. Reset (not power cycle) your Atari computer. The screen will look like it is frozen. Now, you have can press F1 (move memory to allocate the ripper program) or F2 (use memory available to allocate the ripper program) to enter the Ultimate Ripper menu.
+6. Reset (not power cycle) your Atari computer. The screen will look like it is frozen. Now you can press F1 (move memory to allocate the ripper program) or F2 (use memory available to allocate the ripper program) to enter the Ultimate Ripper menu.
+
+Ultimate Ripper does not work in high resolution, nor on a Falcon.
+
+### ▶️ Autorun
+
+For a computer whose keyboard or screen does not work (a diagnostic cartridge, for example): put a file named `.autorun` in the ROM folder whose first line is the name of a ROM in that folder. At the next start the app launches that ROM without the setup screen, and the Multi-device's LED blinks; a **`SELECT`** press then restarts into the ROM. Delete or empty `.autorun` to stop it.
+
+### 🧩 Things the App Handles by Itself
+
+- **The microSD card** can be taken out and put back while the setup screen is up: the card is found again by itself.
+- **After an unexpected restart** of the Multi-device, the setup screen says why ("Last restart: ...") for a few seconds.
 
 ## 🛠️ Setting Up the Development Environment
 
-This project is based on an early version of the [SidecarTridge Multi-device Microfirmware App Template](https://github.com/sidecartridge/md-microfirmware-template).  
+This project is based on the [SidecarTridge Multi-device Microfirmware App Template](https://github.com/sidecartridge/md-microfirmware-template).  
 To set up your development environment, please follow the instructions provided in the [official documentation](https://docs.sidecartridge.com/sidecartridge-multidevice/programming/).
 
 

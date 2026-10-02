@@ -320,7 +320,7 @@ by name for the cursor keys (`swd.py key down`: ASCII 0 and the ST's scan code).
   silent loss (the link up, the network gone): set the station's gateway to an address nobody
   answers with GDB (`set var cyw43_state.netif[0].gw.addr = 0xFD01A8C0`, 192.168.1.253) and the
   gateway probe gives up within about 75 s. No AP at boot: rename `WIFI_SSID` in RAM at the first
-  connect (EPIC-06's GDB script) and put it back later.
+  connect, with a GDB breakpoint there, and put it back later.
 
 Add an app's own commands the same way: a `DEVHOOKS_APP_<NAME>` define and a case in the handler.
 Useful ones in other microfirmwares: stop a boot countdown; stall or fail the next answer on
