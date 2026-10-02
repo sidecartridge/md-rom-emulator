@@ -340,7 +340,8 @@ static int readFrom(const catalog_t *cat, uint32_t page, uint32_t skip, int max,
 static void takeName(int n, const catalog_entry_t *e, void *ctx) {
   char (*names)[CATALOG_SHOWN_BYTES] = (char (*)[CATALOG_SHOWN_BYTES])ctx;
   const char *shown = (e->name[0] != '\0') ? e->name : catalog_fileName(e);
-  snprintf(names[n], CATALOG_SHOWN_BYTES, "%s", shown);
+  snprintf(names[n], CATALOG_SHOWN_BYTES, "%.*s", CATALOG_SHOWN_BYTES - 1,
+           shown);
 }
 
 int catalog_readPage(const catalog_t *cat, uint32_t page,
