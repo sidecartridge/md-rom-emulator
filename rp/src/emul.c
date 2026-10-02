@@ -31,6 +31,7 @@
 #include "pico/stdlib.h"
 #include "reset.h"
 #include "romemul.h"
+#include "romstore.h"
 #include "sdcard.h"
 #include "select.h"
 #include "target_firmware.h"  // Include the target firmware binary
@@ -46,8 +47,6 @@
 
 // The largest file ROM_TEMP takes: two 64 KB banks, plus the 4 zero bytes a
 // STEEM cartridge image starts with.
-#define ROM_FILE_MAX_BYTES (ROM_SIZE_BYTES * ROM_BANKS)
-#define ROM_FILE_STEEM_HEADER_BYTES 4
 
 // Command handlers
 static void cmdMenu(const char *arg);
@@ -221,134 +220,141 @@ static void __not_in_flash_func(emul_pollTick)(void) {
   select_poll();
 }
 
-static FRESULT storeFileToFlash(const char *filename, uint32_t flashAddress) {
-  FIL file;
-  FRESULT res;
-  UINT bytesRead;
-  FSIZE_t size;
+// ROM_TEMP's flash for romstore.c: one sector per call, interrupts off for
+// that sector's erase or program only. Kept for SWD: the longest such stretch
+// and the last whole write's duration.
+volatile uint32_t romstoreMaxIrqOffUs = 0;
+volatile uint32_t romstoreLastWriteUs = 0;
+static uint32_t romstoreWriteStartUs = 0;
+static uint32_t romstoreProgressMarks = 0;
+static bool romstoreHeaderShown = false;
 
-  uint8_t *buffer = (uint8_t *)malloc(FLASH_SECTOR_SIZE);
-  if (buffer == NULL) {
-    DPRINTF("Error allocating memory for buffer\n");
-    return FR_NOT_ENOUGH_CORE;
+static void romFlashTime(uint32_t startUs) {
+  uint32_t took = time_us_32() - startUs;
+  if (took > romstoreMaxIrqOffUs) {
+    romstoreMaxIrqOffUs = took;
   }
+}
 
-  // Open the file (read-only, binary mode)
-  res = f_open(&file, filename, FA_READ);
-  if (res != FR_OK) {
-    DPRINTF("Error opening file %s: %d\n", filename, res);
-    free(buffer);
-    return res;
-  }
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Debug builds only, for the power-cut test: each sector's erase is repeated
+// this many more times, so the erase phase lasts long enough for a hand on
+// the power switch. Set over SWD before a launch; a reset clears it.
+volatile uint32_t romstoreTestEraseRepeats = 0;
+#endif
 
-  // Get file size (use FSIZE_t for portability)
-  size = f_size(&file);
-  DPRINTF("File size: %u bytes\n", (unsigned int)size);
-
-  // ROM_TEMP holds two banks, and Booster's flash starts right after it: a
-  // larger file is refused before anything is erased.
-  if (size > ROM_FILE_MAX_BYTES + ROM_FILE_STEEM_HEADER_BYTES) {
-    DPRINTF("File too large: %u bytes, the limit is %u\n", (unsigned int)size,
-            (unsigned int)ROM_FILE_MAX_BYTES);
-    f_close(&file);
-    free(buffer);
-    return FR_INVALID_PARAMETER;
-  }
-
-  // If the file size is a multiple of FLASH_SECTOR_SIZE plus 4 bytes, check for
-  // 4-byte padding.
-  if (size > 4 && ((size - 4) % FLASH_SECTOR_SIZE == 0)) {
-    // Read the first 4 bytes
-    res = f_read(&file, buffer, 4, &bytesRead);
-    if (res != FR_OK || bytesRead != 4) {
-      DPRINTF("Error reading header of file: %d (bytes read: %u)\n", res,
-              bytesRead);
-      f_close(&file);
-      free(buffer);
-      return res;
-    }
-
-    // Check if the first 4 bytes are 0x00000000
-    if (buffer[0] == 0x00 && buffer[1] == 0x00 && buffer[2] == 0x00 &&
-        buffer[3] == 0x00) {
-      DPRINTF("Skipping first 4 bytes. Looks like a STEEM cartridge image.\n");
-    } else {
-      // Rollback the file pointer by 4 bytes.
-      res = f_lseek(&file, f_tell(&file) - 4);
-      if (res != FR_OK) {
-        DPRINTF("Error seeking back in file: %d\n", res);
-        f_close(&file);
-        free(buffer);
-        return res;
-      }
-    }
-  }
-  FSIZE_t romBytes = size - f_tell(&file);
-  if (romBytes > ROM_FILE_MAX_BYTES) {
-    DPRINTF("File too large: %u bytes after its header, the limit is %u\n",
-            (unsigned int)romBytes, (unsigned int)ROM_FILE_MAX_BYTES);
-    f_close(&file);
-    free(buffer);
-    return FR_INVALID_PARAMETER;
-  }
-
-  // Calculate the flash programming offset relative to XIP_BASE.
-  uint32_t offset = flashAddress - XIP_BASE;
-
-  // Read and program the file in FLASH_SECTOR_SIZE chunks.
-  while (1) {
-    // The ST keeps its answers and SELECT is seen between chunks.
+static void romFlashErase(uint32_t offset, size_t bytes) {
+  uint32_t startUs = time_us_32();
+  uint32_t ints = save_and_disable_interrupts();
+  flash_range_erase(offset, bytes);
+  restore_interrupts(ints);
+  romFlashTime(startUs);
+#if defined(_DEBUG) && (_DEBUG != 0)
+  for (uint32_t i = 0; i < romstoreTestEraseRepeats; i++) {
     emul_pollTick();
-
-    // Read a chunk of data from the file.
-    DPRINTF("Reading %u bytes from file at offset 0x%X\n", FLASH_SECTOR_SIZE,
-            offset);
-    res = f_read(&file, buffer, FLASH_SECTOR_SIZE, &bytesRead);
-    if (res != FR_OK) {
-      DPRINTF("Error reading file: %d\n", res);
-      f_close(&file);
-      free(buffer);
-      return res;
-    }
-    if (bytesRead == 0) {
-      // End of file reached.
-      break;
-    }
-
-    // Pad the data to FLASH_PAGE_SIZE alignment if needed.
-    size_t programSize = bytesRead;
-    if (programSize % FLASH_PAGE_SIZE != 0) {
-      size_t paddedSize =
-          ((programSize + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE) *
-          FLASH_PAGE_SIZE;
-      memset(buffer + programSize, FLASH_PAGE_SIZE, paddedSize - programSize);
-      programSize = paddedSize;
-    }
-
-    // Transform buffer's words from little endian to big endian inline
-    CHANGE_ENDIANESS_BLOCK16(buffer, programSize);
-
-    DPRINTF("Programming %u bytes at offset 0x%X\n", programSize, offset);
-    // Disable interrupts during flash programming.
-    uint32_t ints = save_and_disable_interrupts();
-    flash_range_erase(offset, programSize);
-    flash_range_program(offset, buffer, programSize);
+    ints = save_and_disable_interrupts();
+    flash_range_erase(offset, bytes);
     restore_interrupts(ints);
-
-    // Increment the flash offset by the actual bytes read.
-    offset += bytesRead;
   }
+#endif
+}
 
-  f_close(&file);
-  free(buffer);
-  DPRINTF("File %s stored to flash at address 0x%X\n", filename, flashAddress);
-  return FR_OK;
+static void romFlashProgram(uint32_t offset, const uint8_t *data,
+                            size_t bytes) {
+  uint32_t startUs = time_us_32();
+  uint32_t ints = save_and_disable_interrupts();
+  flash_range_program(offset, data, bytes);
+  restore_interrupts(ints);
+  romFlashTime(startUs);
+}
+
+static const uint8_t *romFlashRead(uint32_t offset) {
+  return (const uint8_t *)(XIP_BASE + offset);
+}
+
+// Between sectors: the ST is answered, SELECT is seen, and a mark goes on the
+// progress line for every 1/ROMSTORE_PROGRESS_MARKS of the write.
+#define ROMSTORE_PROGRESS_MARKS 32
+static void romFlashTick(uint32_t done, uint32_t total) {
+  emul_pollTick();
+  if (!romstoreHeaderShown) {
+    // Only once the first sector is erased: a refused file shows no write.
+    term_printString("\nWriting the ROM to flash:\n");
+    romstoreHeaderShown = true;
+  }
+  uint32_t marks = done * ROMSTORE_PROGRESS_MARKS / total;
+  if (marks > romstoreProgressMarks) {
+    while (romstoreProgressMarks < marks) {
+      term_printString("#");
+      romstoreProgressMarks++;
+    }
+    display_refresh();
+  }
+}
+
+static const romstore_flash_t romFlash = {romFlashErase, romFlashProgram,
+                                          romFlashRead, romFlashTick};
+
+static void romFlashBegin(void) {
+  romstoreWriteStartUs = time_us_32();
+  romstoreProgressMarks = 0;
+  romstoreHeaderShown = false;
+}
+
+static void romFlashEnd(void) {
+  romstoreLastWriteUs = time_us_32() - romstoreWriteStartUs;
+  DPRINTF("ROM write: %lu us, interrupts off at most %lu us\n",
+          (unsigned long)romstoreLastWriteUs,
+          (unsigned long)romstoreMaxIrqOffUs);
+}
+
+// n with a comma every three digits, for the user's messages.
+static void formatThousands(char *out, size_t outSize, uint32_t n) {
+  char digits[16];
+  int len = snprintf(digits, sizeof(digits), "%lu", (unsigned long)n);
+  size_t pos = 0;
+  for (int i = 0; i < len && pos + 1 < outSize; i++) {
+    if (i > 0 && (len - i) % 3 == 0 && pos + 2 < outSize) {
+      out[pos++] = ',';
+    }
+    out[pos++] = digits[i];
+  }
+  out[pos] = '\0';
+}
+
+// Why a launch failed, on the ST.
+static void romstoreReport(romstore_result_t result,
+                           const romstore_info_t *info) {
+  term_printString("\n");
+  if (result == ROMSTORE_TOO_LARGE) {
+    char size[16];
+    char limit[16];
+    char line[TERM_SCREEN_SIZE_X * 2];
+    formatThousands(size, sizeof(size), info->fileBytes);
+    formatThousands(limit, sizeof(limit), ROMSTORE_MAX_BYTES);
+    snprintf(line, sizeof(line), "ROM too large: %s bytes,\nthe limit is %s.",
+             size, limit);
+    term_printString(line);
+  } else {
+    term_printString(romstore_message(result));
+  }
+  term_printString("\n");
+}
+
+// The autorun's selection, saved after its ROM was written and read back.
+static const char *autorunRomName = NULL;
+static void autorunSelect(void) {
+  settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
+                      autorunRomName);
+  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
+                       ROM_MODE_DIRECT);
+  settings_save(aconfig_getContext(), true);
 }
 
 // Tries to autorun a ROM specified in /roms/.autorun (or custom ROM folder)
-static AutorunResult autorunIfRequested(void) {
+static AutorunResult autorunIfRequested(const char *folder) {
   char autorunPath[MAX_PATH_SIZE];
-  snprintf(autorunPath, sizeof(autorunPath), "%s/.autorun", romsFolder);
+  snprintf(autorunPath, sizeof(autorunPath), "%s/.autorun", folder);
   DPRINTF("Checking for autorun file: %s\n", autorunPath);
 
   FIL autorunFile;
@@ -397,7 +403,7 @@ static AutorunResult autorunIfRequested(void) {
 
   // Build full path to the ROM file
   char romPath[MAX_PATH_SIZE];
-  snprintf(romPath, sizeof(romPath), "%s/%s", romsFolder, filenameStart);
+  snprintf(romPath, sizeof(romPath), "%s/%s", folder, filenameStart);
 
   // Ensure the target file exists and is not a directory
   FILINFO fno;
@@ -408,22 +414,21 @@ static AutorunResult autorunIfRequested(void) {
     return AUTORUN_ERR_ROM_NOT_FOUND;  // ROM file not found or is a directory
   }
 
-  // Copy ROM into flash
-  unsigned int flashAddress = (unsigned int)&_rom_temp_start;
-  res = storeFileToFlash(romPath, flashAddress);
-  if (res != FR_OK) {
-    DPRINTF("Failed to store autorun ROM to flash: %d\n", res);
-    free(fileBuf);
+  // The ROM into flash, read back; only then the settings that boot into it.
+  autorunRomName = filenameStart;
+  romstore_info_t info;
+  romFlashBegin();
+  romstore_result_t stored =
+      romstore_launch(romPath, FLASH_ROM_LOAD_OFFSET, &romFlash, &info,
+                      autorunSelect);
+  romFlashEnd();
+  free(fileBuf);
+  autorunRomName = NULL;
+  if (stored != ROMSTORE_OK) {
+    DPRINTF("Failed to store autorun ROM to flash: %s\n",
+            romstore_message(stored));
     return AUTORUN_ERR_FLASH_STORE;  // Failed to store ROM in flash
   }
-
-  // Update settings to boot directly into this ROM
-  settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
-                      filenameStart);
-  free(fileBuf);
-  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
-                       ROM_MODE_DIRECT);
-  settings_save(aconfig_getContext(), true);
 
   // Blink the LED (if available) forever instead of resetting. The ST and
   // SELECT stay serviced: a short press restarts the RP, which boots into the
@@ -529,20 +534,53 @@ static void urlEncodePath(const char *src, char *dest, size_t destSize) {
   dest[idx] = '\0';
 }
 
-static void readRomsSdcard(const char *folder) {
+// The ROM's full name for EMULATED, from the name the browse list opens (the
+// long name, or the card's short 8.3 one): the long name when a settings
+// value holds it, the short one otherwise. Found by reading the folder:
+// f_stat on a short name returns only the short name.
+static void romFullName(const char *openName, char *out, size_t outSize) {
+  snprintf(out, outSize, "%s", openName);
+  DIR dir;
+  FILINFO fno;
+  if (f_opendir(&dir, romsFolder) != FR_OK) {
+    return;
+  }
+  while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != '\0') {
+    if (strcmp(fno.fname, openName) == 0 ||
+        strcmp(fno.altname, openName) == 0) {
+      if (strlen(fno.fname) < outSize) {
+        snprintf(out, outSize, "%s", fno.fname);
+      }
+      break;
+    }
+  }
+  f_closedir(&dir);
+}
+
+// A name on one line: cut to width with "..." when longer.
+static void termPrintCut(const char *text, int width) {
+  if (width < 4 || (int)strlen(text) <= width) {
+    term_printString(text);
+    return;
+  }
+  char cut[TERM_SCREEN_SIZE_X + 1];
+  snprintf(cut, sizeof(cut), "%.*s...", width - 3, text);
+  term_printString(cut);
+}
+
+static FRESULT readRomsSdcard(const char *folder) {
   FRESULT res;
   DIR dir;
   FILINFO fno;
 
-  // Open the directory.
+  // The list empties first: a folder that cannot be read leaves no stale one.
+  romsCount = 0;
+  maxRomPages = 0;
   res = f_opendir(&dir, folder);
   if (res != FR_OK) {
     DPRINTF("Error opening directory %s: %d\n", folder, res);
-    return;
+    return res;
   }
-
-  // Reset the ROM count.
-  romsCount = 0;
 
   // Read each directory entry.
   for (;;) {
@@ -570,8 +608,14 @@ static void readRomsSdcard(const char *folder) {
 
     // Store the filename into the roms[] array if there is space.
     if (romsCount < MAX_ROMS) {
-      // Copy the filename from FatFS entry. fno.fname is a char array.
-      strncpy(roms[romsCount].filename, fno.fname, MAX_FILENAME_LENGTH - 1);
+      // The name to open: the long name when the field holds it whole, the
+      // card's short 8.3 name otherwise, which opens the same file. The name
+      // on screen is the long one, cut to the field.
+      const char *openName = (strlen(fno.fname) < MAX_FILENAME_LENGTH ||
+                              fno.altname[0] == '\0')
+                                 ? fno.fname
+                                 : fno.altname;
+      strncpy(roms[romsCount].filename, openName, MAX_FILENAME_LENGTH - 1);
       roms[romsCount].filename[MAX_FILENAME_LENGTH - 1] = '\0';
       strncpy(roms[romsCount].name, fno.fname, MAX_FILENAME_LENGTH - 1);
       roms[romsCount].name[MAX_FILENAME_LENGTH - 1] = '\0';
@@ -589,6 +633,7 @@ static void readRomsSdcard(const char *folder) {
 
   DPRINTF("Found %d ROMs on the SD card.\n", romsCount);
   maxRomPages = (romsCount + MAX_ROMS_PER_PAGE - 1) / MAX_ROMS_PER_PAGE;
+  return FR_OK;
 }
 
 static void readRomsCsv(const char *csvFilepath) {
@@ -704,6 +749,10 @@ static void displayRomsPage(const ROM roms[], int romsCount, int pageSize,
     pageSize = 0;
   }
 
+  if (roms == NULL || romsCount <= 0) {
+    term_printString("No ROMs to show.\n");
+    return;
+  }
   int startIndex = pageNumber * pageSize;
   if (startIndex >= romsCount) {
     startIndex = romsCount - 1;
@@ -791,7 +840,8 @@ static void menu(void) {
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED);
   if ((romSelected != NULL) && (strlen(romSelected->value) > 0)) {
     term_printString("[L] Launch ROM: ");
-    term_printString(romSelected->value);
+    termPrintCut(romSelected->value,
+                 TERM_SCREEN_SIZE_X - (int)strlen("[L] Launch ROM: ") - 1);
     term_printString("\n");
   }
   term_printString("\n");
@@ -861,10 +911,14 @@ void cmdCard(const char *arg) {
   if (!romsAvailable()) {
     return;
   }
-  readRomsSdcard(romsFolder);
+  FRESULT listed = readRomsSdcard(romsFolder);
   menuState.menuLevel = TERM_ROMS_MENU_BROWSE_SD;
 
-  if (romsCount == 0) {
+  if (listed != FR_OK) {
+    term_printString("The folder '");
+    term_printString(romsFolder);
+    term_printString("' could not be read\nfrom the SD card. Check FOLDER in\n[S]ettings.\n\n");
+  } else if (romsCount == 0) {
     term_printString("No ROMs found in the SD card.\n");
     term_printString("Download ROMs from internet,\n");
     term_printString("or copy them to folder '");
@@ -892,9 +946,41 @@ void cmdNetwork(const char *arg) {
   navigatePages(currentRomPage);
 }
 
+// The selection, saved only once the ROM is in ROM_TEMP and read back.
+static void cmdLaunchSelect(void) {
+  settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
+                       delayMode ? ROM_MODE_DELAY : ROM_MODE_DIRECT);
+  settings_save(aconfig_getContext(), true);
+}
+
 void cmdLaunch(const char *arg) {
+  SettingsConfigEntry *romFile =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED);
+  if (romFile == NULL || romFile->value[0] == '\0') {
+    // The menu hides [L] then, but the key still arrives.
+    romstoreReport(ROMSTORE_NOT_SELECTED, NULL);
+    display_refresh();
+    return;
+  }
+  char filename[MAX_PATH_SIZE];
+  snprintf(filename, sizeof(filename), "%s/%s", romsFolder, romFile->value);
+  DPRINTF("Loading ROM file into FLASH: %s\n", filename);
+  romstore_info_t info;
+  romFlashBegin();
+  romstore_result_t result =
+      romstore_launch(filename, FLASH_ROM_LOAD_OFFSET, &romFlash, &info,
+                      cmdLaunchSelect);
+  romFlashEnd();
+  if (result != ROMSTORE_OK) {
+    DPRINTF("Launch failed: %s\n", romstore_message(result));
+    romstoreReport(result, &info);
+    term_printString("Press [M] for the menu.\n");
+    display_refresh();
+    return;
+  }
+
   menuState.menuLevel = TERM_ROMS_MENU_LAUNCH;
-  term_printString("The ROM will boot shortly...\n\n");
+  term_printString("\n\nThe ROM will boot shortly...\n\n");
   if (delayMode) {
     term_printString(
         "ROM delay/ripper mode enabled. You must press SELECT to activate the "
@@ -902,30 +988,7 @@ void cmdLaunch(const char *arg) {
   }
   term_printString("To return to this menu, press SELECT\n");
   term_printString("If ROM doesn't boot, reset the computer\n");
-  SettingsConfigEntry *romFile =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED);
-  if (romFile != NULL) {
-    // Load the ROM file from the SD card
-    char filename[MAX_PATH_SIZE];
-    snprintf(filename, MAX_PATH_SIZE, "%s/%s", romsFolder, romFile->value);
-    unsigned int flashAddress = (unsigned int)&_rom_temp_start;
-    DPRINTF("Loading ROM file into FLASH: %s at 0x%X\n", filename,
-            flashAddress);
-    FRESULT fresult = storeFileToFlash(filename, flashAddress);
-    if (fresult != FR_OK) {
-      DPRINTF("Error loading ROM file into FLASH: %d\n", fresult);
-    } else {
-      // Now we can set the ROM emulation mode here
-      // Set the ROM emulation mode to 0 (ROM no delay)
-      settings_put_integer(aconfig_getContext(), ACONFIG_PARAM_MODE,
-                           delayMode ? ROM_MODE_DELAY : ROM_MODE_DIRECT);
-      settings_save(aconfig_getContext(), true);
-
-      keepActive = false;  // Exit the active loop
-    }
-  } else {
-    DPRINTF("No ROM file selected.\n");
-  }
+  keepActive = false;  // Exit the active loop
 }
 
 void cmdUnknown(const char *arg) {
@@ -937,13 +1000,16 @@ void cmdUnknown(const char *arg) {
       // Convert to integer the argument
       int romNumber = atoi(arg);
       if (romNumber > 0 && romNumber <= romsCount) {
+        char selected[SETTINGS_MAX_VALUE_LENGTH];
+        romFullName(roms[romNumber - 1].filename, selected, sizeof(selected));
         term_printString("Selected ROM: ");
-        term_printString(roms[romNumber - 1].filename);
+        term_printString(selected);
         term_printString("\n");
-        // Save the selected ROM to the settings
+        // The pick is held in the settings in RAM and reaches flash with
+        // MODE, after the launch has written and read back the ROM: a write
+        // cut short comes back to the previous selection.
         settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
-                            roms[romNumber - 1].filename);
-        settings_save(aconfig_getContext(), true);
+                            selected);
         menu();
       } else {
         term_printString(
@@ -1358,7 +1424,8 @@ void emul_start() {
     }
   } else {
     DPRINTF("SD card found & initialized\n");
-    AutorunResult autorunResult = autorunIfRequested();
+    // The configured folder: romsFolder is set later, by init().
+    AutorunResult autorunResult = autorunIfRequested(folderName);
     if (autorunResult != AUTORUN_OK) {
       DPRINTF("Autorun error: %i. Continue.\n", autorunResult);
     }

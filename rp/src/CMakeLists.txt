@@ -134,6 +134,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         network.c
         reset.c
         romemul.c
+        romstore.c
         sdcard.c
         select.c
         term.c

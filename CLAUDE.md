@@ -69,7 +69,7 @@ App settings keys live in `aconfig.h` (`FOLDER`, `EMULATED`, `MODE`, `HTTP_CATAL
 1. **ROM emulation** — `MODE` = `ROM_MODE_DIRECT` (0) or `ROM_MODE_DELAY` (1): the ROM staged in `ROM_TEMP` flash is DMA-copied into `ROM_IN_RAM` and PIO+DMA emulation starts. Delay/Ripper mode first waits for a SELECT press before starting emulation. While emulating, a SELECT press writes `MODE=ROM_MODE_SETUP` and resets the RP; a long press resets and erases flash (`select.c`).
 2. **Setup/terminal** — `MODE` = `ROM_MODE_SETUP` (255): the embedded target firmware is served as the cartridge instead, and a command-driven terminal UI runs (`term.c`, command table in `emul.c`). Boot sequence: SD init → autorun check → WiFi STA connect (Pico W) → download the ROM catalog CSV (`download.c` + `httpc/`) → menu loop. Features: browse ROMs on microSD (`/roms` by default), download ROMs to SD, settings editing, toggle Delay mode, launch, exit to desktop, return to Booster.
 
-**Launching a ROM** (`storeFileToFlash` in `emul.c`) copies the file from SD into `ROM_TEMP` flash with every 16-bit word byte-swapped (the Atari is big-endian), skipping a 4-byte zero header on STEEM `.stc` images. Accepted extensions: `img`, `rom`, `stc`, `bin`. **Autorun:** if `<romsFolder>/.autorun` exists and names a ROM, setup mode flashes it, sets `MODE=ROM_MODE_DIRECT`, and blinks the LED forever (no reset) — used for diagnostic cartridges on machines with broken keyboards or screens.
+**Launching a ROM** (`romstore.c`, called by `cmdLaunch` and the autorun in `emul.c`) checks the size before anything is erased (at most 128 KB of ROM, past a 4-byte zero header on STEEM `.stc` images), erases all of `ROM_TEMP`, programs the ROM a sector at a time with every 16-bit word byte-swapped (the Atari is big-endian), reads each sector back, and only then lets the caller save `EMULATED` and `MODE`: a write that fails or is cut short leaves the device in setup mode with its previous selection. The ST and SELECT are serviced between sectors; interrupts are off for one sector's erase or program (about 39 ms at most). `[B]rowse` keeps its pick in the settings in RAM until a launch saves it; long file names are opened by their 8.3 alias when the list's field can't hold them. Accepted extensions: `img`, `rom`, `stc`, `bin`. **Autorun:** if `<FOLDER>/.autorun` exists and names a ROM, setup mode writes it the same way, sets `MODE=ROM_MODE_DIRECT`, and blinks the LED, answering the ST and SELECT (a press restarts into the ROM) — used for diagnostic cartridges on machines with broken keyboards or screens.
 
 ### ROM bus emulation core (`romemul.c` + `romemul.pio`)
 
@@ -100,7 +100,7 @@ The template's `src/main.s` and `src/inc/` (senders with retries, token and seed
 
 ## Divergences from the template
 
-Setup mode is the template's at `6935f53`; every other file under `rp/src` and `target/atarist` is byte-identical to it. These differ:
+Setup mode is the template's at `6935f53`; every other file under `rp/src` and `target/atarist` is byte-identical to it, apart from this app's own modules (`romstore.c`) and their line in `rp/src/CMakeLists.txt`. These differ:
 
 - **`emul.c`, `emul.h`:** this app's menu (`[B]rowse`, `[D]ownload`, `[S]ettings`, `[R]ipper`, `[L]aunch`, `[E]xit`, `[X]` Booster) and ROM mode on the template's skeleton. No `[F]irmware`: a debug build has a hidden `f` command that starts `userfw` for `tools/dev/st_harness.py`.
 - **`aconfig.*`:** this app's keys (`EMULATED`, `FOLDER`, `HTTP_CATALOG`, `HTTPS_CATALOG`, `MODE`), unchanged from v2.1.2.
