@@ -95,7 +95,8 @@ make -C tests/host test                                   # host tests, ASan and
   writes (the write runs into Booster's flash).
 - `testserver.py` serves a folder (default `tools/dev/builds/testserver`) and generated failure
   routes: `fail-404*`, `fail-500*`, `fail-html200*`, `fail-truncated*`, `fail-stall*`,
-  `fail-loop*`, `*slow-*.img` (a 64 KB download that takes 16 s and completes),
+  `fail-loop*`, `*slow-*.img` (a 64 KB download that takes 16 s and completes; `*slow-long-*.img`
+  160 s, long enough to pull the SD card by hand in the middle of it),
   `synthetic-NNNN.img` for paging tests, `synthetic-N/roms.csv` (a catalog of N of them, up to
   20,000, for the page index), and two catalogs apart: `failures/roms.csv` (every failure and
   redirect route with the size it really serves, since the device deletes a download that is not
@@ -117,6 +118,9 @@ make -C tests/host test                                   # host tests, ASan and
   back under it, and its last step reboots the ST into the menu through the agent: a run leaves
   the ST where it found it. With the self-check, a `verdict` step reads its report from the ROM3 capture a
   debug build runs in ROM mode (`swd.py ring`: `0x7f01` pass, `0x7f02` fail).
+- A card pulled during a launch: on a debug build, set `romstoreTestSectorDelayMs` (a RAM word, by
+  symbol, with a GDB `set var`) to 3000 before `[L]`: each sector of the write waits 3 s answering
+  the ST, the reads of the file start about 96 s in (after the erase phase), and a hand has time.
 - The power-cut test of a ROM write: a 128 KB write takes about 1.45 s, faster than a hand on a
   power switch. On a debug build, set `romstoreTestEraseRepeats` (a RAM word, by symbol) to 10 over
   SWD just before typing `[L]`: each sector is erased 11 times and the erase phase lasts about 14 s,
@@ -294,6 +298,11 @@ by name for the cursor keys (`swd.py key down`: ASCII 0 and the ST's scan code).
 - `heap_hold KB`: hold KB more kilobytes of heap, on top of what is already held (`heap_hold 0`
   releases everything). Result 0 when the allocation is refused, so repeated calls walk the heap
   down to a known remainder. Watch it with `swd.py heap`.
+- `sd 0|1`: 0 makes the SD card look pulled (the presence check fails at once, and nothing mounts),
+  1 puts it back (the next poll mounts it, within 2 s): the path a real pull and reinsertion take.
+  A pull in the middle of an operation needs GDB: break in `disk_read` or `disk_write`, return
+  `RES_ERROR` (1) and set `sdcardTestRemoved`; presence checks read sector 0, so a condition on the
+  sector argument (`$r2 != 0`) leaves them alone.
 - `health N`: provoke a failure from the main loop 250 ms later (`health.h`'s `health_test_t`): 1
   `panic()`, 2 a HardFault, 3 a hang (the watchdog), 4 a 500 ms stall (no reboot), 5 a stack
   overflow into the guard. Each reboots and names itself in `swd.py crash`, on the console and on
