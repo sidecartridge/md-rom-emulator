@@ -13,8 +13,9 @@ does not), reads the terminal and the ST's screen, and checks what happened:
              skipped when nothing on the ST is listening
   browse     [B]rowse lists the card; with the cursor keys a page forward
              and back
-  select     the marker moved onto the ROM given with --rom, its details
-  launch     RETURN on its details: the RP restarts in ROM mode and the window holds
+  select     the selection moved onto the ROM given with --rom, its details,
+             and RETURN there selects it
+  launch     [L]: the RP restarts in ROM mode and the window holds
              exactly that file (swd.py window, against --images/<rom>)
   verdict    the self-check's verdict from the ROM3 capture (debug builds;
              only for selfcheck.img)
@@ -50,12 +51,15 @@ import io
 import json
 import os
 import re
+import struct
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import swd  # noqa: E402  (same folder)
+
+PAGE_LINES = 16  # navlist.h's NAVLIST_PAGE_LINES
 
 TIMERAWL = 0x40054028       # the RP2040's microsecond timer, low word
 
@@ -101,15 +105,23 @@ class Session:
         swd.send_protocol(self.elf, command_id, [param & 0xFFFF, param >> 16])
 
     def mark(self, rom: str) -> bool:
-        """Moves the list's marker onto rom, page by page."""
+        """Moves the list's selection onto rom, page by page. The selection
+        is an inverted line, not a character: it and the page's first row
+        are read over SWD (emul.c's listNav and listFirstRow)."""
+        sym = swd.elf_symbols(self.elf, "listNav", "listFirstRow")
         while True:
-            lines = [l for l in self.text().splitlines() if l[:2] in ("> ", "  ")]
-            names = [l[2:].strip() for l in lines]
-            marked = next((i for i, l in enumerate(lines) if l.startswith(">")), 0)
+            count, selected = struct.unpack(
+                "<II", swd.read_memory(sym["listNav"][0], 8))
+            first_row = swd.read_memory(sym["listFirstRow"][0], 1)[0]
+            page_first = selected - selected % PAGE_LINES
+            lines = self.text().splitlines()
+            names = [lines[first_row + i][2:].strip()
+                     if first_row + i < len(lines) else ""
+                     for i in range(min(PAGE_LINES, count - page_first))]
             target = next((i for i, n in enumerate(names)
                            if n == rom or (len(n) >= 20 and rom.startswith(n))), None)
             if target is not None:
-                for _ in range(target - marked):
+                for _ in range(target - (selected - page_first)):
                     self.press("down")
                 time.sleep(0.5)
                 return True
@@ -119,9 +131,10 @@ class Session:
             self.press("right")
             self.wait_for(f"Page {int(page.group(1)) + 1}/", 10)
 
-    def typeline(self, line: str) -> None:
-        for char in line + "\r":
-            self.key(char)
+    def menu_key(self, char: str) -> None:
+        """The menu takes single keys, no RETURN (one would reach an open
+        list as RETURN)."""
+        self.key(char)
 
     def wait_for(self, needle: str, timeout: float = 30) -> bool:
         deadline = time.monotonic() + timeout
@@ -224,7 +237,7 @@ class Session:
         a = self.args
         if a.park_core1:
             self.park_core1()
-        self.typeline("m")
+        self.menu_key("m")
         if not self.step("menu", self.wait_for("Select an option")):
             return self.finish()
 
@@ -239,7 +252,7 @@ class Session:
             self.skip("st-reset", "nothing on the ST reads the cartridge: it "
                       "needs its reset button once")
 
-        self.typeline("b")
+        self.menu_key("b")
         listed = self.wait_for("ROMs on the SD card") and self.wait_for("Page 1/")
         self.step("browse", listed)
         if not listed:
@@ -256,9 +269,11 @@ class Session:
             self.step("select", False, f"{a.rom} is not on the card")
             return self.finish()
         self.press("return")
-        self.step("select", self.wait_for(f"ROM: {a.rom}"))
-        self.reset_expected = True
+        details = self.wait_for("Folder") and a.rom in self.text()
         self.press("return")
+        self.step("select", details and self.wait_for(f"Selected: {a.rom}"))
+        self.reset_expected = True
+        self.menu_key("l")
         time.sleep(a.boot_seconds)
         rom_path = os.path.join(a.images, a.rom)
         verdict = swd.cmd_window(argparse.Namespace(
@@ -280,7 +295,7 @@ class Session:
                                                 a.boot_seconds + 30))
 
         if a.catalog:
-            self.typeline("d")
+            self.menu_key("d")
             self.step("catalog", self.wait_for("ROM catalog", 60)
                       and self.wait_for("Page 1/", 10))
             self.press("esc")

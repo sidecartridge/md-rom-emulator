@@ -377,6 +377,25 @@ static void vt52ProcessSequence(const char *seq, size_t length) {
   }
 }
 
+void term_printAt(uint8_t row, uint8_t col, const char *text) {
+  if (row >= TERM_SCREEN_SIZE_Y) {
+    return;
+  }
+  for (; *text != '\0' && col < TERM_SCREEN_SIZE_X; text++, col++) {
+    screen[row * TERM_SCREEN_SIZE_X + col] = *text;
+    display_termChar(col, row, *text);
+  }
+}
+
+void term_recordAt(uint8_t row, uint8_t col, const char *text) {
+  if (row >= TERM_SCREEN_SIZE_Y) {
+    return;
+  }
+  for (; *text != '\0' && col < TERM_SCREEN_SIZE_X; text++, col++) {
+    screen[row * TERM_SCREEN_SIZE_X + col] = *text;
+  }
+}
+
 void term_printString(const char *str) {
   enum { STATE_NORMAL, STATE_ESC } state = STATE_NORMAL;
   char escBuffer[TERM_ESC_BUFFLINE_SIZE];
@@ -432,7 +451,33 @@ void term_printString(const char *str) {
 
 // Called whenever a character is entered by the user
 // This is the single point of entry for user input
+static TermCommandLevel commandLevel = TERM_COMMAND_LEVEL_SINGLE_KEY;
+
+void term_setCommandLevel(TermCommandLevel level) {
+  commandLevel = level;
+  memset(inputBuffer, 0, TERM_INPUT_BUFFER_SIZE);
+  inputLength = 0;
+}
+
+// A key is a command: the one whose name is that letter, in either case.
+static void termSingleKey(char chr) {
+  chr = (char)tolower((unsigned char)chr);
+  for (size_t i = 0; i < numCommands; i++) {
+    if (commands[i].command[0] == chr && commands[i].command[1] == '\0') {
+      commands[i].handler("");
+      break;
+    }
+  }
+  memset(inputBuffer, 0, TERM_INPUT_BUFFER_SIZE);
+  inputLength = 0;
+  display_termRefresh();
+}
+
 static void termInputChar(char chr) {
+  if (commandLevel == TERM_COMMAND_LEVEL_SINGLE_KEY) {
+    termSingleKey(chr);
+    return;
+  }
   // Check for backspace
   if (chr == '\b') {
     display_termChar(prevCursorX, prevCursorY, ' ');
@@ -665,10 +710,18 @@ void __not_in_flash_func(term_loop)() {
     termBusy = true;
     switch (snapshot->command_id) {
       case APP_TERMINAL_START: {
+        // The ST's ESC key (main.s sends it as this command). A screen that
+        // takes the keys one at a time (a list) gets it as ESC: otherwise the
+        // menu was drawn over the list while the list kept the keys.
+        if (termKeyHandler != NULL) {
+          termKeyHandler(TERM_KEY_ESC);
+          break;
+        }
         display_termStart(DISPLAY_TILES_WIDTH, DISPLAY_TILES_HEIGHT);
         term_clearScreen();
-        term_printString("Type 'help' for available commands.\n");
-        termInputChar('\n');
+        // The menu, as its key would draw it
+        term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+        termInputChar('m');
         SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_TERM);
         DPRINTF("Send command to display: DISPLAY_COMMAND_TERM\n");
       } break;

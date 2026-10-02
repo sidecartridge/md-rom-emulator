@@ -11,6 +11,7 @@
 
 #include <stddef.h>
 #include <stdio.h>
+
 #include "pico.h"
 #include "tprotocol.h"
 
@@ -114,6 +115,20 @@ void term_init(void);
 void term_printString(const char *str);
 
 /**
+ * @brief Writes text at a row and column without moving the cursor: the
+ * screen buffer and the glyphs, cut at the row's end. For screens drawn in
+ * place: a cursor move blanks the cell the cursor leaves.
+ */
+void term_printAt(uint8_t row, uint8_t col, const char *text);
+
+/**
+ * @brief Writes text into the screen buffer only, at a row and column, cut
+ * at the row's end: for words the caller draws itself, in another font, so
+ * the buffer still holds what the screen says.
+ */
+void term_recordAt(uint8_t row, uint8_t col, const char *text);
+
+/**
  * @brief Clear the terminal display area
  *
  * Clear the terminal display area. Resets terminal state and removes all
@@ -144,6 +159,15 @@ void term_clearInputBuffer(void);
  */
 typedef void (*TermKeyHandler)(char key);
 void term_setKeyHandler(TermKeyHandler handler);
+
+// How keys reach the commands: a key is a command, the one named by that
+// letter, with no echo and no RETURN (the menu); or a line, echoed, run on
+// RETURN (the settings).
+typedef enum {
+  TERM_COMMAND_LEVEL_SINGLE_KEY = 0,
+  TERM_COMMAND_LEVEL_COMMAND_INPUT = 1,
+} TermCommandLevel;
+void term_setCommandLevel(TermCommandLevel level);
 
 /**
  * @brief While busy, keystrokes are dropped instead of running commands, as

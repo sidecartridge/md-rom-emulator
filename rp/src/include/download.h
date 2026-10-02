@@ -209,4 +209,10 @@ download_err_t download_getError(void);
  */
 int download_getHttpStatus(void);
 
+/**
+ * @brief The bytes of the body written to the card so far, for the request
+ * in flight (a redirect starts again from 0).
+ */
+uint32_t download_getBytesWritten(void);
+
 #endif  // DOWNLOAD_H
