@@ -43,6 +43,7 @@
 #include "select.h"
 #include "target_firmware.h"  // Include the target firmware binary
 #include "term.h"
+#include "ui.h"
 
 // How long a sentinel command the ST must act on before this side moves on
 // is held. The ST reads the sentinel once per pass of its menu loop (measured
@@ -83,6 +84,41 @@ static void cmdFirmware(const char *arg);
 static void netTestWifi(bool connect);
 #endif
 
+// The menu as menu() drew it, only its prompt's row changed since: its status
+// is redrawn in place. Anything printed below the prompt ends that.
+static bool menuIntact = false;
+
+// The terminal's own commands print below the prompt.
+static void cmdSettings(const char *arg);
+static void cmdPrint(const char *arg) {
+  menuIntact = false;
+  term_cmdPrint(arg);
+}
+static void cmdSave(const char *arg) {
+  menuIntact = false;
+  term_cmdSave(arg);
+}
+static void cmdErase(const char *arg) {
+  menuIntact = false;
+  term_cmdErase(arg);
+}
+static void cmdGet(const char *arg) {
+  menuIntact = false;
+  term_cmdGet(arg);
+}
+static void cmdPutInt(const char *arg) {
+  menuIntact = false;
+  term_cmdPutInt(arg);
+}
+static void cmdPutBool(const char *arg) {
+  menuIntact = false;
+  term_cmdPutBool(arg);
+}
+static void cmdPutString(const char *arg) {
+  menuIntact = false;
+  term_cmdPutString(arg);
+}
+
 // Command table
 static const Command commands[] = {
     {"m", cmdMenu},
@@ -94,15 +130,15 @@ static const Command commands[] = {
     {"e", cmdExit},
     {"x", cmdBooster},
     {"?", cmdHelp},
-    {"s", term_cmdSettings},
-    {"settings", term_cmdSettings},
-    {"print", term_cmdPrint},
-    {"save", term_cmdSave},
-    {"erase", term_cmdErase},
-    {"get", term_cmdGet},
-    {"put_int", term_cmdPutInt},
-    {"put_bool", term_cmdPutBool},
-    {"put_str", term_cmdPutString},
+    {"s", cmdSettings},
+    {"settings", cmdSettings},
+    {"print", cmdPrint},
+    {"save", cmdSave},
+    {"erase", cmdErase},
+    {"get", cmdGet},
+    {"put_int", cmdPutInt},
+    {"put_bool", cmdPutBool},
+    {"put_str", cmdPutString},
 #if defined(_DEBUG) && (_DEBUG != 0)
     // Debug builds only, and not in the menu: hands the ST to userfw.s, where
     // tools/dev/st_harness.py puts its command-path tests (sttest.s).
@@ -323,7 +359,6 @@ volatile uint32_t romstoreMaxIrqOffUs = 0;
 volatile uint32_t romstoreLastWriteUs = 0;
 static uint32_t romstoreWriteStartUs = 0;
 static uint32_t romstoreProgressMarks = 0;
-static bool romstoreHeaderShown = false;
 
 static void romFlashTime(uint32_t startUs) {
   uint32_t took = time_us_32() - startUs;
@@ -368,15 +403,50 @@ static const uint8_t *romFlashRead(uint32_t offset) {
   return (const uint8_t *)(XIP_BASE + offset);
 }
 
-// Between sectors: the ST is answered, SELECT is seen, and a mark goes on the
-// progress line for every 1/ROMSTORE_PROGRESS_MARKS of the write.
-#define ROMSTORE_PROGRESS_MARKS 32
+// Between sectors: the ST is answered, SELECT is seen, and the launch
+// screen's bar moves on every 1/ROMSTORE_PROGRESS_MARKS of the write.
+#define ROMSTORE_PROGRESS_MARKS 64
 #if defined(_DEBUG) && (_DEBUG != 0)
 // Debug builds only, set over SWD by symbol: each sector of a ROM write waits
 // this long, answering the ST, so the write lasts long enough for a hand to
 // pull the SD card in the middle of it. Any reset clears it.
 volatile uint32_t romstoreTestSectorDelayMs = 0;
 #endif
+
+// The launch screen: a box with the ROM, the mode and the write's progress
+#define LAUNCH_ROW_BOX 2
+#define LAUNCH_ROW_ROM 3
+#define LAUNCH_ROW_MODE 4
+#define LAUNCH_ROW_BAR 6
+#define LAUNCH_ROW_BOX_END 7
+#define LAUNCH_ROW_NOTICE 9
+#define LAUNCH_ROW_TEXT 9
+#define LAUNCH_COL 2
+#define LAUNCH_COL_VALUE 12
+#define LAUNCH_VALUE_WIDTH (TERM_SCREEN_SIZE_X - LAUNCH_COL_VALUE - 2)
+#define LAUNCH_BAR_COLS (TERM_SCREEN_SIZE_X - (2 * LAUNCH_COL))
+#define PERCENT 100U
+
+static bool launchScreenShown = false;
+
+static void showTitle(void);
+
+static void launchScreen(const char *heading, const char *name,
+                         const char *mode) {
+  showTitle();
+  term_printAt(LAUNCH_ROW_BOX, LAUNCH_COL, heading);
+  term_printAt(LAUNCH_ROW_ROM, LAUNCH_COL, "ROM");
+  ui_printField(LAUNCH_ROW_ROM, LAUNCH_COL_VALUE, LAUNCH_VALUE_WIDTH, name);
+  term_printAt(LAUNCH_ROW_MODE, LAUNCH_COL, "Mode");
+  ui_printField(LAUNCH_ROW_MODE, LAUNCH_COL_VALUE, LAUNCH_VALUE_WIDTH, mode);
+  ui_parkCursor();
+  ui_group(LAUNCH_ROW_BOX, LAUNCH_ROW_BOX_END, LAUNCH_COL,
+           (uint8_t)strlen(heading), UI_GLYPH_CARTRIDGE);
+  ui_bar(LAUNCH_ROW_BAR, LAUNCH_COL, LAUNCH_BAR_COLS, 0, 1,
+         "Reading the ROM from the SD card");
+  launchScreenShown = true;
+  display_refresh();
+}
 
 static void romFlashTick(uint32_t done, uint32_t total) {
   emul_pollTick();
@@ -388,17 +458,13 @@ static void romFlashTick(uint32_t done, uint32_t total) {
     }
   }
 #endif
-  if (!romstoreHeaderShown) {
-    // Only once the first sector is erased: a refused file shows no write.
-    term_printString("\nWriting the ROM to flash:\n");
-    romstoreHeaderShown = true;
-  }
   uint32_t marks = done * ROMSTORE_PROGRESS_MARKS / total;
-  if (marks > romstoreProgressMarks) {
-    while (romstoreProgressMarks < marks) {
-      term_printString("#");
-      romstoreProgressMarks++;
-    }
+  if (launchScreenShown && marks > romstoreProgressMarks) {
+    romstoreProgressMarks = marks;
+    char text[TERM_SCREEN_SIZE_X];
+    snprintf(text, sizeof(text), "Writing to flash   %lu%%",
+             (unsigned long)(done * PERCENT / total));
+    ui_bar(LAUNCH_ROW_BAR, LAUNCH_COL, LAUNCH_BAR_COLS, done, total, text);
     display_refresh();
   }
 }
@@ -410,7 +476,6 @@ static void romFlashBegin(void) {
   health_setPhase(HEALTH_PHASE_FLASH_WRITE);
   romstoreWriteStartUs = time_us_32();
   romstoreProgressMarks = 0;
-  romstoreHeaderShown = false;
 }
 
 static void romFlashEnd(void) {
@@ -434,25 +499,21 @@ static void formatThousands(char *out, size_t outSize, uint32_t n) {
   out[pos] = '\0';
 }
 
-// Why a launch failed, on the ST.
-static void romstoreReport(romstore_result_t result,
-                           const romstore_info_t *info) {
-  term_printString("\n");
-  if (result == ROMSTORE_TOO_LARGE) {
+// Why a launch failed, in words for the ST.
+static void romstoreDescribe(romstore_result_t result,
+                             const romstore_info_t *info, char *out,
+                             size_t outSize) {
+  if (result == ROMSTORE_TOO_LARGE && info != NULL) {
     char size[NUMBER_TEXT_BYTES];
     char limit[NUMBER_TEXT_BYTES];
-    char line[TERM_SCREEN_SIZE_X * 2];
     formatThousands(size, sizeof(size), info->fileBytes);
     formatThousands(limit, sizeof(limit), ROMSTORE_MAX_BYTES);
-    snprintf(line, sizeof(line), "ROM too large: %s bytes,\nthe limit is %s.",
-             size, limit);
-    term_printString(line);
+    snprintf(out, outSize, "ROM too large: %s bytes, the limit is %s.", size,
+             limit);
   } else {
-    term_printString(romstore_message(result));
+    snprintf(out, outSize, "%s", romstore_message(result));
   }
-  term_printString("\n");
 }
-
 // The autorun's selection, saved after its ROM was written and read back.
 static const char *autorunRomName = NULL;
 static void autorunSelect(void) {
@@ -530,10 +591,12 @@ static AutorunResult autorunIfRequested(const char *folder) {
   autorunRomName = filenameStart;
   romstore_info_t info;
   term_setBusy(true);
+  launchScreen("Autorun", filenameStart, "direct");
   romFlashBegin();
   romstore_result_t stored = romstore_launch(romPath, FLASH_ROM_LOAD_OFFSET,
                                              &romFlash, &info, autorunSelect);
   romFlashEnd();
+  launchScreenShown = false;
   term_setBusy(false);
   free(fileBuf);
   autorunRomName = NULL;
@@ -681,110 +744,316 @@ static FRESULT readRomsSdcard(const char *folder) {
   return FR_OK;
 }
 
-static void showTitle() {
+// The title bar's icons: the SD card's, and Wi-Fi's (joining shows the
+// reload arrows)
+static uint8_t titleSdGlyph(void) {
+  return sdcard_isMounted() ? UI_GLYPH_DRIVE : UI_GLYPH_NONE;
+}
+
+static uint8_t titleWifiGlyph(void) {
+  if (netState == NET_UP) {
+    return UI_GLYPH_WIFI;
+  }
+  return (netState == NET_CONNECTING) ? UI_GLYPH_RELOAD : UI_GLYPH_NONE;
+}
+
+// The strip under every screen without key hints: the version is in the
+// title bar.
+#define PRODUCT_STRIP \
+  "SidecarTridge Multi-device   -   (C)2023-2026 GOODDATA LABS SL"
+
+// Clears the screen and draws the title bar and the product strip (a screen
+// with key hints draws its own); the cursor is left on row 1. The menu is no
+// longer on the screen until menu() has drawn it again.
+static void showTitle(void) {
+  menuIntact = false;
   term_printString(
       "\x1B"
       "E"
-      "ROM Emulator - " RELEASE_VERSION "\n");
+      " ROM Emulator " RELEASE_VERSION "\n");
+  ui_titleBar(titleSdGlyph(), titleWifiGlyph());
+  ui_strip(PRODUCT_STRIP, true);
+}
+
+static const char *catalogUrl(void);
+static void listClose(void);
+
+// --- Notices -----------------------------------------------------------------
+// A command's outcome or a refusal, set apart the same way on every screen:
+// two inverted rows with the warning icon, in the small font.
+#define NOTICE_ROWS 2
+#define NOTICE_TEXT_BYTES (NOTICE_ROWS * TERM_SCREEN_SIZE_X)
+
+// text on the rows from row (ui_notice()); blank rows for an empty text.
+static void noticeDraw(uint8_t row, const char *text) {
+  for (uint8_t line = 0; line < NOTICE_ROWS; line++) {
+    ui_printField((uint8_t)(row + line), 0, TERM_SCREEN_SIZE_X, "");
+  }
+  if (text != NULL && text[0] != '\0') {
+    ui_notice(row, NOTICE_ROWS, text);
+  }
+}
+
+// --- The main menu -----------------------------------------------------------
+// Its rows, in one table: a row added moves everything below it. Row 1 is
+// left blank under the title bar. A group box takes its label's row (the top
+// edge), its rows, and a row for the bottom edge.
+#define MENU_ROW_ROM 2
+#define MENU_ROW_LAUNCH 3
+#define MENU_ROW_RIPPER 4
+#define MENU_ROW_ROM_END 5
+#define MENU_ROW_CARD 6
+#define MENU_ROW_BROWSE 7
+#define MENU_ROW_CARD_STATE 8
+#define MENU_ROW_CARD_END 9
+#define MENU_ROW_CATALOG 10
+#define MENU_ROW_DOWNLOAD 11
+#define MENU_ROW_WIFI 12
+#define MENU_ROW_TRANSFER 13
+#define MENU_ROW_CATALOG_END 14
+#define MENU_ROW_DEVICE 15
+#define MENU_ROW_SETTINGS 16
+#define MENU_ROW_EXIT 17
+#define MENU_ROW_BOOSTER 18
+#define MENU_ROW_DEVICE_END 19
+// Two rows for a notice, inverted, above the prompt; the last row stays blank
+// above the strip.
+#define MENU_ROW_NOTICE 20
+#define MENU_ROW_PROMPT 22
+// Inside a box: the label, the keys and the values' column (to column 37,
+// left of the box's right edge)
+#define MENU_COL_LABEL 2
+#define MENU_COL_KEY 2
+#define MENU_COL_VALUE 14
+#define MENU_VALUE_WIDTH 24
+#define MENU_ROW_WIDTH (TERM_SCREEN_SIZE_X - (2 * MENU_COL_KEY))
+#define MENU_COL_PROMPT 1
+#define MENU_PROMPT "Select an option: "
+// The boxes' labels
+#define MENU_LABEL_ROM "ROM"
+#define MENU_LABEL_CARD "SD card"
+#define MENU_LABEL_CATALOG "Catalog"
+#define MENU_LABEL_DEVICE "Device"
+#define LABEL_COLS(label) ((uint8_t)(sizeof(label) - 1))
+
+// The last command's notice, empty for none: the rows then say why the RP
+// last restarted, if that was not asked for.
+static char menuNoticeText[NOTICE_TEXT_BYTES] = "";
+
+// The menu's notice goes after NOTICE_SHOWN_MS: when it was drawn, 0 for
+// none on the screen.
+#define NOTICE_SHOWN_MS 5000U
+static uint32_t menuNoticeShownUs = 0;
+
+static void menuDrawNotice(void) {
+  char bootLine[TERM_SCREEN_SIZE_X];
+  const char *text = menuNoticeText;
+  if (text[0] == '\0' && health_getBootLine(bootLine, sizeof(bootLine))) {
+    text = bootLine;
+  }
+  noticeDraw(MENU_ROW_NOTICE, text);
+  menuNoticeShownUs = (text[0] != '\0') ? (time_us_32() | 1U) : 0;
+}
+
+// From the main loop: the notice off the menu once its time is up.
+static void menuNoticePoll(void) {
+  if (menuNoticeShownUs == 0 ||
+      time_us_32() - menuNoticeShownUs < NOTICE_SHOWN_MS * US_PER_MS) {
+    return;
+  }
+  menuNoticeShownUs = 0;
+  menuNoticeText[0] = '\0';
+  if (menuIntact && listKind == LIST_NONE &&
+      menuState.menuLevel == TERM_ROMS_MENU_MAIN) {
+    noticeDraw(MENU_ROW_NOTICE, "");
+    display_refresh();
+  }
+}
+
+// The prompt, cleared of what was typed after it, with the cursor on it.
+static void menuPrompt(void) {
+  ui_printField(MENU_ROW_PROMPT, 0, TERM_SCREEN_SIZE_X, "");
+  term_printAt(MENU_ROW_PROMPT, MENU_COL_PROMPT, MENU_PROMPT);
+  ui_cursorAt(MENU_ROW_PROMPT,
+              (uint8_t)(MENU_COL_PROMPT + sizeof(MENU_PROMPT) - 1));
+  term_markMenuPromptCursor();
+}
+
+// The catalog box's last row: a ROM download's progress while it runs, then
+// how it ended.
+static void menuDrawTransfer(void) {
+  if (downloadKind == DOWNLOAD_KIND_ROM) {
+    uint32_t done = download_getBytesWritten();
+    char text[TERM_SCREEN_SIZE_X * 2];
+    snprintf(text, sizeof(text), "%s   %lu of %lu KB", downloadRomName,
+             (unsigned long)(done / BYTES_PER_KB),
+             (unsigned long)downloadRomSizeKb);
+    ui_bar(MENU_ROW_TRANSFER, MENU_COL_KEY, MENU_ROW_WIDTH, done,
+           downloadRomSizeKb * BYTES_PER_KB, text);
+    return;
+  }
+  ui_printField(MENU_ROW_TRANSFER, MENU_COL_KEY, MENU_ROW_WIDTH,
+                downloadMessage);
+}
+
+// The values that follow the state: the selection, the card, the network,
+// the last download, and the icons. Drawn in place.
+static void menuDrawStatus(void) {
+  SettingsConfigEntry *romSelected =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED);
+  bool picked = (romSelected != NULL) && (romSelected->value[0] != '\0');
+  ui_printField(MENU_ROW_LAUNCH, MENU_COL_VALUE, MENU_VALUE_WIDTH,
+                picked ? romSelected->value : "pick one: [B] or [D]");
+  ui_printField(MENU_ROW_RIPPER, MENU_COL_VALUE, MENU_VALUE_WIDTH,
+                delayMode ? "on: waits for SELECT" : "off");
+  ui_printField(MENU_ROW_BROWSE, MENU_COL_VALUE, MENU_VALUE_WIDTH, romsFolder);
+  ui_printField(MENU_ROW_CARD_STATE, MENU_COL_VALUE, MENU_VALUE_WIDTH,
+                sdcard_isMounted() ? "mounted" : "none: put one in");
+  const char *wifi = netReason;
+  if (netState == NET_CONNECTING) {
+    wifi = "joining...";
+  } else if (netState == NET_UP) {
+    wifi = (catalogRefresh == CATALOG_REFRESH_RUNNING) ? "connected, refreshing"
+                                                       : "connected";
+  }
+  ui_printField(MENU_ROW_WIFI, MENU_COL_VALUE, MENU_VALUE_WIDTH, wifi);
+  menuDrawTransfer();
+  ui_titleIcons(titleSdGlyph(), titleWifiGlyph());
+  ui_groupIcon(MENU_ROW_CARD,
+               sdcard_isMounted() ? UI_GLYPH_DRIVE : UI_GLYPH_NONE);
+  ui_groupIcon(MENU_ROW_CATALOG, titleWifiGlyph());
 }
 
 static void menu(void) {
   menuState.menuLevel = TERM_ROMS_MENU_MAIN;
+  term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+  menuNoticeText[0] = '\0';
   showTitle();
-  // Why the RP restarted, when nobody asked for it, on the free row under
-  // the title, for as long as this boot lasts.
-  char bootLine[TERM_SCREEN_SIZE_X];
-  if (health_getBootLine(bootLine, sizeof(bootLine))) {
-    term_printString(bootLine);
-  }
-  term_printString("\n\n");
-  term_printString("[B] Browse ROMs in microSD card\n");
-  term_printString("[D] Download ROMs from the catalog\n");
-  term_printString("[S] Settings\n\n");
-  term_printString("[E] Exit to desktop (or hold SHIFT)\n");
-  term_printString("[X] Return to booster menu\n\n");
+  // The words: printed in place, so the frames drawn after them stay whole
+  term_printAt(MENU_ROW_ROM, MENU_COL_LABEL, MENU_LABEL_ROM);
+  term_printAt(MENU_ROW_LAUNCH, MENU_COL_KEY, "[L]aunch");
+  term_printAt(MENU_ROW_RIPPER, MENU_COL_KEY, "[R]ipper");
+  term_printAt(MENU_ROW_CARD, MENU_COL_LABEL, MENU_LABEL_CARD);
+  term_printAt(MENU_ROW_BROWSE, MENU_COL_KEY, "[B]rowse");
+  term_printAt(MENU_ROW_CARD_STATE, MENU_COL_KEY, "Card:");
+  term_printAt(MENU_ROW_CATALOG, MENU_COL_LABEL, MENU_LABEL_CATALOG);
+  term_printAt(MENU_ROW_DOWNLOAD, MENU_COL_KEY, "[D]ownload");
+  term_printAt(MENU_ROW_WIFI, MENU_COL_KEY, "Wi-Fi:");
+  term_printAt(MENU_ROW_DEVICE, MENU_COL_LABEL, MENU_LABEL_DEVICE);
+  term_printAt(MENU_ROW_SETTINGS, MENU_COL_KEY, "[S]ettings");
+  term_printAt(MENU_ROW_EXIT, MENU_COL_KEY,
+               "[E]xit to desktop (or hold SHIFT)");
+  term_printAt(MENU_ROW_BOOSTER, MENU_COL_KEY,
+               "[X] Back to Booster   [M] Refresh");
+  const char *url = catalogUrl();
+  const char *host = (url != NULL) ? strstr(url, "://") : NULL;
+  host = (host != NULL) ? host + 3 : "not set";
+  char hostName[MENU_VALUE_WIDTH + 1];
+  snprintf(hostName, sizeof(hostName), "%.*s", (int)strcspn(host, "/:"), host);
+  ui_printField(MENU_ROW_DOWNLOAD, MENU_COL_VALUE, MENU_VALUE_WIDTH, hostName);
+  menuDrawStatus();
+  menuPrompt();
+  // Then the frames and the strip
+  ui_group(MENU_ROW_ROM, MENU_ROW_ROM_END, MENU_COL_LABEL,
+           LABEL_COLS(MENU_LABEL_ROM), UI_GLYPH_CARTRIDGE);
+  ui_group(MENU_ROW_CARD, MENU_ROW_CARD_END, MENU_COL_LABEL,
+           LABEL_COLS(MENU_LABEL_CARD),
+           sdcard_isMounted() ? UI_GLYPH_DRIVE : UI_GLYPH_NONE);
+  ui_group(MENU_ROW_CATALOG, MENU_ROW_CATALOG_END, MENU_COL_LABEL,
+           LABEL_COLS(MENU_LABEL_CATALOG), titleWifiGlyph());
+  ui_group(MENU_ROW_DEVICE, MENU_ROW_DEVICE_END, MENU_COL_LABEL,
+           LABEL_COLS(MENU_LABEL_DEVICE), UI_GLYPH_COG);
+  menuDrawNotice();
+  menuIntact = true;
+}
 
-  if (delayMode) {
-    term_printString("[R] Disable ROM delay/ripper mode\n");
-  } else {
-    term_printString("[R] Enable ROM delay/ripper mode\n");
+// A command's outcome, on the menu's notice rows; the menu is drawn again if
+// something else is on the screen. The cursor goes back to the prompt.
+static void menuNotice(const char *text) {
+  if (!menuIntact || listKind != LIST_NONE ||
+      menuState.menuLevel != TERM_ROMS_MENU_MAIN) {
+    listClose();
+    menu();
   }
-  term_printString("\n");
-
-  // Read ACONFIG_PARAM_ROM_SELECTED
-  SettingsConfigEntry *romSelected =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED);
-  if ((romSelected != NULL) && (strlen(romSelected->value) > 0)) {
-    term_printString("[L] Launch ROM: ");
-    termPrintCut(romSelected->value,
-                 TERM_SCREEN_SIZE_X - (int)strlen("[L] Launch ROM: ") - 1);
-    term_printString("\n");
-  }
-  term_printString("\n");
-
-  term_printString("[M] Refresh this menu\n");
-
-  term_printString("\n");
-
-  // The network, then the last download
-  if (!sdcard_isMounted()) {
-    term_printString("SD card: none. Put one in.\n");
-  }
-  term_printString("Network: ");
-  switch (netState) {
-    case NET_CONNECTING:
-      term_printString("connecting...\n");
-      break;
-    case NET_UP:
-      term_printString(catalogRefresh == CATALOG_REFRESH_RUNNING
-                           ? "connected, refreshing\n"
-                           : "connected\n");
-      break;
-    default:
-      term_printString(netReason);
-      term_printString("\n");
-      break;
-  }
-  if (downloadMessage[0] != '\0') {
-    term_printString(downloadMessage);
-    term_printString("\n");
-  } else {
-    term_printString("\n");
-  }
-  term_printString("Select an option: ");
+  snprintf(menuNoticeText, sizeof(menuNoticeText), "%s", text);
+  menuDrawNotice();
+  menuPrompt();
+  display_refresh();
 }
 
 // Command handlers
-void cmdMenu(const char *arg) { menu(); }
+// A screen of a few lines under the title bar, when the menu gives way to
+// something (Booster, the desktop) or shows the keys. Lines fit in
+// MESSAGE_WIDTH.
+#define MESSAGE_ROW 2
+#define MESSAGE_COL 2
+#define MESSAGE_WIDTH (TERM_SCREEN_SIZE_X - (2 * MESSAGE_COL))
 
-void cmdHelp(const char *arg) {
-  // term_printString("\x1B" "E" "Available commands:\n");
-  term_printString("Available commands:\n");
-  term_printString(" General:\n");
-  term_printString("  clear   - Clear the terminal screen\n");
-  term_printString("  exit    - Exit the terminal\n");
-  term_printString("  help    - Show available commands\n");
+static void messageScreen(const char *const lines[], size_t count) {
+  showTitle();
+  for (size_t i = 0; i < count; i++) {
+    ui_printField((uint8_t)(MESSAGE_ROW + i), MESSAGE_COL, MESSAGE_WIDTH,
+                  lines[i]);
+  }
+  ui_parkCursor();
+  display_refresh();
 }
 
-void cmdClear(const char *arg) { term_clearScreen(); }
+void cmdMenu(const char *arg) {
+  menu();
+  display_refresh();
+}
+
+// The settings take typed lines (put_str KEY VALUE, save, ...) until 'm'.
+static void cmdSettings(const char *arg) {
+  menuIntact = false;
+  menuState.menuLevel = TERM_ROMS_MENU_SETTINGS;
+  term_setCommandLevel(TERM_COMMAND_LEVEL_COMMAND_INPUT);
+  term_cmdSettings(arg);
+  term_printString("> ");
+}
+
+void cmdHelp(const char *arg) {
+  static const char *const lines[] = {
+      "Available commands:",
+      "",
+      "B  Browse the ROMs on the SD card",
+      "D  Download ROMs from the catalog",
+      "L  Launch the selected ROM",
+      "R  Delay/ripper mode on or off",
+      "S  Settings (typed commands)",
+      "E  Exit to the desktop",
+      "X  Back to Booster",
+      "M  The menu",
+      "",
+      "Press M for the menu.",
+  };
+  messageScreen(lines, sizeof(lines) / sizeof(lines[0]));
+}
+void cmdClear(const char *arg) {
+  menuIntact = false;
+  term_clearScreen();
+}
 
 void cmdExit(const char *arg) {
-  term_printString("Exiting terminal...\n");
+  static const char *const lines[] = {"Booting to the desktop..."};
+  messageScreen(lines, sizeof(lines) / sizeof(lines[0]));
   // Send continue to desktop command
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
 }
-
 // --- The network and the catalog refresh, behind the menu ------------------
 
 // The menu shows the network and the last download on its status lines:
 // redraw it when they change, unless a list or another screen is up.
 static void menuStatusChanged(void) {
-  if (listKind == LIST_NONE && menuState.menuLevel == TERM_ROMS_MENU_MAIN) {
-    menu();
+  if (listKind != LIST_NONE) {
+    ui_titleIcons(titleSdGlyph(), titleWifiGlyph());
+    display_refresh();
+  } else if (menuIntact && menuState.menuLevel == TERM_ROMS_MENU_MAIN) {
+    menuDrawStatus();
     display_refresh();
   }
 }
-
 static const char *catalogUrl(void) {
 #if APP_DOWNLOAD_HTTPS == 1
   SettingsConfigEntry *entry = settings_find_entry(
@@ -1018,6 +1287,9 @@ static void netPoll(void) {
   menuStatusChanged();
 }
 
+static void downloadProgress(void);
+static void downloadRomEnded(void);
+
 // The download running, from the main loop: the catalog replaces the card's
 // copy only when complete (download.c), a ROM is selected only when complete.
 static void downloadsPoll(void) {
@@ -1031,6 +1303,7 @@ static void downloadsPoll(void) {
   if (status == DOWNLOAD_STATUS_STARTED ||
       status == DOWNLOAD_STATUS_IN_PROGRESS) {
     download_poll();
+    downloadProgress();
     return;
   }
   if (status != DOWNLOAD_STATUS_COMPLETED && status != DOWNLOAD_STATUS_FAILED) {
@@ -1085,7 +1358,7 @@ static void downloadsPoll(void) {
         snprintf(downloadMessage, sizeof(downloadMessage),
                  "Download failed: %lu KB, catalog %lu KB",
                  (unsigned long)gotKb, (unsigned long)downloadRomSizeKb);
-        menuStatusChanged();
+        downloadRomEnded();
         return;
       }
     }
@@ -1104,7 +1377,11 @@ static void downloadsPoll(void) {
     snprintf(downloadMessage, sizeof(downloadMessage), "Download failed: %s",
              reason);
   }
-  menuStatusChanged();
+  if (kind == DOWNLOAD_KIND_ROM) {
+    downloadRomEnded();
+  } else {
+    menuStatusChanged();
+  }
 }
 
 // --- The lists ---------------------------------------------------------------
@@ -1135,119 +1412,303 @@ static const char *listName(uint32_t index) {
   return catalogNames[index % NAVLIST_PAGE_LINES];
 }
 
-// Two lines at most above the catalog: why it may be old.
-static void catalogNotice(void) {
+// Why the catalog may be old, from row: the rows it took, with a blank one.
+static uint8_t catalogNotice(uint8_t row) {
+  char text[NOTICE_TEXT_BYTES];
   if (netState == NET_CONNECTING || catalogRefresh == CATALOG_REFRESH_RUNNING) {
-    term_printString("Refreshing the catalog...\n");
+    snprintf(text, sizeof(text), "Refreshing the catalog...");
   } else if (netState != NET_UP) {
-    term_printString("Offline: the copy on the SD card.\n");
-    term_printString(netReason);
-    term_printString("\n");
+    snprintf(text, sizeof(text), "Offline: the copy on the SD card. %s",
+             netReason);
   } else if (catalogRefresh == CATALOG_REFRESH_FAILED) {
-    term_printString("Offline: the copy on the SD card.\n");
-    term_printString("Server: ");
-    term_printString(catalogReason);
-    term_printString("\n");
+    snprintf(text, sizeof(text), "Offline: the copy on the SD card. Server: %s",
+             catalogReason);
+  } else {
+    return 0;
+  }
+  noticeDraw(row, text);
+  return NOTICE_ROWS + 1;
+}
+// The lists' rows
+#define LIST_ROW_HEADER 2
+#define LIST_ROW_RULE 3
+#define LIST_ROW_FIRST 4
+#define LIST_NAME_WIDTH (TERM_SCREEN_SIZE_X - 3)
+
+// The page's first entry's row: after the catalog's notice, if any
+uint8_t listFirstRow = LIST_ROW_FIRST;
+
+// An entry's row, inverted when it is the selection (the tools read the
+// selection and the first row over SWD: listNav, listFirstRow).
+static void listDrawEntry(uint32_t index) {
+  uint8_t row = (uint8_t)(listFirstRow + (index - navlist_first(&listNav)));
+  bool selected = (index == listNav.selected);
+  char line[TERM_SCREEN_SIZE_X + 1];
+  snprintf(line, sizeof(line), "  %.*s", LIST_NAME_WIDTH, listName(index));
+  ui_printField(row, 0, TERM_SCREEN_SIZE_X, line);
+  if (selected) {
+    ui_invertRows(row, 1);
   }
 }
 
 static void listDraw(void) {
   showTitle();
-  if (listKind == LIST_CARD) {
-    term_printString("ROMs on the SD card\n");
-  } else {
-    term_printString("ROM catalog\n");
-    catalogNotice();
+  char page[TERM_SCREEN_SIZE_X];
+  snprintf(page, sizeof(page), "Page %lu/%lu, %lu ROMs",
+           (unsigned long)(navlist_page(&listNav) + 1),
+           (unsigned long)navlist_pages(&listNav),
+           (unsigned long)listNav.count);
+  const char *name =
+      (listKind == LIST_CARD) ? "ROMs on the SD card" : "ROM catalog";
+  char head[TERM_SCREEN_SIZE_X + 1];
+  snprintf(head, sizeof(head), " %-*s%s",
+           (int)(TERM_SCREEN_SIZE_X - 2 - strlen(page)), name, page);
+  term_printAt(LIST_ROW_HEADER, 0, head);
+  listFirstRow = LIST_ROW_FIRST;
+  if (listKind == LIST_CATALOG) {
+    listFirstRow += catalogNotice(LIST_ROW_FIRST);
   }
   uint32_t first = navlist_first(&listNav);
   uint32_t shown = navlist_onPage(&listNav);
   for (uint32_t i = 0; i < shown; i++) {
-    char line[TERM_SCREEN_SIZE_X + 1];
-    snprintf(line, sizeof(line), "%c %.*s\n",
-             (first + i == listNav.selected) ? '>' : ' ',
-             TERM_SCREEN_SIZE_X - 3, listName(first + i));
-    term_printString(line);
+    listDrawEntry(first + i);
   }
-  char footer[TERM_SCREEN_SIZE_X + 1];
-  snprintf(footer, sizeof(footer), "\nPage %lu/%lu, %lu ROMs\n",
-           (unsigned long)(navlist_page(&listNav) + 1),
-           (unsigned long)navlist_pages(&listNav),
-           (unsigned long)listNav.count);
-  term_printString(footer);
-  term_printString("UP/DOWN select, LEFT/RIGHT page\n");
-  term_printString("RETURN details, ESC menu");
+  ui_parkCursor();
+  ui_rule(LIST_ROW_RULE);
+  ui_strip("UP/DOWN select    LEFT/RIGHT page    RETURN details    ESC menu",
+           false);
   display_refresh();
 }
-
-static bool catalogEntryAllowed(void) {
+static bool catalogEntryAllowed(char *why, size_t whySize) {
   switch (catalog_check(&catalogEntry)) {
-    case CATALOG_ENTRY_TOO_LARGE: {
-      char line[TERM_SCREEN_SIZE_X * 2];
-      snprintf(line, sizeof(line),
-               "\nToo large: %lu KB, the limit is 128 KB.\n",
+    case CATALOG_ENTRY_TOO_LARGE:
+      snprintf(why, whySize, "Too large: %lu KB, the limit is 128 KB.",
                (unsigned long)catalogEntry.sizeKb);
-      term_printString(line);
       return false;
-    }
     case CATALOG_ENTRY_BAD_NAME:
-      term_printString("\nRefused: its file name is not safe.\n");
+      snprintf(why, whySize, "Refused: its file name is not safe.");
       return false;
     case CATALOG_ENTRY_LONG_NAME:
-      term_printString("\nRefused: its file name is too long.\n");
+      snprintf(why, whySize, "Refused: its file name is too long.");
       return false;
     default:
       break;
   }
   if (netState != NET_UP) {
-    term_printString("\nThe network is needed to download it:\n");
-    term_printString(netReason);
-    term_printString("\nFix Wi-Fi in Booster, then restart.\n");
+    snprintf(why, whySize, "The network is needed to download it: %s",
+             netReason);
     return false;
   }
   if (!catalogOrigin.known) {
-    term_printString("\nThe catalog has not been refreshed\n");
-    term_printString("from its server yet: try again soon.\n");
+    snprintf(why, whySize,
+             "The catalog has not been refreshed from its server yet: try "
+             "again soon.");
     return false;
   }
   if (downloadKind != DOWNLOAD_KIND_NONE) {
-    term_printString("\nA download is running: wait for it.\n");
+    snprintf(why, whySize, "A download is running: wait for it.");
     return false;
   }
+  why[0] = '\0';
   return true;
+}
+// The details' rows: a box with the ROM's name on its top edge, its fields,
+// and a refusal under it
+#define DETAILS_ROW_BOX 4
+#define DETAILS_COL_LABEL 2
+#define DETAILS_COL_VALUE 12
+#define DETAILS_VALUE_WIDTH (TERM_SCREEN_SIZE_X - DETAILS_COL_VALUE - 2)
+#define DETAILS_NAME_WIDTH (TERM_SCREEN_SIZE_X - 10)
+#define DETAILS_ABOUT_ROWS 6
+
+// Where the details' refusal goes, under the box
+static uint8_t detailsNoticeRow = DETAILS_ROW_BOX + 2;
+
+// A refusal on the details screen, after it was drawn
+static void detailsNotice(const char *text) {
+  noticeDraw(detailsNoticeRow, text);
+  ui_parkCursor();
+  display_refresh();
+}
+
+static void detailsField(uint8_t row, const char *label, const char *value) {
+  term_printAt(row, DETAILS_COL_LABEL, label);
+  ui_printField(row, DETAILS_COL_VALUE, DETAILS_VALUE_WIDTH, value);
+}
+
+// value split at spaces over rows from row, at most maxRows: the rows taken
+static uint8_t detailsWrapped(uint8_t row, const char *label, const char *value,
+                              uint8_t maxRows) {
+  term_printAt(row, DETAILS_COL_LABEL, label);
+  uint8_t used = 0;
+  while (*value != '\0' && used < maxRows) {
+    int len = (int)strlen(value);
+    int take = len;
+    if (len > DETAILS_VALUE_WIDTH) {
+      take = DETAILS_VALUE_WIDTH;
+      while (take > 0 && value[take] != ' ') {
+        take--;
+      }
+      if (take == 0) {
+        take = DETAILS_VALUE_WIDTH;
+      }
+    }
+    char part[TERM_SCREEN_SIZE_X + 1];
+    snprintf(part, sizeof(part), "%.*s", take, value);
+    term_printAt((uint8_t)(row + used), DETAILS_COL_VALUE, part);
+    value += take;
+    while (*value == ' ') {
+      value++;
+    }
+    used++;
+  }
+  return (used > 0) ? used : 1;
+}
+
+static void detailsBox(uint8_t bottomRow, const char *name) {
+  char label[DETAILS_NAME_WIDTH + 1];
+  snprintf(label, sizeof(label), "%s", name);
+  term_printAt(DETAILS_ROW_BOX, DETAILS_COL_LABEL, label);
+  ui_parkCursor();
+  ui_rule(LIST_ROW_RULE);
+  ui_group(DETAILS_ROW_BOX, bottomRow, DETAILS_COL_LABEL,
+           (uint8_t)strlen(label), UI_GLYPH_CARTRIDGE);
 }
 
 static void listDetailsDraw(void) {
   showTitle();
-  term_printString("\n");
+  term_printAt(
+      LIST_ROW_HEADER, 0,
+      (listKind == LIST_CARD) ? " ROMs on the SD card" : " ROM catalog");
   if (listKind == LIST_CARD) {
     char name[SETTINGS_MAX_VALUE_LENGTH];
     romFullName(sdRoms[listNav.selected].open, name, sizeof(name));
-    term_printString("ROM: ");
-    term_printString(name);
-    term_printString("\n\nRETURN launch, ESC back");
+    detailsField(DETAILS_ROW_BOX + 1, "File", name);
+    detailsField(DETAILS_ROW_BOX + 2, "Folder", romsFolder);
+    detailsBox(DETAILS_ROW_BOX + 3, name);
+    ui_strip("RETURN select    ESC back", false);
     display_refresh();
     return;
   }
   if (catalog_readEntry(&catalog, listNav.selected, &catalogEntry) !=
       CATALOG_OK) {
-    term_printString("The catalog could not be read.\n\nESC back");
+    noticeDraw(DETAILS_ROW_BOX, "The catalog could not be read.");
+    ui_parkCursor();
+    ui_rule(LIST_ROW_RULE);
+    ui_strip("ESC back", false);
     display_refresh();
     return;
   }
-  char line[TERM_SCREEN_SIZE_X * 3];
-  snprintf(line, sizeof(line), "Name: %s\nFile: %s\n", catalogEntry.name,
-           catalog_fileName(&catalogEntry));
-  term_printString(line);
-  snprintf(line, sizeof(line), "Description: %s\nTags: %s\nSize: %lu KB\n",
-           catalogEntry.description, catalogEntry.tags,
-           (unsigned long)catalogEntry.sizeKb);
-  term_printString(line);
-  if (catalogEntryAllowed()) {
-    term_printString("\nRETURN download, ESC back");
-  } else {
-    term_printString("\nESC back");
-  }
+  char size[NUMBER_TEXT_BYTES];
+  snprintf(size, sizeof(size), "%lu KB", (unsigned long)catalogEntry.sizeKb);
+  detailsField(DETAILS_ROW_BOX + 1, "File", catalog_fileName(&catalogEntry));
+  detailsField(DETAILS_ROW_BOX + 2, "Size", size);
+  detailsField(DETAILS_ROW_BOX + 3, "Tags", catalogEntry.tags);
+  uint8_t rows = detailsWrapped(DETAILS_ROW_BOX + 4, "About",
+                                catalogEntry.description, DETAILS_ABOUT_ROWS);
+  uint8_t bottom = (uint8_t)(DETAILS_ROW_BOX + 4 + rows);
+  char why[NOTICE_TEXT_BYTES];
+  bool allowed = catalogEntryAllowed(why, sizeof(why));
+  detailsNoticeRow = (uint8_t)(bottom + 2);
+  noticeDraw(detailsNoticeRow, why);
+  detailsBox(bottom, catalogEntry.name);
+  ui_strip(allowed ? "RETURN download    ESC back" : "ESC back", false);
   display_refresh();
+}
+// --- The download screen -----------------------------------------------------
+// A ROM download in front, with its progress; ESC leaves it running behind
+// the menu, whose catalog box shows its progress too.
+#define DOWNLOAD_ROW_BOX 2
+#define DOWNLOAD_ROW_ROM 3
+#define DOWNLOAD_ROW_FROM 4
+#define DOWNLOAD_ROW_BAR 6
+#define DOWNLOAD_ROW_BOX_END 7
+#define DOWNLOAD_COL 2
+#define DOWNLOAD_LABEL "Download"
+#define DOWNLOAD_COL_VALUE 12
+#define DOWNLOAD_VALUE_WIDTH (TERM_SCREEN_SIZE_X - DOWNLOAD_COL_VALUE - 2)
+#define DOWNLOAD_BAR_COLS (TERM_SCREEN_SIZE_X - (2 * DOWNLOAD_COL))
+// How often the progress is drawn again
+#define DOWNLOAD_PROGRESS_MS 250
+
+static bool downloadScreenShown = false;
+static uint32_t downloadProgressUs = 0;
+
+static void downloadDrawBar(uint8_t row, uint8_t col, uint8_t cols) {
+  uint32_t done = download_getBytesWritten();
+  char text[TERM_SCREEN_SIZE_X * 2];
+  snprintf(text, sizeof(text), "%lu of %lu KB",
+           (unsigned long)(done / BYTES_PER_KB),
+           (unsigned long)downloadRomSizeKb);
+  ui_bar(row, col, cols, done, downloadRomSizeKb * BYTES_PER_KB, text);
+}
+
+static void downloadScreenKey(char key) {
+  if (key == TERM_KEY_ESC || key == 'm' || key == 'M') {
+    downloadScreenShown = false;
+    term_setKeyHandler(NULL);
+    menu();
+    display_refresh();
+  }
+}
+
+static void downloadScreen(void) {
+  menuIntact = false;
+  menuState.menuLevel = TERM_ROMS_MENU_BROWSE_NETWORK;
+  showTitle();
+  term_printAt(DOWNLOAD_ROW_BOX, DOWNLOAD_COL, DOWNLOAD_LABEL);
+  term_printAt(DOWNLOAD_ROW_ROM, DOWNLOAD_COL, "ROM");
+  ui_printField(DOWNLOAD_ROW_ROM, DOWNLOAD_COL_VALUE, DOWNLOAD_VALUE_WIDTH,
+                downloadRomName);
+  term_printAt(DOWNLOAD_ROW_FROM, DOWNLOAD_COL, "From");
+  ui_printField(DOWNLOAD_ROW_FROM, DOWNLOAD_COL_VALUE, DOWNLOAD_VALUE_WIDTH,
+                catalogOrigin.host);
+  ui_parkCursor();
+  ui_group(DOWNLOAD_ROW_BOX, DOWNLOAD_ROW_BOX_END, DOWNLOAD_COL,
+           LABEL_COLS(DOWNLOAD_LABEL), UI_GLYPH_WIFI);
+  downloadDrawBar(DOWNLOAD_ROW_BAR, DOWNLOAD_COL, DOWNLOAD_BAR_COLS);
+  ui_strip("ESC menu: the download goes on", false);
+  downloadScreenShown = true;
+  downloadProgressUs = time_us_32();
+  term_setKeyHandler(downloadScreenKey);
+  display_refresh();
+}
+
+// A ROM download's end: from its screen, the menu with how it went
+static void downloadRomEnded(void) {
+  if (!downloadScreenShown) {
+    menuStatusChanged();
+    return;
+  }
+  downloadScreenShown = false;
+  term_setKeyHandler(NULL);
+  menuIntact = false;
+  if (strncmp(downloadMessage, DOWNLOADED_PREFIX,
+              sizeof(DOWNLOADED_PREFIX) - 1) == 0) {
+    char text[NOTICE_TEXT_BYTES];
+    snprintf(text, sizeof(text), "Downloaded and selected: %s",
+             downloadMessage + sizeof(DOWNLOADED_PREFIX) - 1);
+    menuNotice(text);
+  } else {
+    menuNotice(downloadMessage);
+  }
+}
+
+// The progress, every DOWNLOAD_PROGRESS_MS, where it is shown
+static void downloadProgress(void) {
+  if (downloadKind != DOWNLOAD_KIND_ROM ||
+      time_us_32() - downloadProgressUs < DOWNLOAD_PROGRESS_MS * US_PER_MS) {
+    return;
+  }
+  downloadProgressUs = time_us_32();
+  if (downloadScreenShown) {
+    downloadDrawBar(DOWNLOAD_ROW_BAR, DOWNLOAD_COL, DOWNLOAD_BAR_COLS);
+    display_refresh();
+  } else if (menuIntact && listKind == LIST_NONE &&
+             menuState.menuLevel == TERM_ROMS_MENU_MAIN) {
+    menuDrawTransfer();
+    display_refresh();
+  }
 }
 
 static void listAct(void) {
@@ -1258,11 +1719,13 @@ static void listAct(void) {
     // after the launch has written and read back the ROM.
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, name);
     listClose();
-    showTitle();
-    cmdLaunch(NULL);
+    char text[NOTICE_TEXT_BYTES];
+    snprintf(text, sizeof(text), "Selected: %s", name);
+    menuNotice(text);
     return;
   }
-  if (!catalogEntryAllowed()) {
+  char why[NOTICE_TEXT_BYTES];
+  if (!catalogEntryAllowed(why, sizeof(why))) {
     return;
   }
   char encoded[CATALOG_URL_BYTES * 3];
@@ -1275,7 +1738,7 @@ static void listAct(void) {
           : snprintf(url, sizeof(url), "%s://%s/%s", catalogOrigin.protocol,
                      catalogOrigin.host, encoded);
   if (!fits || length < 0 || (size_t)length >= sizeof(url)) {
-    term_printString("\nRefused: its URL is too long.\n");
+    detailsNotice("Refused: its URL is too long.");
     return;
   }
   DPRINTF("Downloading ROM: %s\n", url);
@@ -1284,9 +1747,9 @@ static void listAct(void) {
   if (err != DOWNLOAD_OK) {
     char reason[TERM_SCREEN_SIZE_X];
     describeDownload(err, reason, sizeof(reason));
-    term_printString("\nThe download did not start:\n");
-    term_printString(reason);
-    term_printString("\n");
+    char text[NOTICE_TEXT_BYTES];
+    snprintf(text, sizeof(text), "The download did not start: %s", reason);
+    detailsNotice(text);
     return;
   }
   downloadKind = DOWNLOAD_KIND_ROM;
@@ -1297,8 +1760,7 @@ static void listAct(void) {
            (int)(TERM_SCREEN_SIZE_X - sizeof(DOWNLOADING_PREFIX)),
            downloadRomName);
   listClose();
-  menu();
-  display_refresh();
+  downloadScreen();
 }
 
 static void listKey(char key) {
@@ -1311,8 +1773,14 @@ static void listKey(char key) {
     }
     return;
   }
+  uint32_t before = listNav.selected;
   switch (navlist_key(&listNav, key)) {
     case NAVLIST_MOVED:
+      // Two rows, not the page
+      listDrawEntry(before);
+      listDrawEntry(listNav.selected);
+      display_refresh();
+      break;
     case NAVLIST_PAGE_TURNED:
       listDraw();
       break;
@@ -1335,10 +1803,9 @@ static bool cardMissing(void) {
   if (sdcard_isMounted()) {
     return false;
   }
-  term_printString("No SD card. Put one in: it is found\nby itself.\n");
+  menuNotice("No SD card. Put one in: it is found by itself.");
   return true;
 }
-
 // The card going or coming, seen by sdcard_pollRemount() or by a failed
 // operation's presence check. An open list read the old card (and the
 // catalog's page index is the old card's), so it closes; a new card needs
@@ -1378,7 +1845,7 @@ void cmdCard(const char *arg) {
   }
   FRESULT listed = readRomsSdcard(romsFolder);
   if (listed == FR_NOT_ENOUGH_CORE) {
-    term_printString("Not enough memory for the ROM list.\n");
+    menuNotice("Not enough memory for the ROM list.");
     return;
   }
   if (listed != FR_OK) {
@@ -1387,20 +1854,19 @@ void cmdCard(const char *arg) {
       cardMissing();
       return;
     }
-    term_printString("The folder '");
-    term_printString(romsFolder);
-    term_printString(
-        "' could not be read\nfrom the SD card. Check FOLDER in\n"
-        "[S]ettings.\n\n");
+    char text[NOTICE_TEXT_BYTES];
+    snprintf(text, sizeof(text),
+             "The folder %s could not be read: check FOLDER in [S]ettings.",
+             romsFolder);
+    menuNotice(text);
     return;
   }
   if (sdRomsCount == 0) {
     listClose();
-    term_printString("No ROMs found in the SD card.\n");
-    term_printString("Download ROMs from internet,\n");
-    term_printString("or copy them to folder '");
-    term_printString(romsFolder);
-    term_printString("'\n\n");
+    char text[NOTICE_TEXT_BYTES];
+    snprintf(text, sizeof(text),
+             "No ROMs in %s: [D]ownload some, or copy them there.", romsFolder);
+    menuNotice(text);
     return;
   }
   listOpen(LIST_CARD, sdRomsCount);
@@ -1426,24 +1892,23 @@ void cmdNetwork(const char *arg) {
       cardMissing();
       return;
     }
+    char text[NOTICE_TEXT_BYTES];
     if (netState == NET_CONNECTING ||
         catalogRefresh == CATALOG_REFRESH_RUNNING) {
-      term_printString("The catalog is still downloading:\n");
-      term_printString("try [D] again in a moment.\n");
+      snprintf(text, sizeof(text),
+               "The catalog is still downloading: try [D] again in a moment.");
     } else if (opened == CATALOG_NO_MEMORY) {
-      term_printString("Not enough memory for the catalog.\n");
+      snprintf(text, sizeof(text), "Not enough memory for the catalog.");
+    } else if (netState != NET_UP) {
+      snprintf(text, sizeof(text),
+               "No catalog on the SD card, and no "
+               "network: %s",
+               netReason);
     } else {
-      term_printString("No catalog on the SD card");
-      if (netState != NET_UP) {
-        term_printString(", and no\nnetwork: ");
-        term_printString(netReason);
-        term_printString("\nSet up Wi-Fi in Booster.\n");
-      } else {
-        term_printString(":\n");
-        term_printString(catalogReason[0] ? catalogReason : "empty");
-        term_printString("\n");
-      }
+      snprintf(text, sizeof(text), "No catalog on the SD card: %s",
+               catalogReason[0] ? catalogReason : "empty");
     }
+    menuNotice(text);
     return;
   }
   catalogPageCached = UINT32_MAX;
@@ -1461,49 +1926,58 @@ void cmdLaunch(const char *arg) {
   SettingsConfigEntry *romFile =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED);
   if (romFile == NULL || romFile->value[0] == '\0') {
-    // The menu hides [L] then, but the key still arrives.
-    romstoreReport(ROMSTORE_NOT_SELECTED, NULL);
-    display_refresh();
+    menuNotice(romstore_message(ROMSTORE_NOT_SELECTED));
     return;
   }
   if (cardMissing()) {
     return;
   }
+  // The launch's screen stays until [M]: a status redraw (the card, the
+  // network) would wipe a failure before it was read.
+  menuIntact = false;
+  menuState.menuLevel = TERM_ROMS_MENU_LAUNCH;
   char filename[MAX_PATH_SIZE];
   snprintf(filename, sizeof(filename), "%s/%s", romsFolder, romFile->value);
   DPRINTF("Loading ROM file into FLASH: %s\n", filename);
+  launchScreen("Launch", romFile->value,
+               delayMode ? "delay: waits for SELECT" : "direct");
   romstore_info_t info;
   romFlashBegin();
   romstore_result_t result = romstore_launch(filename, FLASH_ROM_LOAD_OFFSET,
                                              &romFlash, &info, cmdLaunchSelect);
   romFlashEnd();
+  launchScreenShown = false;
   if (result != ROMSTORE_OK) {
     DPRINTF("Launch failed: %s\n", romstore_message(result));
-    romstoreReport(result, &info);
+    char why[NOTICE_TEXT_BYTES];
     if ((result == ROMSTORE_READ_ERROR || result == ROMSTORE_NOT_FOUND) &&
         !sdcard_checkPresence()) {
-      term_printString("The SD card is gone.\n");
+      snprintf(why, sizeof(why),
+               "The ROM could not be read: the SD card is "
+               "gone.");
+    } else {
+      romstoreDescribe(result, &info, why, sizeof(why));
     }
-    // The message stays until [M]: a status redraw (the card, the network)
-    // would wipe it before it was read.
-    menuState.menuLevel = TERM_ROMS_MENU_LAUNCH;
-    term_printString("Press [M] for the menu.\n");
+    ui_bar(LAUNCH_ROW_BAR, LAUNCH_COL, LAUNCH_BAR_COLS, 0, 1, "Not written");
+    noticeDraw(LAUNCH_ROW_NOTICE, why);
+    term_printAt(LAUNCH_ROW_NOTICE + NOTICE_ROWS + 1, LAUNCH_COL,
+                 "Press M for the menu.");
     display_refresh();
     return;
   }
-
-  menuState.menuLevel = TERM_ROMS_MENU_LAUNCH;
-  term_printString("\n\nThe ROM will boot shortly...\n\n");
+  ui_bar(LAUNCH_ROW_BAR, LAUNCH_COL, LAUNCH_BAR_COLS, 1, 1,
+         "Written to flash and read back");
+  uint8_t row = LAUNCH_ROW_TEXT;
+  term_printAt(row++, LAUNCH_COL, "The ROM will boot shortly.");
   if (delayMode) {
-    term_printString(
-        "ROM delay/ripper mode enabled. You must press SELECT to activate the "
-        "ROM.\n");
+    term_printAt(row++, LAUNCH_COL, "Delay mode: SELECT starts the ROM.");
   }
-  term_printString("To return to this menu, press SELECT\n");
-  term_printString("If ROM doesn't boot, reset the computer\n");
+  row++;
+  term_printAt(row++, LAUNCH_COL, "SELECT brings this menu back.");
+  term_printAt(row, LAUNCH_COL, "If it doesn't boot, reset the ST.");
+  display_refresh();
   keepActive = false;  // Exit the active loop
 }
-
 // A line that is not a command: the menu again (the lists take their keys
 // one at a time, through listKey()).
 void cmdUnknown(const char *arg) {
@@ -1516,16 +1990,20 @@ void cmdUnknown(const char *arg) {
 }
 
 void cmdBooster(const char *arg) {
+  static const char *const lines[] = {
+      "Launching Booster...",
+      "",
+      "The computer will boot shortly.",
+      "If it doesn't, turn it off and on.",
+  };
   menuState.menuLevel = TERM_ROMS_MENU_BOOSTER;
-  term_printString("Launching Booster app...\n");
-  term_printString("The computer will boot shortly...\n\n");
-  term_printString("If it doesn't boot, power it on and off.\n");
+  messageScreen(lines, sizeof(lines) / sizeof(lines[0]));
   resetDeviceAtBoot = false;  // Jump to the booster app
   keepActive = false;         // Exit the active loop
 }
-
 #if defined(_DEBUG) && (_DEBUG != 0)
 static void cmdFirmware(const char *arg) {
+  menuIntact = false;
   if (!chandler_stPresent()) {
     // The user firmware relies on what the ST publishes at boot (the machine
     // type, for a Mega STE's cache), and this RP has not heard it yet.
@@ -1870,6 +2348,7 @@ void emul_start() {
     cardPoll();
     netPoll();
     downloadsPoll();
+    menuNoticePoll();
     // A hang past here is the loop's, not the connect's or the download's.
     health_setPhase(HEALTH_PHASE_MAIN_LOOP);
 

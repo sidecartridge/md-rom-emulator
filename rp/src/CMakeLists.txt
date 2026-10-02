@@ -134,6 +134,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         httpc/httpc.c
         hw_config.c
         navlist.c
+        ui.c
         network.c
         reset.c
         romemul.c

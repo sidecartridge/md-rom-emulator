@@ -44,8 +44,10 @@ If there is no ROM binary file loaded, the app will display a **setup screen**. 
 
 ### ⬇️ Browsing or Downloading ROM Files
 
-When you select the **[B]rowse** option, the app will display a list of available ROM files on the microSD card. You can navigate through the list using the keyboard and select a ROM file to load it.
-When you select the **[D]ownload** option, the app will show you the list of available ROM files from the internet. You can select a ROM file to download it to your microSD card.
+The menu's options take a single key, with no RETURN. When you select the **[B]rowse** option, the app will display a list of available ROM files on the microSD card. Move through it with the cursor keys (UP/DOWN, LEFT/RIGHT a page), RETURN shows a ROM's details, and RETURN again selects it; **[L]aunch** then loads it.
+When you select the **[D]ownload** option, the app will show you the list of available ROM files from the internet. RETURN on a ROM's details downloads it to your microSD card, with its progress on the screen, and selects it; ESC goes back to the menu while the download goes on.
+
+**[S]ettings** takes typed commands (`print`, `get KEY`, `put_str KEY VALUE`, `save`, ...), each ended with RETURN; `m` and RETURN go back to the menu.
 
 The catalog and the ROMs come over HTTPS, from `https://roms.sidecartridge.com/roms.csv` by default. To use a catalog of your own, set its URL in the `HTTPS_CATALOG` setting (**[S]ettings**); it can be `https://` or `http://`, and the ROMs are fetched from the same server. The connection is encrypted, but the server's certificate is not verified.
 
