@@ -51,17 +51,20 @@ static inline void reset_jump_to_booster(void) {
   // It should be placed at the beginning of main() if the SELECT signal or
   // BOOSTER app is selected. Set VTOR register, set stack pointer, and jump to
   // reset.
+  // VTOR's address comes in a register: an "ldr r1, =VTOR" left its constant
+  // to the assembler's next literal pool, out of reach in a large caller (a
+  // CMake Release build of emul.c with DEBUG_MODE=1 stopped there). "l": a low
+  // register, as str needs one; r0 and r1 are used by name.
   __asm__ __volatile__(
       "mov r0, %[start]\n"
-      "ldr r1, =%[vtable]\n"
-      "str r0, [r1]\n"
+      "str r0, [%[vtable]]\n"
       "ldmia r0, {r0, r1}\n"
       "msr msp, r0\n"
       "bx r1\n"
       :
-      : [start] "r"((unsigned int)&_booster_app_flash_start + 256),
-        [vtable] "X"(PPB_BASE + M0PLUS_VTOR_OFFSET)
-      :);
+      : [start] "l"((unsigned int)&_booster_app_flash_start + 256),
+        [vtable] "l"(PPB_BASE + M0PLUS_VTOR_OFFSET)
+      : "r0", "r1", "memory");
   DPRINTF("You should never reach this point\n");
 }
 
