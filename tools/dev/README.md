@@ -111,8 +111,9 @@ make -C tests/host test                                   # host tests, ASan and
 - The self-check cartridge (`selfcheck/selfcheck.s`) reads every patterned word of both banks
   through the cartridge port at boot, prints PASS or the first bad address, and sends the verdict
   as a `$7F01`/`$7F02` frame through ROM3 reads for a ROM3 capture to decode.
-- `smoke.py` drives the menu with `swd.py key` (the `[B]` and `[D]` lists with the cursor keys:
-  down to the ROM, a page right and back, RETURN for its details, RETURN to launch), checks each step on the terminal text and the
+- `smoke.py` drives the menu with `swd.py key` (single keys; the `[B]` and `[D]` lists with the
+  cursor keys: down to the ROM, the selection read over SWD, a page right and back, RETURN for its
+  details, RETURN to select it, then `L`), checks each step on the terminal text and the
   window, fails when the RP restarts unasked or the heap runs low, and writes screen PNGs and a
   JSON report to `tools/dev/logs/smoke-<time>/`. After the launch it waits `--rom-seconds` (15),
   so the ROM (the self-check by default) finishes on the ST before SELECT brings the setup menu
@@ -227,7 +228,7 @@ python3 tools/dev/select_harness.py long --force                 # 10 s press: f
 python3 tools/dev/select_harness.py restore settings.bin         # put the settings back
 python3 tools/dev/swd.py key g                                   # a keystroke, as if typed on the ST
 python3 tools/dev/swd.py key down                                # a named key: up down left right esc return space
-python3 tools/dev/swd.py type "put_str FOLDER /roms" --enter     # a line, through one OpenOCD: about 20 keys a second
+python3 tools/dev/swd.py type "put_str FOLDER /roms" --enter     # a line in [S]ettings (the menu takes single keys), one OpenOCD
 python3 tools/dev/swd.py app heap_hold 16                        # hold 16 KB more heap (0 releases)
 python3 tools/dev/swd.py app wifi 0                              # Wi-Fi down as a lost network (1: up)
 python3 tools/dev/swd.py inject 0x0001 0x0067 0                  # any protocol command

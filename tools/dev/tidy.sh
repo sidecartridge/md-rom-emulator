@@ -28,7 +28,7 @@ if [ "${1:-}" = "--build" ]; then
 fi
 FILES=("$@")
 if [ ${#FILES[@]} -eq 0 ]; then
-    FILES=(emul.c catalog.c navlist.c romstore.c)
+    FILES=(emul.c catalog.c navlist.c romstore.c ui.c)
 fi
 
 CLANG_TIDY=${CLANG_TIDY:-$(command -v clang-tidy || echo /usr/local/opt/llvm/bin/clang-tidy)}
