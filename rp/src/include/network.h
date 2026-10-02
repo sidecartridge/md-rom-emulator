@@ -201,6 +201,33 @@ wifi_sta_conn_process_status_t network_wifiStaConnectStart();
  */
 wifi_sta_conn_process_status_t network_wifiStaConnectPoll();
 
+// The link, from md-devops' link supervisor (v1.1.0). An ordinary disconnect
+// shows in the link status. A silent one (the radio off the network while the
+// driver and lwIP still say up, seen twice in md-devops) only shows to a
+// question asked over the air: an ARP request for the default gateway every
+// NETWORK_PROBE_INTERVAL_MS, NETWORK_PROBE_FAILURES unanswered in a row.
+#define NETWORK_PROBE_INTERVAL_MS 60000U
+#define NETWORK_PROBE_RETRY_MS 5000U
+#define NETWORK_PROBE_TIMEOUT_MS 3000U
+#define NETWORK_PROBE_FAILURES 3U
+
+/**
+ * @brief True while the station's link is up as lwIP sees it.
+ */
+bool network_isLinkHealthy(void);
+
+/**
+ * @brief From the main loop while connected: one step of the gateway probe.
+ * @return true when the gateway has stopped answering: treat the link as
+ * down.
+ */
+bool network_pollGatewayProbe(void);
+
+/**
+ * @brief Forget the probe's state, after a rejoin or a new connection.
+ */
+void network_resetGatewayProbe(void);
+
 /**
  * @brief Obtains the current WiFi connection status.
  *
