@@ -3,7 +3,7 @@
 survive, over HTTP and HTTPS.
 
     python3 tools/dev/testserver.py [--root DIR] [--http-port 80]
-                                    [--https-port 443]
+                                    [--https-port 443] [--ecdsa-port 8443]
 
 Run it on a machine in the same LAN as the SidecarTridge and point the app's
 catalog at it (the HTTP_CATALOG setting): http://<this machine>/roms.csv. The
@@ -44,6 +44,8 @@ Generated routes, for any name:
 
 HTTPS uses a self-signed certificate made with openssl on first run, in
 tools/dev/builds/testserver-cert/: the firmware encrypts but does not verify.
+Port 443 has an RSA 2048 certificate, --ecdsa-port an ECDSA P-256 one (the
+other handshake, https://<this machine>:8443/...); 0 turns that one off.
 Every request is logged to stdout and to tools/dev/logs/testserver.log, so a
 test can check what the device asked for.
 """
@@ -73,6 +75,9 @@ SYNTHETIC = pattern(64 * 1024)
 CERT_DIR = os.path.join(HERE, "builds", "testserver-cert")
 LOG = os.path.join(HERE, "logs", "testserver.log")
 PORTS = {"http": 80, "https": 443}
+CERT_KEYS = {"rsa": ["-newkey", "rsa:2048"],
+             "ecdsa": ["-newkey", "ec", "-pkeyopt",
+                       "ec_paramgen_curve:prime256v1"]}
 ROOT = os.path.join(HERE, "builds", "testserver")
 LOG_LOCK = threading.Lock()
 AUTORUN_ROM = "DiagROMCart.rom"
@@ -226,16 +231,26 @@ class Handler(BaseHTTPRequestHandler):
             f.write(line + "\n")
 
 
-def ensure_cert() -> tuple[str, str]:
+def ensure_cert(kind: str = "rsa") -> tuple[str, str]:
     os.makedirs(CERT_DIR, exist_ok=True)
-    cert, key = (os.path.join(CERT_DIR, n) for n in ("cert.pem", "key.pem"))
+    suffix = "" if kind == "rsa" else f"-{kind}"
+    cert, key = (os.path.join(CERT_DIR, n + suffix + ".pem")
+                 for n in ("cert", "key"))
     if not (os.path.exists(cert) and os.path.exists(key)):
-        print("generating a self-signed certificate (openssl)...")
-        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
+        print(f"generating a self-signed {kind} certificate (openssl)...")
+        subprocess.run(["openssl", "req", "-x509", *CERT_KEYS[kind],
                         "-keyout", key, "-out", cert, "-days", "3650",
                         "-nodes", "-subj", "/CN=testserver"],
                        check=True, capture_output=True)
     return cert, key
+
+
+def tls_server(port: int, kind: str) -> ThreadingHTTPServer:
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.load_cert_chain(*ensure_cert(kind))
+    server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    return server
 
 
 def main() -> int:
@@ -244,22 +259,23 @@ def main() -> int:
     ap.add_argument("--root", default=ROOT)
     ap.add_argument("--http-port", type=int, default=PORTS["http"])
     ap.add_argument("--https-port", type=int, default=PORTS["https"])
+    ap.add_argument("--ecdsa-port", type=int, default=8443)
     args = ap.parse_args()
     ROOT = os.path.abspath(args.root)
     PORTS.update(http=args.http_port, https=args.https_port)
     os.makedirs(ROOT, exist_ok=True)
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
-    cert, key = ensure_cert()
     print(f"file.bin md5 {hashlib.md5(PAYLOAD).hexdigest()} (65536 bytes); "
           f"serving {ROOT}")
     httpd = ThreadingHTTPServer(("0.0.0.0", args.http_port), Handler)
-    httpsd = ThreadingHTTPServer(("0.0.0.0", args.https_port), Handler)
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(cert, key)
-    httpsd.socket = ctx.wrap_socket(httpsd.socket, server_side=True)
+    httpsd = tls_server(args.https_port, "rsa")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    print(f"http on port {args.http_port}, https on port {args.https_port}",
-          flush=True)
+    if args.ecdsa_port:
+        ecdsad = tls_server(args.ecdsa_port, "ecdsa")
+        threading.Thread(target=ecdsad.serve_forever, daemon=True).start()
+    print(f"http on port {args.http_port}, https on port {args.https_port}"
+          + (f", https (ECDSA) on port {args.ecdsa_port}"
+             if args.ecdsa_port else ""), flush=True)
     httpsd.serve_forever()
     return 0
 

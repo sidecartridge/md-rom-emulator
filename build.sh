@@ -55,9 +55,9 @@ esac
 export BUILD_TYPE DEBUG_MODE
 echo "Build type: $BUILD_TYPE (DEBUG_MODE=$DEBUG_MODE)"
 
-# HTTPS downloads: APP_DOWNLOAD_HTTPS=1 builds TLS in (rp/src/CMakeLists.txt);
-# unset or 0 builds HTTP only.
-export APP_DOWNLOAD_HTTPS=${APP_DOWNLOAD_HTTPS:-0}
+# HTTPS downloads: unset or APP_DOWNLOAD_HTTPS=1 builds TLS in, as releases
+# ship (rp/src/CMakeLists.txt); 0 builds HTTP only.
+export APP_DOWNLOAD_HTTPS=${APP_DOWNLOAD_HTTPS:-1}
 case "$APP_DOWNLOAD_HTTPS" in
     0|1) ;;
     *)

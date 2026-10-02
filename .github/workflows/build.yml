@@ -29,10 +29,9 @@ jobs:
       fail-fast: false
       matrix:
         build_type: [release, debug]
-        # 1 builds HTTPS downloads in (APP_DOWNLOAD_HTTPS). HTTP only until the
-        # HTTPS profile fits in RAM: it compiles, and the link stops 28,876
-        # bytes over (release).
-        https: [0]
+        # 1 builds HTTPS downloads in (APP_DOWNLOAD_HTTPS), as releases ship;
+        # 0, HTTP only, keeps compiling.
+        https: [1, 0]
     steps:
     - name: Checkout the code
       uses: actions/checkout@v4

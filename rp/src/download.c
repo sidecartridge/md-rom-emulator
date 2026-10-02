@@ -48,6 +48,10 @@ static absolute_time_t reissueAt;
 static struct pbuf *pending = NULL;
 static struct altcp_pcb *pendingConn = NULL;
 static uint8_t *writeChunk = NULL;  // on the heap only while a download runs
+// What the header callback copies out of the headers: a header's name
+// ("Location:") and the status line's start ("HTTP/1.1 302 ").
+#define DOWNLOAD_HEADER_NAME_SIZE 16
+#define DOWNLOAD_STATUS_LINE_SIZE 16
 
 // The app's folder, or NULL when its settings have none (after `erase`, or
 // an app without the key). Read through NULL, it was the boot ROM's bytes at
@@ -200,33 +204,48 @@ static void filenameFromUri(const char *uri, download_file_t *file) {
   }
 }
 
-// Find a header (case-insensitive name at the start of a line) in a block of
-// response headers and copy its value into out. False if absent or empty;
-// *tooLong is set when it is present but longer than out.
-static bool findHeaderValue(const char *headers, const char *name, char *out,
-                            size_t outLen, bool *tooLong) {
+// Find a header (case-insensitive name at the start of a line) in the
+// response's headers and copy its value into out. False if absent or empty;
+// *tooLong is set when it is present but longer than out. Reads the pbuf a
+// line at a time instead of copying the headers whole: a redirect's run to
+// 5 KB (GitHub's), more than the heap should hold at once.
+static bool findHeaderValue(struct pbuf *hdr, u16_t hdrLen, const char *name,
+                            char *out, size_t outLen, bool *tooLong) {
+  char head[DOWNLOAD_HEADER_NAME_SIZE];
   size_t nameLen = strlen(name);
-  const char *line = headers;
+  u16_t line = 0;
   *tooLong = false;
-  while (line != NULL && *line != '\0') {
-    if (strncasecmp(line, name, nameLen) == 0) {
-      const char *value = line + nameLen;
-      while (*value == ' ' || *value == '\t') {
+  if (nameLen >= sizeof(head)) {
+    return false;
+  }
+  while (line < hdrLen) {
+    u16_t eol = pbuf_memfind(hdr, "\r\n", 2, line);
+    if (eol > hdrLen) {  // not found (0xFFFF), or in the body
+      eol = hdrLen;
+    }
+    if ((size_t)(eol - line) >= nameLen &&
+        pbuf_copy_partial(hdr, head, nameLen, line) == nameLen &&
+        strncasecmp(head, name, nameLen) == 0) {
+      u16_t value = line + nameLen;
+      while (value < eol && (pbuf_get_at(hdr, value) == ' ' ||
+                             pbuf_get_at(hdr, value) == '\t')) {
         value++;
       }
-      size_t len = strcspn(value, "\r\n");
+      u16_t end = value;
+      while (end < eol && pbuf_get_at(hdr, end) != '\r' &&
+             pbuf_get_at(hdr, end) != '\n') {
+        end++;
+      }
+      size_t len = end - value;
       if (len >= outLen) {
         *tooLong = true;
         return false;
       }
-      memcpy(out, value, len);
+      pbuf_copy_partial(hdr, out, len, value);
       out[len] = '\0';
       return len > 0;
     }
-    line = strstr(line, "\r\n");
-    if (line != NULL) {
-      line += 2;
-    }
+    line = eol + 2;
   }
   return false;
 }
@@ -298,18 +317,12 @@ static err_t httpClientHeaderCheckSizeFn(__unused httpc_state_t *connection,
                                          __unused void *arg, struct pbuf *hdr,
                                          u16_t hdrLen,
                                          __unused u32_t contentLen) {
-  char *headerData = malloc(hdrLen + 1);
-  if (headerData == NULL) {
-    downloadError = DOWNLOAD_TRANSFER_ERROR;
-    return ERR_MEM;  // Memory allocation failed
-  }
-  pbuf_copy_partial(hdr, headerData, hdrLen, 0);
-  headerData[hdrLen] = '\0';  // Null-terminate the string
-
   // The status line comes first: "HTTP/1.x NNN ...".
+  char statusLine[DOWNLOAD_STATUS_LINE_SIZE] = {0};
+  pbuf_copy_partial(hdr, statusLine, sizeof(statusLine) - 1, 0);
   httpStatus = 0;
-  if (strncmp(headerData, "HTTP/", 5) == 0) {
-    const char *statusStart = strchr(headerData, ' ');
+  if (strncmp(statusLine, "HTTP/", 5) == 0) {
+    const char *statusStart = strchr(statusLine, ' ');
     if (statusStart != NULL) {
       httpStatus = atoi(statusStart + 1);
     }
@@ -322,7 +335,7 @@ static err_t httpClientHeaderCheckSizeFn(__unused httpc_state_t *connection,
     if (redirectHops >= DOWNLOAD_MAX_REDIRECTS) {
       DPRINTF("More than %d redirects\n", DOWNLOAD_MAX_REDIRECTS);
       downloadError = DOWNLOAD_TOOMANYREDIRECTS_ERROR;
-    } else if (findHeaderValue(headerData, "Location:", location,
+    } else if (findHeaderValue(hdr, hdrLen, "Location:", location,
                                sizeof(location), &tooLong) &&
                resolveRedirectUrl(location, nextUrl, sizeof(nextUrl))) {
       DPRINTF("HTTP %d redirect to: %s\n", httpStatus, nextUrl);
@@ -333,11 +346,9 @@ static err_t httpClientHeaderCheckSizeFn(__unused httpc_state_t *connection,
       downloadError =
           tooLong ? DOWNLOAD_URLTOOLONG_ERROR : DOWNLOAD_HTTPSTATUS_ERROR;
     }
-    free(headerData);
     return redirectPending ? ERR_OK : ERR_ABRT;
   }
 
-  free(headerData);
   if (httpStatus < 200 || httpStatus >= 300) {
     DPRINTF("HTTP status %d: aborting before the body\n", httpStatus);
     downloadError = DOWNLOAD_HTTPSTATUS_ERROR;

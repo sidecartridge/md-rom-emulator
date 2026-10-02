@@ -47,6 +47,8 @@ If there is no ROM binary file loaded, the app will display a **setup screen**. 
 When you select the **[B]rowse** option, the app will display a list of available ROM files on the microSD card. You can navigate through the list using the keyboard and select a ROM file to load it.
 When you select the **[D]ownload** option, the app will show you the list of available ROM files from the internet. You can select a ROM file to download it to your microSD card.
 
+The catalog and the ROMs come over HTTPS, from `https://roms.sidecartridge.com/roms.csv` by default. To use a catalog of your own, set its URL in the `HTTPS_CATALOG` setting (**[S]ettings**); it can be `https://` or `http://`, and the ROMs are fetched from the same server. The connection is encrypted, but the server's certificate is not verified.
+
 ### 🚀 Launching a ROM
 
 When you select the **[L]aunch** option, the app will attempt to run the selected ROM file. If the ROM is valid and compatible, it will be loaded into memory and executed. The computer will then behave as if the ROM was loaded from a physical cartridge, even after a power cycle or reset.

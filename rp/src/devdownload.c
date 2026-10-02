@@ -33,7 +33,9 @@ static MD5Context md5Context;
 static bool namedExisted;
 static FSIZE_t namedSize;
 static absolute_time_t startedAt;
-static uint8_t hashChunk[4096];
+// 1 KB: an HTTPS debug build has no RAM for more.
+#define DEVDOWNLOAD_HASH_CHUNK 1024
+static uint8_t hashChunk[DEVDOWNLOAD_HASH_CHUNK];
 
 static const char *devdownload_folder(void) {
   SettingsConfigEntry *entry =
@@ -155,7 +157,7 @@ void devdownload_poll(void) {
     return;
   }
   if (devdownloadState.state == DEVDOWNLOAD_HASHING) {
-    // One chunk per call: about 2 ms of SD reads at a time.
+    // One chunk per call: about 0.5 ms of SD reads at a time.
     UINT got = 0;
     FRESULT res = f_read(&hashFile, hashChunk, sizeof(hashChunk), &got);
     if (res != FR_OK) {
