@@ -8,7 +8,13 @@
 typedef unsigned int UINT;
 typedef uint32_t FSIZE_t;
 typedef unsigned char BYTE;
-typedef enum { FR_OK = 0, FR_DISK_ERR, FR_NO_FILE = 4, FR_NO_PATH = 5 } FRESULT;
+typedef enum {
+  FR_OK = 0,
+  FR_DISK_ERR,
+  FR_NO_FILE = 4,
+  FR_NO_PATH = 5,
+  FR_NOT_ENOUGH_CORE = 17
+} FRESULT;
 #define FA_READ 0x01
 
 typedef struct {

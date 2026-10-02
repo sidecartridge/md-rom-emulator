@@ -40,8 +40,13 @@ static bool readerOpen(reader_t *reader, const char *path, uint32_t offset,
   memset(reader, 0, sizeof(*reader));
   FRESULT res = f_open(&reader->file, path, FA_READ);
   if (res != FR_OK) {
-    *result = (res == FR_NO_FILE || res == FR_NO_PATH) ? CATALOG_NOT_FOUND
-                                                       : CATALOG_READ_ERROR;
+    if (res == FR_NO_FILE || res == FR_NO_PATH) {
+      *result = CATALOG_NOT_FOUND;
+    } else if (res == FR_NOT_ENOUGH_CORE) {
+      *result = CATALOG_NO_MEMORY;  // no heap for FatFs's long-name buffer
+    } else {
+      *result = CATALOG_READ_ERROR;
+    }
     return false;
   }
   if (offset != 0U && f_lseek(&reader->file, offset) != FR_OK) {

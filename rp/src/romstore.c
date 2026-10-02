@@ -137,6 +137,10 @@ romstore_result_t romstore_write(const char *path, uint32_t flashOffset,
   if (res == FR_NO_FILE || res == FR_NO_PATH) {
     return ROMSTORE_NOT_FOUND;
   }
+  if (res == FR_NOT_ENOUGH_CORE) {
+    // FatFs's long-name buffer is on the heap.
+    return ROMSTORE_NO_MEMORY;
+  }
   if (res != FR_OK) {
     return ROMSTORE_READ_ERROR;
   }
