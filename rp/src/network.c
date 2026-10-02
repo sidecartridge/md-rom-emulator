@@ -1,5 +1,7 @@
 #include "include/network.h"
 
+#include "lwip/etharp.h"
+
 static bool cyw43Initialized = false;
 static wifi_mode_t wifiCurrentMode = WIFI_MODE_STA;
 static wifi_network_info_t wifiNetworkInfo = {.rssi = INT16_MIN};
@@ -676,11 +678,11 @@ static bool staConnecting = false;
 static wifi_sta_conn_status_t staPrevStatus = DISCONNECTED;
 static absolute_time_t staStatusTime;
 static absolute_time_t staTimeout;
-
-wifi_sta_conn_process_status_t network_wifiStaConnectStart() {
 // No network by that name: when the join may be armed again (see the poll).
 static absolute_time_t staRearmAt;
 #define STA_REARM_MS 2000U
+
+wifi_sta_conn_process_status_t network_wifiStaConnectStart() {
   if (!cyw43Initialized) {
     DPRINTF("WiFi not initialized. Cancelling connection\n");
     return NETWORK_WIFI_STA_CONN_ERR_NOT_INITIALIZED;
@@ -924,8 +926,6 @@ wifi_sta_conn_process_status_t network_wifiStaConnectPoll() {
             status);
     staPrevStatus = status;
   }
-  if (status != CONNECTED_WIFI_IP) {
-    return NETWORK_WIFI_STA_CONN_IN_PROGRESS;
   if (status == CONNECT_FAILED_ERROR &&
       absolute_time_diff_us(staRearmAt, get_absolute_time()) >= 0) {
     // No network by that name (an AP refusing a station that has just left
@@ -942,6 +942,8 @@ wifi_sta_conn_process_status_t network_wifiStaConnectPoll() {
     staRearmAt = make_timeout_time_ms(STA_REARM_MS);
     return NETWORK_WIFI_STA_CONN_IN_PROGRESS;
   }
+  if (status != CONNECTED_WIFI_IP) {
+    return NETWORK_WIFI_STA_CONN_IN_PROGRESS;
   }
 #ifdef BLINK_H
   blink_on();
@@ -1128,4 +1130,93 @@ const char *network_getSignalQualityLabel(int32_t rssi) {
   if (rssi >= -70) return "Weak";
   if (rssi >= -80) return "Very weak";
   return "Unusable";
+}
+
+// The link, from md-devops' link supervisor (network.c, v1.1.0).
+bool network_isLinkHealthy(void) {
+  if (!cyw43Initialized || wifiCurrentMode != WIFI_MODE_STA) {
+    return false;
+  }
+  return cyw43_tcpip_link_status(&cyw43_state, CYW43_ITF_STA) == CYW43_LINK_UP;
+}
+
+// The silent case: the radio leaves the network and both the driver and lwIP
+// keep reporting success, so nothing above notices. An ARP request for the
+// default gateway is the cheapest question that has to be answered over the
+// air: no sockets, no DNS, no internet, one small frame. The ARP cache is
+// flushed first, because a stale entry would answer for a dead network; that
+// costs one re-ARP for whoever is talked to next, hence minutes between.
+static absolute_time_t nextProbeAt;
+static absolute_time_t probeDeadline;
+static bool probeInFlight = false;
+static bool probeStarted = false;
+static uint32_t probeFailures = 0;
+
+static bool network_gatewayKnown(struct netif *nif) {
+  const ip4_addr_t *gateway = netif_ip4_gw(nif);
+  struct eth_addr *eth = NULL;
+  const ip4_addr_t *entryIp = NULL;
+  return etharp_find_addr(nif, gateway, &eth, &entryIp) >= 0;
+}
+
+bool network_pollGatewayProbe(void) {
+  if (!network_isLinkHealthy()) {
+    return false;
+  }
+  struct netif *nif = &cyw43_state.netif[CYW43_ITF_STA];
+  const ip4_addr_t *gateway = netif_ip4_gw(nif);
+  if (gateway == NULL || ip4_addr_isany(gateway)) {
+    return false;  // nothing to ask
+  }
+  absolute_time_t now = get_absolute_time();
+  if (!probeStarted) {
+    probeStarted = true;
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+    return false;
+  }
+  if (probeInFlight) {
+    if (network_gatewayKnown(nif)) {
+      probeInFlight = false;
+      probeFailures = 0;
+      nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+      return false;
+    }
+    if (absolute_time_diff_us(now, probeDeadline) > 0) {
+      return false;  // still waiting for the reply
+    }
+    probeInFlight = false;
+    probeFailures++;
+    DPRINTF("WiFi probe: gateway did not answer (%lu/%u)\n",
+            (unsigned long)probeFailures, (unsigned)NETWORK_PROBE_FAILURES);
+    if (probeFailures >= NETWORK_PROBE_FAILURES) {
+      probeFailures = 0;
+      nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_INTERVAL_MS);
+      DPRINTF("WiFi probe: network unreachable while the link is up\n");
+      return true;
+    }
+    // Asked again sooner than the full interval while it looks doubtful.
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_RETRY_MS);
+    return false;
+  }
+  if (absolute_time_diff_us(now, nextProbeAt) > 0) {
+    return false;  // not time yet
+  }
+  cyw43_arch_lwip_begin();
+  etharp_cleanup_netif(nif);
+  err_t err = etharp_request(nif, gateway);
+  cyw43_arch_lwip_end();
+  if (err != ERR_OK) {
+    DPRINTF("WiFi probe: could not send the ARP request (%d)\n", (int)err);
+    nextProbeAt = delayed_by_ms(now, NETWORK_PROBE_RETRY_MS);
+    return false;
+  }
+  probeInFlight = true;
+  probeDeadline = delayed_by_ms(now, NETWORK_PROBE_TIMEOUT_MS);
+  return false;
+}
+
+void network_resetGatewayProbe(void) {
+  probeInFlight = false;
+  probeStarted = false;
+  probeFailures = 0;
 }

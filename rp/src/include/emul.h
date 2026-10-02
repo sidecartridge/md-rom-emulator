@@ -102,8 +102,9 @@ void emul_start();
 //                  tools/dev/download_harness.py drives it and reads the
 //                  outcome.
 #define DEVHOOKS_APP_DOWNLOAD 2
-//   wifi 0|1       take Wi-Fi down (0, as a lost network) or connect it again
-//                  (1), for the offline paths of [D]ownload.
+//   wifi 0|1       take Wi-Fi down (0: the station leaves the AP, as a lost
+//                  network would, and the link check notices) or make the
+//                  next try now instead of after the backoff (1).
 #define DEVHOOKS_APP_WIFI 3
 //   health N       provoke a failure from the main loop, 250 ms later
 //                  (health.h's health_test_t): 1 panic, 2 HardFault, 3 hang,

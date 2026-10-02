@@ -137,6 +137,20 @@ static NetState netState = NET_OFF;
 static const char *netReason = "Wi-Fi is not configured.";
 static int netAttempts = 0;
 #define NET_CONNECT_ATTEMPTS 3
+// Joining again, as md-devops' link supervisor does: after a lost link (a
+// grace period first, since an ordinary reconnect can finish by itself) and
+// after a join that did not work, one more try each time, later and later,
+// never while a download runs (it fails first). Not for what a try cannot
+// fix (no Wi-Fi settings, a chip that did not start).
+#define NET_LINK_DOWN_GRACE_MS 5000U
+#define NET_REJOIN_BACKOFF_MIN_MS 5000U
+#define NET_REJOIN_BACKOFF_MAX_MS 60000U
+static bool netRetry = false;
+static absolute_time_t netNextTryAt;
+static uint32_t netBackoffMs = NET_REJOIN_BACKOFF_MIN_MS;
+// Tries made since boot, and links lost: for SWD.
+uint32_t netRejoins = 0;
+uint32_t netLinkLosses = 0;
 
 // The catalog on the card, <FOLDER>/roms.csv, refreshed once the network is
 // up; the card's copy is replaced only by a complete download.
@@ -851,17 +865,15 @@ static void netConnect(void);
 
 #if defined(_DEBUG) && (_DEBUG != 0)
 // The Wi-Fi debug hook: down as a lost network would be (the station leaves
-// the AP), or a new connection.
+// the AP, and netPoll() notices as it would a real loss), or the next try at
+// once instead of after the backoff.
 static void netTestWifi(bool connect) {
   if (connect) {
-    netAttempts = 0;
-    netConnect();
+    netBackoffMs = NET_REJOIN_BACKOFF_MIN_MS;
+    netNextTryAt = get_absolute_time();
   } else {
     cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
-    netState = NET_FAILED;
-    netReason = "Wi-Fi went down.";
   }
-  menuStatusChanged();
 }
 #endif
 
@@ -873,9 +885,19 @@ static void netConnect(void) {
     return;
   }
   netState = NET_FAILED;
-  netReason = (result == NETWORK_WIFI_STA_CONN_ERR_NO_SSID)
-                  ? "Wi-Fi is not configured."
-                  : "Wi-Fi did not connect.";
+  netRetry = (result != NETWORK_WIFI_STA_CONN_ERR_NO_SSID);
+  netReason =
+      netRetry ? "Did not connect; trying again." : "Wi-Fi is not configured.";
+}
+
+// The next try after a failure, later each time up to the maximum.
+static void netScheduleRetry(void) {
+  netRetry = true;
+  netNextTryAt = make_timeout_time_ms(netBackoffMs);
+  netBackoffMs *= 2U;
+  if (netBackoffMs > NET_REJOIN_BACKOFF_MAX_MS) {
+    netBackoffMs = NET_REJOIN_BACKOFF_MAX_MS;
+  }
 }
 
 // At boot, once the menu is up. Booster owns the Wi-Fi settings.
@@ -888,15 +910,64 @@ static void netStart(void) {
     netReason = "Wi-Fi is not configured.";
   } else if (network_wifiInit(WIFI_MODE_STA) != 0) {
     netState = NET_FAILED;
+    netRetry = false;
     netReason = "The Wi-Fi chip did not start.";
   } else {
     netConnect();
+    if (netState == NET_FAILED && netRetry) {
+      netScheduleRetry();
+    }
   }
   menuStatusChanged();
 }
 
-// One step of the connection, from the main loop: three attempts, as before.
+// Connected: is the link still there? The link status catches an ordinary
+// disconnect, the gateway probe a silent one.
+static void netWatchLink(void) {
+  if (network_isLinkHealthy() && !network_pollGatewayProbe()) {
+    return;
+  }
+  DPRINTF("Wi-Fi: the link is down; joining again in %u ms\n",
+          (unsigned)NET_LINK_DOWN_GRACE_MS);
+  netLinkLosses++;
+  netState = NET_FAILED;
+  netReason = "Wi-Fi lost; joining again.";
+  netRetry = true;
+  netBackoffMs = NET_REJOIN_BACKOFF_MIN_MS;
+  netNextTryAt = make_timeout_time_ms(NET_LINK_DOWN_GRACE_MS);
+  menuStatusChanged();
+}
+
+// Not connected: the next try, when it is due and no download runs.
+static void netRetryIfDue(void) {
+  if (!netRetry || downloadKind != DOWNLOAD_KIND_NONE ||
+      absolute_time_diff_us(get_absolute_time(), netNextTryAt) > 0) {
+    return;
+  }
+  netRejoins++;
+  DPRINTF("Wi-Fi: try %lu\n", (unsigned long)netRejoins);
+  // One attempt per try: the backoff, not the attempts, spaces them.
+  netAttempts = NET_CONNECT_ATTEMPTS - 1;
+  health_feed();
+  netConnect();
+  health_feed();
+  if (netState == NET_FAILED && netRetry) {
+    netScheduleRetry();
+  }
+  menuStatusChanged();
+}
+
+// From the main loop: the connection under way (three attempts at boot, one
+// per later try), the link while connected, the next try while not.
 static void netPoll(void) {
+  if (netState == NET_UP) {
+    netWatchLink();
+    return;
+  }
+  if (netState == NET_FAILED) {
+    netRetryIfDue();
+    return;
+  }
   if (netState != NET_CONNECTING) {
     return;
   }
@@ -907,6 +978,8 @@ static void netPoll(void) {
   }
   if (result == NETWORK_WIFI_STA_CONN_OK) {
     netState = NET_UP;
+    netBackoffMs = NET_REJOIN_BACKOFF_MIN_MS;
+    network_resetGatewayProbe();
     catalogRefreshStart();
   } else if (result == NETWORK_WIFI_STA_CONN_ERR_TIMEOUT &&
              netAttempts < NET_CONNECT_ATTEMPTS) {
@@ -916,7 +989,8 @@ static void netPoll(void) {
     }
   } else {
     netState = NET_FAILED;
-    netReason = "Wi-Fi did not connect.";
+    netReason = "Did not connect; trying again.";
+    netScheduleRetry();
   }
   menuStatusChanged();
 }
