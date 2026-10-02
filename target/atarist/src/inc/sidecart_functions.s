@@ -4,9 +4,12 @@
 _p_cookies                              equ $5a0    ; pointer to the system Cookie-Jar
 
 COOKIE_JAR_MEGASTE                      equ $00010010 ; Mega STE computer
+COOKIE_JAR_TT                           equ $00020000 ; TT; the Falcon is $00030000: both a 68030
+MEGASTE_SPEED_CACHE_REG                 equ $FFFF8E21 ; Mega STE: bit 0 the cache, bit 1 16 MHz (no cache at 8 MHz)
 SHARED_VARIABLE_SHARED_FUNCTIONS_SIZE   equ 16      ; Size of the shared variables for the shared functions
 SHARED_VARIABLE_HARDWARE_TYPE           equ 0       ; Hardware type of the Atari ST computer
 SHARED_VARIABLE_SVERSION                equ 1       ; TOS version from Sversion
+HARDWARE_TYPE_ADDR                      equ (SHARED_VARIABLES + (SHARED_VARIABLE_HARDWARE_TYPE * 4)) ; what detect_hw wrote
 
 COMMAND_SYNC_CODE_SIZE                  equ (4 + _end_sync_code_in_stack - _start_sync_code_in_stack)
 COMMAND_SYNC_WRITE_CODE_SIZE            equ (4 + _end_sync_write_code_in_stack - _start_sync_write_code_in_stack)
@@ -81,8 +84,38 @@ get_tos_version:
     move.l #SHARED_VARIABLE_SVERSION, d3    ; Variable index
     move.l d0, d4                           ; Variable value
     send_sync CMD_SET_SHARED_VAR, 8
+    ; No retry here: send_sync already retries CMD_RETRIES_COUNT times, each with
+    ; the full timeout, and looping on top of that would hang the boot for ever
+    ; when the RP did not answer. On failure the shared variable is left as it
+    ; was. d0 carries the error code, and Z is set exactly when it is 0.
     tst.w d0
-    bne.s get_tos_version       ; Test if the command was successful. If not, retry
+    rts
+
+; A TT's or a Falcon's 68030 runs the wait loop from its instruction cache,
+; which does not see the copy a sender has just made: it may still hold, line
+; by line, a loop left at the same place before - the other sender's, which
+; counts in another register, or another module's, with its own timeout - and
+; run a mix of them. A command then gave up early and was sent again: on the
+; Falcon every other GEMDRIVE Fopen and Fcreate reached the RP twice, and
+; reads came back from the wrong place. Clear it, as TOS's own clrcache does.
+; The drivers call it after a read into memory too, where code may have just
+; arrived, as TOS's floppy driver clears its caches after every Rwabs read. The
+; machine is detect_hw's; before it has run, and on every other machine,
+; nothing is done. A 68000 has no CACR, and is told by _longframe before any
+; variable is read: the setup menu, in main.s, sends before any driver has
+; written the machine, and reading the wrong place put a Mega STE into four
+; bombs. Keeps every register.
+clear_icache_after_copy:
+    tst.w $59e.w                        ; _longframe: 0 on a 68000
+    beq.s .clear_icache_done
+    cmp.l #COOKIE_JAR_TT, HARDWARE_TYPE_ADDR
+    bcs.s .clear_icache_done
+    move.l d7, -(sp)
+    dc.w $4e7a, $7002                   ; movec cacr, d7
+    or.w #$0008, d7                     ; CI: clear the instruction cache
+    dc.w $4e7b, $7002                   ; movec d7, cacr
+    move.l (sp)+, d7
+.clear_icache_done:
     rts
 
 ; Send an sync command to the Sidecart
@@ -118,6 +151,7 @@ send_sync_command_to_sidecart:
 _copy_sync_code:
         move.w (a1)+, (a2)+
         dbf d7, _copy_sync_code
+        bsr clear_icache_after_copy
     endif
 
     ; The sync command synchronize with a random token
@@ -224,7 +258,16 @@ _start_sync_code_in_stack:
     moveq #0, d0                             ; No Timeout
 _start_sync_code_in_stack_loop:
     cmp.l (a1), d2                           ; Compare the random number with the token
-    beq.s _sync_token_found                  ; Token found, we can finish succesfully
+    bne.s _sync_token_not_ready
+    ; A token match alone is not an answer. The RP writes the token and then the
+    ; new seed as two separate stores, and the token we sent IS the seed we read:
+    ; accepted between the two stores, the next command would read the old seed,
+    ; reuse it as its token and match this same answer at once. Requiring the
+    ; seed to have advanced makes the pair a two-phase commit, and also covers a
+    ; freshly zeroed area where token and seed are both 0.
+    cmp.l RANDOM_TOKEN_SEED_ADDR, d2         ; Seed must advance to prove a real response
+    bne.s _sync_token_found                  ; Token found, we can finish succesfully
+_sync_token_not_ready:
     subq.l #1, d7                            ; Decrement the inner loop
     bne.s _start_sync_code_in_stack_loop     ; If the inner loop is not finished, continue
 
@@ -236,6 +279,9 @@ _sync_token_found:
 ;_postwait_me:
 ;    dbf d7, _postwait_me
 ;_no_wait_me:
+    ; Callers may branch on the flags instead of testing d0 (acsi.s does), so
+    ; return with Z set exactly when d0 is 0, whatever compare ran last.
+    tst.w d0
     rts                                 ; Return to the code
 _end_sync_code_in_stack:
 
@@ -270,13 +316,14 @@ send_sync_write_command_to_sidecart:
     endif
 
     ifne COMMAND_SYNC_USE_DSKBUF != 0   ; Copy the code for stack and disk buffer
-        move.l #COMMAND_SYNC_CODE_SIZE, d7
+        move.l #COMMAND_SYNC_WRITE_CODE_SIZE, d7
         lea _start_sync_write_code_in_stack, a1    ; a1 points to the start of the code in ROM
         lsr.w #1, d7
         subq #1, d7
 _copy_sync_code_write:
         move.w (a1)+, (a2)+
         dbf d7, _copy_sync_code_write
+        bsr clear_icache_after_copy
     endif
 
 ; Adjust the payload size to include the buffer
@@ -359,8 +406,8 @@ _copy_sync_code_write:
     subq.w #1, d5            ; one less
 
     ; Test if the address in A4 is even or odd
-    move.l a4, d0
-    btst #0, d0
+    move.l a4, d4
+    btst #0, d4
     beq.s _write_to_sidecart_even_loop
 _write_to_sidecart_odd_loop:
     move.b  (a4)+, d3       ; Load the high byte
@@ -372,17 +419,17 @@ _write_to_sidecart_odd_loop:
     bra.s _no_more_payload_write_stack
 
  _write_to_sidecart_even_loop:
-    move.w (a4)+, d0          ; Load the word
-    add.w d0, d7              ; Add the word to the checksum
-    tst.b (a0, d0.w)          ; Write the memory to the sidecart
+    move.w (a4)+, d4          ; Load the word
+    add.w d4, d7              ; Add the word to the checksum
+    tst.b (a0, d4.w)          ; Write the memory to the sidecart
     dbf d5, _write_to_sidecart_even_loop
     bra.s _no_more_payload_write_stack
 
  _write_to_sidecart_byteodd_loop:
     addq.l #1, d5             ; Add one byte to the payload before rounding to the next word
     lsr.w #1, d5              ; Copy two bytes each iteration
-    move.l a4, d0             ; Test if the address in A4 is even or odd
-    btst #0, d0
+    move.l a4, d4             ; Test if the address in A4 is even or odd
+    btst #0, d4
     beq.s _write_to_sidecart_byteodd_odd_loop
 
     subq.w #1, d5
@@ -396,11 +443,11 @@ _write_to_sidecart_byteodd_even_loop_copy:
     add.w d3, d7            ; Add the word to the checksum
     dbf d5, _write_to_sidecart_byteodd_even_loop_copy
 _write_to_sidecart_byteodd_loop_tail:
-    move.b (a4)+, d0          ; Load the high byte
-    lsl.w   #8, d0            ; Shift it to the high part of the word
-    and.w #$FF00,d0           ; Mask the upper word
-    add.w d0, d7              ; Add the word to the checksum
-    tst.b (a0, d0.w)          ; Write the memory to the sidecart
+    move.b (a4)+, d4          ; Load the high byte
+    lsl.w   #8, d4            ; Shift it to the high part of the word
+    and.w #$FF00,d4           ; Mask the upper word
+    add.w d4, d7              ; Add the word to the checksum
+    tst.b (a0, d4.w)          ; Write the memory to the sidecart
     bra.s _no_more_payload_write_stack
 
 _write_to_sidecart_byteodd_odd_loop:
@@ -408,15 +455,15 @@ _write_to_sidecart_byteodd_odd_loop:
     beq.s _write_to_sidecart_byteodd_odd_loop_tail
     subq.w #1, d5            ; one less
 _write_to_sidecart_byteodd_odd_loop_copy:
-    move.w (a4)+, d0          ; Load the word
-    add.w d0, d7              ; Add the word to the checksum
-    tst.b (a0, d0.w)          ; Write the memory to the sidecart
+    move.w (a4)+, d4          ; Load the word
+    add.w d4, d7              ; Add the word to the checksum
+    tst.b (a0, d4.w)          ; Write the memory to the sidecart
     dbf d5, _write_to_sidecart_byteodd_odd_loop_copy
 _write_to_sidecart_byteodd_odd_loop_tail:
-    move.w (a4)+, d0          ; Load the word
-    and.w #$FF00,d0           ; Mask the upper word
-    add.w d0, d7              ; Add the word to the checksum
-    tst.b (a0, d0.w)          ; Write the memory to the sidecart
+    move.w (a4)+, d4          ; Load the word
+    and.w #$FF00,d4           ; Mask the upper word
+    add.w d4, d7              ; Add the word to the checksum
+    tst.b (a0, d4.w)          ; Write the memory to the sidecart
 
 _no_more_payload_write_stack:
     add.w d7, d6              ; Add the checksum parameters to the buffer 
@@ -428,11 +475,14 @@ _no_more_payload_write_stack:
 ; This is the code that cannot run in ROM while waiting for the command to complete
 _start_sync_write_code_in_stack:
     swap d2                                        ; D2 is the only register that is not used as a scratch register
-    move.l #COMMAND_TIMEOUT, d6                    ; Most significant word is the inner loop, least significant word is the outer loop
+    move.l #COMMAND_WRITE_TIMEOUT, d6              ; Most significant word is the inner loop, least significant word is the outer loop
     moveq #0, d0                                   ; Timeout
 _start_sync_write_code_in_stack_loop:
     cmp.l (a1), d2                                 ; Compare the random number with the token
-    beq.s _sync_write_token_found                  ; Token found, we can finish succesfully
+    bne.s _sync_write_token_not_ready
+    cmp.l RANDOM_TOKEN_SEED_ADDR, d2               ; Seed must advance to prove a real response (see the read loop)
+    bne.s _sync_write_token_found                  ; Token found, we can finish succesfully
+_sync_write_token_not_ready:
     subq.l #1, d6                                  ; Decrement the inner loop
     bne.s _start_sync_write_code_in_stack_loop     ; If the inner loop is not finished, continue
 
@@ -444,6 +494,7 @@ _sync_write_token_found:
 ;_postwait_write_me:
 ;    dbf d6, _postwait_write_me
 ;_no_wait_write_me:
+    tst.w d0                            ; Z set exactly when d0 is 0 (see the read variant)
     rts                                 ; Return to the code
 
 _end_sync_write_code_in_stack:

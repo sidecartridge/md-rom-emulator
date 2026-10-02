@@ -1,8 +1,8 @@
 /**
  * File: reset.h
  * Author: Diego Parrilla Santamaría
- * Date: December 2025
- * Copyright: 2024 - GOODDATA LABS SL
+ * Date: December 2025, February 2026
+ * Copyright: 2024-2026 - GOODDATA LABS SL
  * Description: Header file for RESET functions of the booster app
  */
 
@@ -12,6 +12,8 @@
 #include "constants.h"
 #include "debug.h"
 #include "gconfig.h"
+#include "hardware/irq.h"
+#include "hardware/regs/m0plus.h"
 #include "hardware/sync.h"
 #include "hardware/watchdog.h"
 #include "pico/multicore.h"
@@ -31,22 +33,38 @@
  * printed.
  */
 static inline void reset_jump_to_booster(void) {
+  // The jump does not quieten our interrupts, and from the instruction that
+  // writes VTOR onwards they vector through Booster's table, into handlers it
+  // has not installed yet: the core locks up and Booster never runs. At the
+  // jump this app has the SDK's alarm IRQ and the Wi-Fi chip's host-wake GPIO
+  // IRQ enabled, and the latter fires whenever a packet arrives. Booster's
+  // start-up resets the peripherals, but not the NVIC in the core: mask and
+  // clear every interrupt here, and Booster enables what it needs itself.
+  irq_set_mask_enabled(0xFFFFFFFFu, false);
+  *((volatile uint32_t *)(PPB_BASE + M0PLUS_NVIC_ICPR_OFFSET)) = 0xFFFFFFFFu;
+  // Booster does not feed the watchdog: one left running would reset it.
+  watchdog_disable();
+  __dsb();
+  __isb();
   // This code jumps to the Booster application at the top of the flash memory.
   // The reason to perform this jump is for performance reasons.
   // It should be placed at the beginning of main() if the SELECT signal or
   // BOOSTER app is selected. Set VTOR register, set stack pointer, and jump to
   // reset.
+  // VTOR's address comes in a register: an "ldr r1, =VTOR" left its constant
+  // to the assembler's next literal pool, out of reach in a large caller (a
+  // CMake Release build of emul.c with DEBUG_MODE=1 stopped there). "l": a low
+  // register, as str needs one; r0 and r1 are used by name.
   __asm__ __volatile__(
       "mov r0, %[start]\n"
-      "ldr r1, =%[vtable]\n"
-      "str r0, [r1]\n"
+      "str r0, [%[vtable]]\n"
       "ldmia r0, {r0, r1}\n"
       "msr msp, r0\n"
       "bx r1\n"
       :
-      : [start] "r"((unsigned int)&_booster_app_flash_start + 256),
-        [vtable] "X"(PPB_BASE + M0PLUS_VTOR_OFFSET)
-      :);
+      : [start] "l"((unsigned int)&_booster_app_flash_start + 256),
+        [vtable] "l"(PPB_BASE + M0PLUS_VTOR_OFFSET)
+      : "r0", "r1", "memory");
   DPRINTF("You should never reach this point\n");
 }
 

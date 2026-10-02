@@ -1,53 +1,28 @@
 /**
  * File: term.h
  * Author: Diego Parrilla Santamaría
- * Date: January 20205
- * Copyright: 2025 - GOODDATA LABS SL
+ * Date: January 20205, February 2026
+ * Copyright: 2025-2026 - GOODDATA LABS SL
  * Description: Header for the terminal
  */
 
 #ifndef TERM_H
 #define TERM_H
 
+#include <stddef.h>
 #include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
 
-#include "aconfig.h"
-#include "constants.h"
-#include "debug.h"
-#include "display_term.h"
-#include "hardware/dma.h"
-#include "memfunc.h"
-#include "reset.h"
-#include "time.h"
+#include "pico.h"
 #include "tprotocol.h"
-
-#define ADDRESS_HIGH_BIT 0x8000  // High bit of the address
-
-#ifndef ROM3_GPIO
-#define ROM3_GPIO 26
-#endif
 
 #ifndef ROM4_GPIO
 #define ROM4_GPIO 22
 #endif
 
-// Use the highest 4K of the shared memory for the terminal commands
-#define TERM_RANDOM_TOKEN_OFFSET \
-  0xF000  // Random token offset in the shared memory
-#define TERM_RANDON_TOKEN_SEED_OFFSET \
-  (TERM_RANDOM_TOKEN_OFFSET +         \
-   4)  // Random token seed offset in the shared memory: 0xF004
-
-// The shared variables are located in the + 0x200 offset
-#define TERM_SHARED_VARIABLES_OFFSET \
-  (TERM_RANDOM_TOKEN_OFFSET +        \
-   0x200)  // Shared variables offset in the shared memory: 0xF200
-
-// Shared variables for common use. Must be set in the init function
-#define TERM_HARDWARE_TYPE (0)     // Hardware type. 0xF200
-#define TERM_HARDWARE_VERSION (1)  // Hardware version.  0xF204
+// Random-token publish and shared-variable layout are owned by chandler
+// (see CHANDLER_RANDOM_TOKEN_OFFSET / CHANDLER_SHARED_VARIABLES_OFFSET in
+// chandler.h). The previous TERM_*_OFFSET / TERM_HARDWARE_* defines were
+// removed when chandler took over.
 
 // App commands for the terminal
 #define APP_TERMINAL 0x00  // The terminal app
@@ -59,7 +34,7 @@
 #ifdef DISPLAY_ATARIST
 // Terminal size for Atari ST
 #define TERM_SCREEN_SIZE_X 40
-#define TERM_SCREEN_SIZE_Y 25
+#define TERM_SCREEN_SIZE_Y 24  // Leave last line for status
 #define TERM_SCREEN_SIZE (TERM_SCREEN_SIZE_X * TERM_SCREEN_SIZE_Y)
 
 #define TERM_DISPLAY_BYTES_PER_CHAR 8
@@ -80,6 +55,19 @@
 #define TERM_KEYBOARD_KEY_START 0x20         // Start of the ASCII table
 #define TERM_KEYBOARD_KEY_END 0x7E           // End of the ASCII table
 #define TERM_KEYBOARD_KEY_MASK 0xFF          // Mask for the key
+
+// The cursor keys: the ST sends them as ASCII 0 with these scan codes, and a
+// key handler (term_setKeyHandler) gets them as the TERM_KEY_* codes below
+// (md-drives-emulator's values).
+#define TERM_KEYBOARD_SCAN_CODE_UP 72
+#define TERM_KEYBOARD_SCAN_CODE_DOWN 80
+#define TERM_KEYBOARD_SCAN_CODE_LEFT 75
+#define TERM_KEYBOARD_SCAN_CODE_RIGHT 77
+#define TERM_KEY_UP 16
+#define TERM_KEY_DOWN 14
+#define TERM_KEY_LEFT 2
+#define TERM_KEY_RIGHT 6
+#define TERM_KEY_ESC 27
 #define TERM_KEYBOARD_SHIFT_MASK 0xFF000000  // Mask for the shift key
 #define TERM_KEYBOARD_SHIFT_SHIFT 24         // Shift for the shift key
 #define TERM_KEYBOARD_SCAN_MASK 0xFF0000     // Mask for the scan code
@@ -103,7 +91,14 @@ typedef struct {
   void (*handler)(const char *arg);
 } Command;
 
-void __not_in_flash_func(term_dma_irq_handler_lookup)(void);
+/**
+ * @brief chandler callback that publishes a parsed protocol command
+ *        into the terminal double-buffer for term_loop() to drain.
+ *
+ * Register with chandler_addCB() during application init.
+ */
+void __not_in_flash_func(term_command_cb)(TransmissionProtocol *protocol,
+                                          uint16_t *payloadPtr);
 
 void term_init(void);
 
@@ -118,6 +113,20 @@ void term_init(void);
  * @param str The string to print.
  */
 void term_printString(const char *str);
+
+/**
+ * @brief Writes text at a row and column without moving the cursor: the
+ * screen buffer and the glyphs, cut at the row's end. For screens drawn in
+ * place: a cursor move blanks the cell the cursor leaves.
+ */
+void term_printAt(uint8_t row, uint8_t col, const char *text);
+
+/**
+ * @brief Writes text into the screen buffer only, at a row and column, cut
+ * at the row's end: for words the caller draws itself, in another font, so
+ * the buffer still holds what the screen says.
+ */
+void term_recordAt(uint8_t row, uint8_t col, const char *text);
 
 /**
  * @brief Clear the terminal display area
@@ -136,6 +145,46 @@ void term_clearScreen(void);
  * commands.
  */
 void term_setCommands(const Command *cmds, size_t count);
+/**
+ * @brief Clears the terminal's input buffer.
+ *
+ * This function removes any pending characters in the input buffer,
+ * ensuring that subsequent input operations start with a clean state.
+ */
+void term_clearInputBuffer(void);
+
+/**
+ * @brief While a handler is set, every keystroke goes to it, the cursor keys
+ * as TERM_KEY_*, instead of to the line editor. NULL gives the keys back.
+ */
+typedef void (*TermKeyHandler)(char key);
+void term_setKeyHandler(TermKeyHandler handler);
+
+// How keys reach the commands: a key is a command, the one named by that
+// letter, with no echo and no RETURN (the menu); or a line, echoed, run on
+// RETURN (the settings).
+typedef enum {
+  TERM_COMMAND_LEVEL_SINGLE_KEY = 0,
+  TERM_COMMAND_LEVEL_COMMAND_INPUT = 1,
+} TermCommandLevel;
+void term_setCommandLevel(TermCommandLevel level);
+
+/**
+ * @brief While busy, keystrokes are dropped instead of running commands, as
+ * they are while a command runs: for long work outside a command whose waits
+ * call term_loop(), such as a ROM written to flash at boot.
+ */
+void term_setBusy(bool busy);
+
+/**
+ * @brief Retrieve the current terminal input buffer.
+ *
+ * This function returns a pointer to the buffer holding the input from the
+ * terminal. The buffer is used for processing terminal input.
+ *
+ * @return char* A pointer to the terminal's input buffer.
+ */
+char *term_getInputBuffer(void);
 
 // Generic commands to be used in the terminal
 // Manage application setttings
@@ -147,6 +196,9 @@ void term_cmdGet(const char *arg);
 void term_cmdPutInt(const char *arg);
 void term_cmdPutBool(const char *arg);
 void term_cmdPutString(const char *arg);
+void term_printNetworkInfo(void);
+void term_markMenuPromptCursor(void);
+void term_refreshMenuLiveInfo(void);
 
 void __not_in_flash_func(term_loop)();
 

@@ -1,0 +1,34 @@
+/**
+ * File: commemul.h
+ * Author: Diego Parrilla Santamaría
+ * Date: March 2026
+ * Copyright: 2026 - GOODDATA LABS SL
+ * Description: ROM3 communication emulator backed by a DMA ring buffer.
+ */
+
+#ifndef COMMEMUL_H
+#define COMMEMUL_H
+
+#include <inttypes.h>
+#include <stdbool.h>
+
+#include "pico/stdlib.h"
+
+typedef void (*CommEmulSampleCallback)(uint16_t sample);
+
+// Returns 0 on success, < 0 on failure (PIO program load failed). The
+// PIO state-machine and DMA-channel claims call the SDK's "panic on
+// exhaustion" variants, so those paths abort the whole boot rather
+// than returning here.
+int commemul_init(void);
+void __not_in_flash_func(commemul_poll)(CommEmulSampleCallback callback);
+
+// Times the reader fell a whole ring behind the capture and the unread samples
+// were dropped (also readable over SWD as commOverruns).
+uint32_t commemul_getOverruns(void);
+
+// Stops the capture: the state machine off and its DMA channel aborted, so
+// nothing of it runs past a reset or the jump to Booster.
+void commemul_stop(void);
+
+#endif  // COMMEMUL_H

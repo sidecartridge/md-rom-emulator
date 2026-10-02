@@ -1,8 +1,8 @@
 /**
  * File: emul.h
  * Author: Diego Parrilla Santamaría
- * Date: January 20205
- * Copyright: 2025 - GOODDATA LABS SL
+ * Date: January 2025, October 2026
+ * Copyright: 2025-2026 - GOODDATA LABS SL
  * Description: Header for the ROM emulator core and setup features
  */
 
@@ -34,22 +34,18 @@
 #define SLEEP_LOOP_MS 100
 
 #define MAX_ROMS 100
-#define MAX_ROMS_PER_PAGE 20
 #define MAX_FILENAME_LENGTH 36
 #define MAX_PATH_SIZE 128
 
 #define AUTORUN_BLINK_MS 200
 
+// A ROM file on the SD card as [B]rowse lists it: the name it opens by (the
+// long name when it fits, the card's 8.3 alias otherwise) and the name shown,
+// cut to the field. The list holds MAX_ROMS of them while it is open.
 typedef struct {
-  char filename[MAX_FILENAME_LENGTH];
-  // You can add other fields (e.g. file size, type, etc.)
-  char path[MAX_PATH_SIZE];
+  char open[MAX_FILENAME_LENGTH];
   char name[MAX_FILENAME_LENGTH];
-  char description[MAX_PATH_SIZE];
-  char tags[MAX_FILENAME_LENGTH];
-  int size;
-
-} ROM;
+} SdRom;
 
 enum {
   ROM_MODE_DIRECT = 0,  // ROM direct (no delay)
@@ -93,5 +89,31 @@ typedef struct {
  * user interaction and potential system resets.
  */
 void emul_start();
+
+// App commands for `tools/dev/swd.py app NAME [WORDS...]`, debug builds only;
+// the name after DEVHOOKS_APP_ is the one the tool takes.
+//   heap_hold KB   hold KB more kilobytes of heap (0 releases everything);
+//                  answers 0 when the allocation is refused, so repeated calls
+//                  walk the heap down to a known remainder.
+#define DEVHOOKS_APP_HEAP_HOLD 1
+//   download       download the URL the host wrote into devdownloadState
+//                  (devdownload.h) to the app folder, then hash it; answers 1
+//                  when started, 0 while one runs.
+//                  tools/dev/download_harness.py drives it and reads the
+//                  outcome.
+#define DEVHOOKS_APP_DOWNLOAD 2
+//   wifi 0|1       take Wi-Fi down (0: the station leaves the AP, as a lost
+//                  network would, and the link check notices) or make the
+//                  next try now instead of after the backoff (1).
+#define DEVHOOKS_APP_WIFI 3
+//   health N       provoke a failure from the main loop, 250 ms later
+//                  (health.h's health_test_t): 1 panic, 2 HardFault, 3 hang,
+//                  4 a 500 ms stall, 5 stack overflow. Each must end in a
+//                  reboot that names itself, but the stall.
+#define DEVHOOKS_APP_HEALTH 4
+//   sd 0|1         the SD card looks pulled (0: the presence check fails, at
+//                  once) or put back (1: the next poll mounts it), through
+//                  the path a real pull and reinsertion take.
+#define DEVHOOKS_APP_SD 5
 
 #endif  // EMUL_H

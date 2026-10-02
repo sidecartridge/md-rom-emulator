@@ -1,8 +1,8 @@
 /**
  * File: constants.h
  * Author: Diego Parrilla Santamaría
- * Date: November 2024
- * Copyright: 2025 - GOODDATA LABS SL
+ * Date: November 2024, February 2026
+ * Copyright: 2025-2026 - GOODDATA LABS SL
  * Description: Constants used in the placeholder file
  */
 
@@ -21,6 +21,19 @@
 // SELECT signal
 #define SELECT_GPIO 5  // GPIO signal for SELECT
 
+// SD card GPIO drive strength
+#define SD_SPI_GPIO_DRIVE_STRENGTH GPIO_DRIVE_STRENGTH_2MA
+
+// SD card SPI mode. Allowed values, from fatfs-sdk's my_spi.h and my_spi.c:
+// 0: CPOL=0, CPHA=0. Sample on leading rising edge, shift on falling edge.
+// 1: CPOL=0, CPHA=1. Sample on trailing falling edge, shift on rising edge.
+// 2: CPOL=1, CPHA=0. Sample on leading falling edge, shift on rising edge.
+// 3: CPOL=1, CPHA=1. Sample on trailing rising edge, shift on falling edge.
+// The driver asserts spi_mode < 4. Measured on a SidecarTridge Multi-device at
+// the default 24 MHz, reading 4 MB of raw sectors: mode 3 2,114 KB/s, mode 0
+// 1,894 KB/s, the same data from both.
+#define SD_SPI_MODE 3
+
 // GPIO constants for the read address from the bus
 #define READ_ADDR_GPIO_BASE 6     // Start of the GPIOs for the address
 #define READ_ADDR_PIN_COUNT 16    // Number of GPIOs for the address
@@ -36,14 +49,17 @@
   (READ_SIGNAL_GPIO_BASE + 1)  // GPIO signal for WRITE
 #define WRITE_SIGNAL_PIN_COUNT 1
 
-// FLASH and RAM sections constants.
-#define ROM_BANKS 2  // Number of ROM banks to emulate
+// FLASH and RAM sections constants. The window is two 64 KB banks: ROM4
+// ($FA0000) first, which holds the setup image, then ROM3 ($FB0000). A ROM the
+// user launches may use both (ROM mode); in setup mode ROM3 is the command
+// channel and its bank is unused.
+#define ROM_BANKS 2  // Number of 64KB banks in the window (ROM4 and ROM3)
 #define FLASH_ROM_LOAD_OFFSET \
-  0xE0000  // Offset start in FLASH reserved for ROMs. Survives a reset or
-           // poweroff.
-#define FLASH_ROM4_LOAD_OFFSET FLASH_ROM_LOAD_OFFSET  // First 64KB block
+  0x100000  // Offset of ROM_TEMP in FLASH (memmap_rp.ld): the ROM to serve,
+            // byte-swapped. Survives a reset or poweroff.
+#define FLASH_ROM4_LOAD_OFFSET FLASH_ROM_LOAD_OFFSET  // ROM4 bank
 #define FLASH_ROM3_LOAD_OFFSET \
-  (FLASH_ROM_LOAD_OFFSET + 0x10000)              // Second 64KB block
+  (FLASH_ROM_LOAD_OFFSET + 0x10000)  // ROM3 bank
 #define ROM_SIZE_BYTES 0x10000                   // 64KBytes
 #define ROM_SIZE_WORDS (ROM_SIZE_BYTES / 2)      // 32KWords
 #define ROM_SIZE_LONGWORDS (ROM_SIZE_BYTES / 4)  // 16KLongWords
@@ -78,12 +94,18 @@
 
 // NOLINTBEGIN(readability-identifier-naming)
 extern unsigned int __flash_binary_start;
-extern unsigned int _rom_temp_start;
+// ROM_TEMP, the 128 KB in flash the ROM is staged in. An array of unknown
+// size, like __rom_in_ram_start__: ROM mode copies all of it from here.
+extern unsigned int _rom_temp_start[];
 extern unsigned int _booster_app_flash_start;
 extern unsigned int _config_flash_start;
 extern unsigned int _global_lookup_flash_start;
 extern unsigned int _global_config_flash_start;
-extern unsigned int __rom_in_ram_start__;
+// The 64 KB cartridge window. An array of unknown size, not a scalar: code
+// reads and writes the whole window through this symbol, and a scalar
+// declaration tells the compiler the object is 4 bytes, which makes every
+// access past them undefined behaviour it may optimise on.
+extern unsigned int __rom_in_ram_start__[];
 // NOLINTEND(readability-identifier-naming)
 
 #endif  // CONSTANTS_H

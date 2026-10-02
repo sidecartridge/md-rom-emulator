@@ -1,31 +1,24 @@
 /**
  * File: display_term.h
  * Author: Diego Parrilla Santamaría
- * Date: January 2025
- * Copyright: 2025 - GOODDATA LABS SL
+ * Date: January 2025, February 2026
+ * Copyright: 2025-2026 - GOODDATA LABS SL
  * Description: Header file for the term mode diplay functions.
  */
 
 #ifndef DISPLAY_TERM_H
 #define DISPLAY_TERM_H
 
-#include <inttypes.h>
-#include <stdbool.h>
-#include <stdio.h>
-#include <string.h>
-
-#include "constants.h"
-#include "debug.h"
-#include "display.h"
-#include "hardware/dma.h"
-#include "memfunc.h"
-#include "u8g2.h"
+#include <stdint.h>
 
 #ifdef DISPLAY_ATARIST
 // Terminal size for Atari ST
 // If the display of the chars is from bottom to top, then you need to add a
 // ROW_OFFSET If it's top down, then set it to 0
 #define DISPLAY_TERM_FIRST_ROW_OFFSET 1
+// Keep cursor offset explicit and independent from glyph offset.
+// Current behavior intentionally draws cursor one row above glyph baseline.
+#define DISPLAY_TERM_CURSOR_ROW_OFFSET 0
 #define DISPLAY_TERM_CHAR_WIDTH 8
 #define DISPLAY_TERM_CHAR_HEIGHT 8
 #endif
@@ -54,6 +47,8 @@ void display_termChar(uint8_t col, uint8_t row, char chr);
  * This function renders a filled rectangular block on the display.
  * It calculates the position based on the provided column and row indices,
  * multiplied by the predefined character dimensions.
+ * The y-coordinate intentionally uses DISPLAY_TERM_CURSOR_ROW_OFFSET, which
+ * may differ from DISPLAY_TERM_FIRST_ROW_OFFSET used for glyphs.
  *
  * @param col The column index of the cursor position.
  * @param row The row index of the cursor position.

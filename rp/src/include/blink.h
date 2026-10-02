@@ -1,8 +1,8 @@
 /**
  * File: blink.h
  * Author: Diego Parrilla Santamaría
- * Date: November 2024
- * Copyright: 2024 - GOODDATA LABS SL
+ * Date: November 2024, February 2026
+ * Copyright: 2024-2026 - GOODDATA LABS SL
  * Description: Header file for the blinking functions
  */
 
@@ -19,17 +19,22 @@
 #include "pico/cyw43_arch.h"
 #endif
 
-// Morse code
-#define DOT_DURATION_MS 150
-#define DASH_DURATION_MS 450
-#define SYMBOL_GAP_MS 150
 #define CHARACTER_GAP_MS 700
 
-typedef struct {
-  char character;
-  const char *morse;
-} MorseCode;
-
+/**
+ * @brief   Blinks an LED to represent a given character in Morse code.
+ *
+ * @param   chr  The character to blink in Morse code.
+ *
+ * @details This function searches for the provided character in the
+ *          `morseAlphabet` structure array to get its Morse code
+ * representation. If found, it then blinks an LED in the pattern of dots and
+ * dashes corresponding to the Morse code of the character. The LED blinks are
+ *          separated by time intervals defined by constants such as
+ * DOT_DURATION_MS, DASH_DURATION_MS, SYMBOL_GAP_MS, and CHARACTER_GAP_MS.
+ *
+ * @return  void
+ */
 /**
  * @brief Turns off the LED.
  *

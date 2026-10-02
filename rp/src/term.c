@@ -1,19 +1,130 @@
 /**
  * File: term.c
  * Author: Diego Parrilla Santamaría
- * Date: January 2025
- * Copyright: 2025 - GOODDATA LABS
+ * Date: January 2025, February 2026
+ * Copyright: 2025-2026 - GOODDATA LABS
  * Description: Online terminal
  */
 
 #include "term.h"
 
-static TransmissionProtocol lastProtocol;
-static bool lastProtocolValid = false;
+#include <ctype.h>
+#include <limits.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
-static uint32_t memorySharedAddress = 0;
-static uint32_t memoryRandomTokenAddress = 0;
-static uint32_t memoryRandomTokenSeedAddress = 0;
+#include "aconfig.h"
+#include "chandler.h"
+#include "constants.h"
+#include "debug.h"
+#include "display.h"
+#include "display_term.h"
+#include "gconfig.h"
+#include "memfunc.h"
+#include "network.h"
+#include "reset.h"
+#include "romemul.h"
+#include "sdcard.h"
+#include "select.h"
+#include "tprotocol.h"
+
+// Producer (term_command_cb, called from chandler_loop) and consumer
+// (term_loop) both run sequentially on core 0, so the double-buffer swap
+// doesn't need volatile or an IRQ-disable critical section.
+static TransmissionProtocol protocolBuffers[2];
+static uint8_t protocolReadIndex = 0;
+static uint8_t protocolWriteIndex = 1;
+static bool protocolBufferReady = false;
+static uint32_t protocolOverwriteCount = 0;
+
+// A command can run for seconds (a ROM written to flash, an SD card scan),
+// and its waits call term_loop() again so the ST keeps being answered. A key
+// that arrives meanwhile is dropped instead of running inside the command:
+// a launch typed during a launch started a second flash write under the
+// first. Anything else waits for the command to end. Counted for SWD.
+// term_setBusy() does the same for long work outside a command.
+static bool termBusy = false;
+uint32_t termKeysDropped = 0;
+
+void term_setBusy(bool busy) { termBusy = busy; }
+
+#define TERM_NETWORK_INFO_VALUE_SIZE 64
+#define TERM_MENU_LIVE_LINE_MAX 128
+
+static void term_getConfigValueOrNA(const char *key, char *buffer,
+                                    size_t bufferSize) {
+  if (bufferSize == 0) {
+    return;
+  }
+
+  buffer[0] = '\0';
+  SettingsConfigEntry *entry = settings_find_entry(gconfig_getContext(), key);
+  if ((entry != NULL) && (entry->value != NULL) && (entry->value[0] != '\0')) {
+    snprintf(buffer, bufferSize, "%s", entry->value);
+    return;
+  }
+
+  snprintf(buffer, bufferSize, "N/A");
+}
+
+#if defined(CYW43_WL_GPIO_LED_PIN)
+static void term_getIpStringOrNA(const ip_addr_t *address, char *buffer,
+                                 size_t bufferSize) {
+  if (bufferSize == 0) {
+    return;
+  }
+
+  if ((address == NULL) || ip_addr_isany(address)) {
+    snprintf(buffer, bufferSize, "N/A");
+    return;
+  }
+
+  const char *ipString = ipaddr_ntoa(address);
+  if ((ipString != NULL) && (ipString[0] != '\0')) {
+    snprintf(buffer, bufferSize, "%s", ipString);
+  } else {
+    snprintf(buffer, bufferSize, "N/A");
+  }
+}
+
+static void term_getConfiguredDns(char *dns1, size_t dns1Size, char *dns2,
+                                  size_t dns2Size) {
+  if (dns1Size > 0) {
+    snprintf(dns1, dns1Size, "N/A");
+  }
+  if (dns2Size > 0) {
+    snprintf(dns2, dns2Size, "N/A");
+  }
+
+  SettingsConfigEntry *entry =
+      settings_find_entry(gconfig_getContext(), PARAM_WIFI_DNS);
+  if ((entry == NULL) || (entry->value == NULL) || (entry->value[0] == '\0')) {
+    return;
+  }
+
+  char dnsValue[(TERM_NETWORK_INFO_VALUE_SIZE * 2) + 2] = {0};
+  snprintf(dnsValue, sizeof(dnsValue), "%s", entry->value);
+
+  char *dnsSecond = strchr(dnsValue, ',');
+  if (dnsSecond != NULL) {
+    *dnsSecond = '\0';
+    dnsSecond++;
+    while (*dnsSecond == ' ') {
+      dnsSecond++;
+    }
+  }
+
+  if ((dns1Size > 0) && (dnsValue[0] != '\0')) {
+    snprintf(dns1, dns1Size, "%s", dnsValue);
+  }
+
+  if ((dns2Size > 0) && (dnsSecond != NULL) && (dnsSecond[0] != '\0')) {
+    snprintf(dns2, dns2Size, "%s", dnsSecond);
+  }
+}
+#endif
 
 // Command handlers
 static void cmdClear(const char *arg);
@@ -34,52 +145,58 @@ void term_setCommands(const Command *cmds, size_t count) {
 }
 
 /**
- * @brief Callback that handles the protocol command received.
+ * @brief chandler callback that publishes a fully-parsed protocol command
+ *        into the terminal's double-buffer for term_loop() to consume.
  *
- * This callback copy the content of the protocol to the last_protocol
- * structure. The last_protocol_valid flag is set to true to indicate that the
- * last_protocol structure contains a valid protocol. We return to the
- * dma_irq_handler_lookup function to continue asap with the next
- *
- * @param protocol The TransmissionProtocol structure containing the protocol
- * information.
+ * Called from chandler_loop() on core 0 (or wherever the application drains
+ * commemul). Copies the command into the inactive slot and atomically swaps
+ * read/write roles. payloadPtr is provided by chandler (already advanced past
+ * the random token) but term doesn't use it directly — it re-derives the
+ * pointer from the published snapshot inside term_loop().
  */
-static inline void __not_in_flash_func(handle_protocol_command)(
-    const TransmissionProtocol *protocol) {
-  // Copy the content of protocol to last_protocol
-  memcpy(&lastProtocol, protocol, sizeof(TransmissionProtocol));
-  lastProtocolValid = true;
-};
+void __not_in_flash_func(term_command_cb)(TransmissionProtocol *protocol,
+                                          uint16_t *payloadPtr) {
+  (void)payloadPtr;
+  uint8_t writeIndex = protocolWriteIndex;
+  TransmissionProtocol *writeBuffer = &protocolBuffers[writeIndex];
 
-static inline void __not_in_flash_func(handle_protocol_checksum_error)(
-    const TransmissionProtocol *protocol) {
-  DPRINTF("Checksum error detected (ID=%u, Size=%u)\n", protocol->command_id,
-          protocol->payload_size);
-}
+  // Copy the content of protocol to the active write buffer.
+  writeBuffer->command_id = protocol->command_id;
+  writeBuffer->payload_size = protocol->payload_size;
+  writeBuffer->bytes_read = protocol->bytes_read;
+  writeBuffer->final_checksum = protocol->final_checksum;
 
-// Interrupt handler for DMA completion
-void __not_in_flash_func(term_dma_irq_handler_lookup)(void) {
-  // Read once to avoid redundant hardware access
-  uint32_t addr = dma_hw->ch[2].al3_read_addr_trig;
-
-  // Check ROM3 signal (bit 16)
-  // We expect that the ROM3 signal is not set very often, so this should help
-  // the compilar to run faster
-  if (__builtin_expect(addr & 0x00010000, 0)) {
-    // Invert highest bit of low word to get 16-bit address
-    uint16_t addr_lsb = (uint16_t)(addr ^ ADDRESS_HIGH_BIT);
-
-    tprotocol_parse(addr_lsb, handle_protocol_command,
-                    handle_protocol_checksum_error);
+  // Sanity check: clamp payload_size to avoid overflow
+  uint16_t size = protocol->payload_size;
+  if (size > MAX_PROTOCOL_PAYLOAD_SIZE) {
+    size = MAX_PROTOCOL_PAYLOAD_SIZE;
   }
 
-  // Read the rom3 signal and if so then process the command
-  dma_hw->ints1 = 1U << 2;
+  // Copy only used payload bytes
+  memcpy(writeBuffer->payload, protocol->payload, size);
+
+  if (protocolBufferReady) {
+    protocolOverwriteCount++;
+  }
+
+  // Publish atomically by swapping read/write roles.
+  uint8_t readIndex = protocolReadIndex;
+  protocolReadIndex = writeIndex;
+  protocolWriteIndex = readIndex;
+  protocolBufferReady = true;
 }
 
 static char screen[TERM_SCREEN_SIZE];
 static uint8_t cursorX = 0;
 static uint8_t cursorY = 0;
+
+static uint8_t menuRowSsid = 0;
+static uint8_t menuRowSelect = 0;
+static uint8_t menuRowSd = 0;
+static uint8_t menuPromptRow = 0;
+static uint8_t menuPromptCol = 0;
+static bool menuRowsValid = false;
+static bool menuPromptValid = false;
 
 // Store previous cursor position for block removal
 static uint8_t prevCursorX = 0;
@@ -89,12 +206,37 @@ static uint8_t prevCursorY = 0;
 static char inputBuffer[TERM_INPUT_BUFFER_SIZE];
 static size_t inputLength = 0;
 
+// Getter method for inputBuffer
+char *term_getInputBuffer(void) { return inputBuffer; }
+
 // Clears entire screen buffer and resets cursor
 void term_clearScreen(void) {
   memset(screen, 0, TERM_SCREEN_SIZE);
   cursorX = 0;
   cursorY = 0;
+  menuRowsValid = false;
+  menuPromptValid = false;
   display_termClear();
+}
+
+// Clears the input buffer
+void term_clearInputBuffer(void) {
+  memset(inputBuffer, 0, TERM_INPUT_BUFFER_SIZE);
+  inputLength = 0;
+}
+
+// Custom scrollup function to scroll except for the last row
+void termScrollupBuffer(uint16_t blankBytes) {
+  // blank bytes is the number of bytes to blank out at the bottom of the
+  // screen
+
+  unsigned char *u8g2Buffer = u8g2_GetBufferPtr(display_getU8g2Ref());
+  memmove(u8g2Buffer, u8g2Buffer + blankBytes,
+          DISPLAY_BUFFER_SIZE - blankBytes -
+              TERM_SCREEN_SIZE_X * DISPLAY_TERM_CHAR_HEIGHT);
+  memset(u8g2Buffer + DISPLAY_BUFFER_SIZE - blankBytes -
+             TERM_SCREEN_SIZE_X * DISPLAY_TERM_CHAR_HEIGHT,
+         0, blankBytes);
 }
 
 // Scrolls the screen up by one row
@@ -102,7 +244,7 @@ static void termScrollUp(void) {
   memmove(screen, screen + TERM_SCREEN_SIZE_X,
           TERM_SCREEN_SIZE - TERM_SCREEN_SIZE_X);
   memset(screen + TERM_SCREEN_SIZE - TERM_SCREEN_SIZE_X, 0, TERM_SCREEN_SIZE_X);
-  display_scrollup(TERM_DISPLAY_ROW_BYTES);
+  termScrollupBuffer(TERM_DISPLAY_ROW_BYTES);
 }
 
 // Prints a character to the screen, handles scrolling
@@ -235,6 +377,25 @@ static void vt52ProcessSequence(const char *seq, size_t length) {
   }
 }
 
+void term_printAt(uint8_t row, uint8_t col, const char *text) {
+  if (row >= TERM_SCREEN_SIZE_Y) {
+    return;
+  }
+  for (; *text != '\0' && col < TERM_SCREEN_SIZE_X; text++, col++) {
+    screen[row * TERM_SCREEN_SIZE_X + col] = *text;
+    display_termChar(col, row, *text);
+  }
+}
+
+void term_recordAt(uint8_t row, uint8_t col, const char *text) {
+  if (row >= TERM_SCREEN_SIZE_Y) {
+    return;
+  }
+  for (; *text != '\0' && col < TERM_SCREEN_SIZE_X; text++, col++) {
+    screen[row * TERM_SCREEN_SIZE_X + col] = *text;
+  }
+}
+
 void term_printString(const char *str) {
   enum { STATE_NORMAL, STATE_ESC } state = STATE_NORMAL;
   char escBuffer[TERM_ESC_BUFFLINE_SIZE];
@@ -278,8 +439,8 @@ void term_printString(const char *str) {
     }
     str++;
   }
-  // If the string ends while still in ESC state, flush the buffered characters
-  // as normal text.
+  // If the string ends while still in ESC state, flush the buffered
+  // characters as normal text.
   if (state == STATE_ESC) {
     for (size_t i = 0; i < escLen; i++) {
       termRenderChar(escBuffer[i]);
@@ -290,7 +451,33 @@ void term_printString(const char *str) {
 
 // Called whenever a character is entered by the user
 // This is the single point of entry for user input
+static TermCommandLevel commandLevel = TERM_COMMAND_LEVEL_SINGLE_KEY;
+
+void term_setCommandLevel(TermCommandLevel level) {
+  commandLevel = level;
+  memset(inputBuffer, 0, TERM_INPUT_BUFFER_SIZE);
+  inputLength = 0;
+}
+
+// A key is a command: the one whose name is that letter, in either case.
+static void termSingleKey(char chr) {
+  chr = (char)tolower((unsigned char)chr);
+  for (size_t i = 0; i < numCommands; i++) {
+    if (commands[i].command[0] == chr && commands[i].command[1] == '\0') {
+      commands[i].handler("");
+      break;
+    }
+  }
+  memset(inputBuffer, 0, TERM_INPUT_BUFFER_SIZE);
+  inputLength = 0;
+  display_termRefresh();
+}
+
 static void termInputChar(char chr) {
+  if (commandLevel == TERM_COMMAND_LEVEL_SINGLE_KEY) {
+    termSingleKey(chr);
+    return;
+  }
   // Check for backspace
   if (chr == '\b') {
     display_termChar(prevCursorX, prevCursorY, ' ');
@@ -298,6 +485,7 @@ static void termInputChar(char chr) {
     // If we have chars in input_buffer, remove last char
     if (inputLength > 0) {
       inputLength--;
+      inputBuffer[inputLength] = '\0';  // Null-terminate the string
       // Also reflect on screen
       // same as term_backspace
       if (cursorX == 0) {
@@ -355,7 +543,13 @@ static void termInputChar(char chr) {
     memset(inputBuffer, 0, TERM_INPUT_BUFFER_SIZE);
     inputLength = 0;
 
-    term_printString("> ");
+    // A command that drew the menu left its own "Select an option:" prompt,
+    // with the cursor on it: a "> " after it would read as a second prompt.
+    bool atMenuPrompt = menuPromptValid && (cursorY == menuPromptRow) &&
+                        (cursorX == menuPromptCol);
+    if (!atMenuPrompt) {
+      term_printString("> ");
+    }
     display_termRefresh();
     return;
   }
@@ -376,21 +570,9 @@ static void termInputChar(char chr) {
 }
 
 void term_init(void) {
-  // Memory shared address
-  memorySharedAddress = (unsigned int)&__rom_in_ram_start__;
-  memoryRandomTokenAddress = memorySharedAddress + TERM_RANDOM_TOKEN_OFFSET;
-  memoryRandomTokenSeedAddress =
-      memorySharedAddress + TERM_RANDON_TOKEN_SEED_OFFSET;
-  SET_SHARED_VAR(TERM_HARDWARE_TYPE, 0, memorySharedAddress,
-                 TERM_SHARED_VARIABLES_OFFSET);  // Clean the hardware type
-  SET_SHARED_VAR(TERM_HARDWARE_VERSION, 0, memorySharedAddress,
-                 TERM_SHARED_VARIABLES_OFFSET);  // Clean the hardware version
-
-  // Initialize the random seed (add this line)
-  srand(time(NULL));
-  // Init the random token seed in the shared memory for the next command
-  uint32_t newRandomSeedToken = rand();  // Generate a new random 32-bit value
-  TPROTO_SET_RANDOM_TOKEN(memoryRandomTokenSeedAddress, newRandomSeedToken);
+  // Random-token publish, seed init, and shared-variable bookkeeping moved
+  // to chandler (chandler_init / chandler_loop). term_init only handles
+  // terminal display state now.
 
   // Initialize the welcome messages
   term_clearScreen();
@@ -424,62 +606,127 @@ void term_init(void) {
   display_refresh();
 }
 
-// Invoke this function to process the commands from the active loop in the main
-// function
-void __not_in_flash_func(term_loop)() {
-  if (lastProtocolValid) {
-    // Shared by all commands
-    // Read the random token from the command and increment the payload pointer
-    // to the first parameter available in the payload
-    uint32_t randomToken = TPROTO_GET_RANDOM_TOKEN(lastProtocol.payload);
-    uint16_t *payloadPtr = ((uint16_t *)(lastProtocol).payload);
-    uint16_t commandId = lastProtocol.command_id;
-    DPRINTF(
-        "Command ID: %d. Size: %d. Random token: 0x%08X, Checksum: 0x%04X\n",
-        lastProtocol.command_id, lastProtocol.payload_size, randomToken,
-        lastProtocol.final_checksum);
+// Invoke this function to process the commands from the active loop in the
+// main function
+// A list on screen takes the keys one at a time (term_setKeyHandler).
+static TermKeyHandler termKeyHandler = NULL;
 
+void term_setKeyHandler(TermKeyHandler handler) { termKeyHandler = handler; }
+
+static void termKeyToHandler(char keystroke, uint8_t scanCode) {
+  char key = keystroke;
+  if (key == 0) {
+    switch (scanCode) {
+      case TERM_KEYBOARD_SCAN_CODE_UP:
+        key = TERM_KEY_UP;
+        break;
+      case TERM_KEYBOARD_SCAN_CODE_DOWN:
+        key = TERM_KEY_DOWN;
+        break;
+      case TERM_KEYBOARD_SCAN_CODE_LEFT:
+        key = TERM_KEY_LEFT;
+        break;
+      case TERM_KEYBOARD_SCAN_CODE_RIGHT:
+        key = TERM_KEY_RIGHT;
+        break;
+      default:
+        return;
+    }
+  }
+  termKeyHandler(key);
+}
+
+void __not_in_flash_func(term_loop)() {
+  // Read the published slot in place: a copy cost over 4 KB of stack, twice
+  // the stack core 0 has. The double buffer keeps term_command_cb off this
+  // slot until the next command after it, and everything is read from the
+  // slot before termInputChar(), which can run a command handler that drains
+  // commands again.
+  const TransmissionProtocol *snapshot = NULL;
+  bool protocolReady = false;
+  uint32_t overwriteCountSnapshot = 0;
+
+  if (protocolBufferReady && termBusy) {
+    if (protocolBuffers[protocolReadIndex].command_id ==
+        APP_TERMINAL_KEYSTROKE) {
+      protocolBufferReady = false;
+      termKeysDropped++;
+      DPRINTF("Keystroke dropped: a command is running\n");
+    }
+    return;
+  }
+  if (protocolBufferReady) {
+    snapshot = &protocolBuffers[protocolReadIndex];
+    protocolBufferReady = false;
+    protocolReady = true;
+  }
+  overwriteCountSnapshot = protocolOverwriteCount;
+
+  if (protocolReady) {
+    // Shared by all commands
+    // Read the random token from the command and increment the payload
+    // pointer to the first parameter available in the payload
+    uint32_t randomToken = TPROTO_GET_RANDOM_TOKEN(snapshot->payload);
+    uint16_t *payloadPtr = ((uint16_t *)snapshot->payload);
+    uint16_t commandId = snapshot->command_id;
+    DPRINTF(
+        "Command ID: %d. Size: %d. Random token: 0x%08X, Checksum: 0x%04X, "
+        "Overwrites: %lu\n",
+        snapshot->command_id, snapshot->payload_size, randomToken,
+        snapshot->final_checksum, (unsigned long)overwriteCountSnapshot);
+
+#if defined(_DEBUG) && (_DEBUG != 0)
     // Jump the random token
     TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
 
     // Read the payload parameters
     uint16_t payloadSizeTmp = 4;
-    if ((lastProtocol.payload_size > payloadSizeTmp) &&
-        (lastProtocol.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D3: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
     payloadSizeTmp += 4;
-    if ((lastProtocol.payload_size > payloadSizeTmp) &&
-        (lastProtocol.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D4: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
     payloadSizeTmp += 4;
-    if ((lastProtocol.payload_size > payloadSizeTmp) &&
-        (lastProtocol.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D5: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
     payloadSizeTmp += 4;
-    if ((lastProtocol.payload_size > payloadSizeTmp) &&
-        (lastProtocol.payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
+    if ((snapshot->payload_size > payloadSizeTmp) &&
+        (snapshot->payload_size <= TERM_PARAMETERS_MAX_SIZE)) {
       DPRINTF("Payload D6: 0x%04X\n", TPROTO_GET_PAYLOAD_PARAM32(payloadPtr));
       TPROTO_NEXT32_PAYLOAD_PTR(payloadPtr);
     }
+#endif
 
     // Handle the command
-    switch (lastProtocol.command_id) {
+    termBusy = true;
+    switch (snapshot->command_id) {
       case APP_TERMINAL_START: {
+        // The ST's ESC key (main.s sends it as this command). A screen that
+        // takes the keys one at a time (a list) gets it as ESC: otherwise the
+        // menu was drawn over the list while the list kept the keys.
+        if (termKeyHandler != NULL) {
+          termKeyHandler(TERM_KEY_ESC);
+          break;
+        }
         display_termStart(DISPLAY_TILES_WIDTH, DISPLAY_TILES_HEIGHT);
         term_clearScreen();
-        term_printString("Type 'help' for available commands.\n");
-        termInputChar('\n');
+        // The menu, as its key would draw it
+        term_setCommandLevel(TERM_COMMAND_LEVEL_SINGLE_KEY);
+        termInputChar('m');
         SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_TERM);
         DPRINTF("Send command to display: DISPLAY_COMMAND_TERM\n");
       } break;
       case APP_TERMINAL_KEYSTROKE: {
-        uint16_t *payload = ((uint16_t *)(lastProtocol).payload);
+        uint16_t *payload = ((uint16_t *)snapshot->payload);
         // Jump the random token
         TPROTO_NEXT32_PAYLOAD_PTR(payload);
         // Extract the 32 bit payload
@@ -502,6 +749,10 @@ void __not_in_flash_func(term_loop)() {
           DPRINTF("Keystroke: %d. Shift key: %d, Scan code: %d\n", keystroke,
                   shiftKey, scanCode);
         }
+        if (termKeyHandler != NULL) {
+          termKeyToHandler(keystroke, scanCode);
+          break;
+        }
         termInputChar(keystroke);
         break;
       }
@@ -510,17 +761,451 @@ void __not_in_flash_func(term_loop)() {
         DPRINTF("Unknown command\n");
         break;
     }
-    if (memoryRandomTokenAddress != 0) {
-      // Set the random token in the shared memory
-      TPROTO_SET_RANDOM_TOKEN(memoryRandomTokenAddress, randomToken);
+    termBusy = false;
+    // Random-token publish is owned by chandler_loop; nothing more to do here.
+    (void)randomToken;
+  }
+}
 
-      // Init the random token seed in the shared memory for the next command
-      uint32_t newRandomSeedToken =
-          rand();  // Generate a new random 32-bit value
-      TPROTO_SET_RANDOM_TOKEN(memoryRandomTokenSeedAddress, newRandomSeedToken);
+// Command handlers
+// Print one line of the menu, cut to fit: the terminal wraps as soon as its
+// last column is written, so a line of TERM_SCREEN_SIZE_X characters would
+// leave a blank row after it, and a longer one would push the menu down.
+static void termPrintMenuLine(const char *fmt, ...) {
+  char line[TERM_SCREEN_SIZE_X];
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(line, sizeof(line), fmt, args);  // at most SIZE_X - 1 characters
+  va_end(args);
+  term_printString(line);
+  term_printString("\n");
+}
+
+void term_printNetworkInfo(void) {
+  // Static, not on the stack: nineteen values would take more than half of
+  // core 0's stack. The menu runs on core 0 only and never re-enters; the
+  // values are cleared on every call, as they were as locals.
+  static char hostName[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char ipAddress[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char gateway[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char dns1[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char dns2[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char netmask[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char ssid[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char bssid[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char authMode[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char signalDb[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char wifiMode[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char wifiLink[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char ipMode[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char wifiMac[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char mcuArch[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char mcuId[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char selectState[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char sdStatus[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char sdSpace[TERM_NETWORK_INFO_VALUE_SIZE];
+  char *const values[] = {hostName, ipAddress,   gateway,  dns1,     dns2,
+                          netmask,  ssid,        bssid,    authMode, signalDb,
+                          wifiMode, wifiLink,    ipMode,   wifiMac,  mcuArch,
+                          mcuId,    selectState, sdStatus, sdSpace};
+  for (size_t i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+    memset(values[i], 0, TERM_NETWORK_INFO_VALUE_SIZE);
+  }
+
+  term_getConfigValueOrNA(PARAM_HOSTNAME, hostName, sizeof(hostName));
+  term_getConfigValueOrNA(PARAM_WIFI_IP, ipAddress, sizeof(ipAddress));
+  term_getConfigValueOrNA(PARAM_WIFI_GATEWAY, gateway, sizeof(gateway));
+  term_getConfigValueOrNA(PARAM_WIFI_NETMASK, netmask, sizeof(netmask));
+#if defined(CYW43_WL_GPIO_LED_PIN)
+  term_getConfiguredDns(dns1, sizeof(dns1), dns2, sizeof(dns2));
+#else
+  snprintf(dns1, sizeof(dns1), "N/A");
+  snprintf(dns2, sizeof(dns2), "N/A");
+#endif
+  snprintf(ssid, sizeof(ssid), "N/A");
+  snprintf(bssid, sizeof(bssid), "N/A");
+  snprintf(authMode, sizeof(authMode), "N/A");
+  snprintf(signalDb, sizeof(signalDb), "N/A");
+  snprintf(wifiMode, sizeof(wifiMode), "N/A");
+  snprintf(wifiLink, sizeof(wifiLink), "N/A");
+  snprintf(ipMode, sizeof(ipMode), "N/A");
+  snprintf(wifiMac, sizeof(wifiMac), "N/A");
+  snprintf(mcuArch, sizeof(mcuArch), "N/A");
+  snprintf(mcuId, sizeof(mcuId), "N/A");
+  snprintf(selectState, sizeof(selectState), "%s",
+           select_detectPush() ? "Pressed" : "Released");
+  snprintf(sdStatus, sizeof(sdStatus), "Not mounted");
+  snprintf(sdSpace, sizeof(sdSpace), "N/A");
+
+  uint32_t sdTotalMb = 0;
+  uint32_t sdFreeMb = 0;
+  if (sdcard_getMountedInfo(&sdTotalMb, &sdFreeMb)) {
+    snprintf(sdStatus, sizeof(sdStatus), "Mounted");
+    snprintf(sdSpace, sizeof(sdSpace), "%lu/%lu MB", (unsigned long)sdFreeMb,
+             (unsigned long)sdTotalMb);
+  } else if (sdcard_isMounted()) {
+    snprintf(sdStatus, sizeof(sdStatus), "Error");
+  }
+
+  term_printString("Network status: ");
+
+#if defined(CYW43_WL_GPIO_LED_PIN)
+  const char *wifiModeValue = network_getWifiModeStr();
+  if ((wifiModeValue != NULL) && (wifiModeValue[0] != '\0')) {
+    snprintf(wifiMode, sizeof(wifiMode), "%s", wifiModeValue);
+  }
+  const char *wifiLinkValue = network_wifiConnStatusStr();
+  if ((wifiLinkValue != NULL) && (wifiLinkValue[0] != '\0')) {
+    snprintf(wifiLink, sizeof(wifiLink), "%s", wifiLinkValue);
+  }
+
+  SettingsConfigEntry *dhcpEntry =
+      settings_find_entry(gconfig_getContext(), PARAM_WIFI_DHCP);
+  if ((dhcpEntry != NULL) && (dhcpEntry->value != NULL) &&
+      (dhcpEntry->value[0] != '\0')) {
+    char dhcpChar = dhcpEntry->value[0];
+    bool dhcpEnabled = (dhcpChar == 't') || (dhcpChar == 'T') ||
+                       (dhcpChar == '1') || (dhcpChar == 'y') ||
+                       (dhcpChar == 'Y');
+    // A rejected static configuration fell back to DHCP (the reason is on
+    // the debug console): show what is in use, not what was asked for.
+    bool staticRejected = network_getStaticConfigRejected(NULL);
+    snprintf(ipMode, sizeof(ipMode), "%s",
+             (dhcpEnabled || staticRejected) ? "DHCP" : "Static");
+  }
+
+  const char *wifiMacValue = network_getCyw43MacStr();
+  if ((wifiMacValue != NULL) && (wifiMacValue[0] != '\0')) {
+    snprintf(wifiMac, sizeof(wifiMac), "%s", wifiMacValue);
+  }
+
+  const char *mcuArchValue = network_getMcuArchStr();
+  if ((mcuArchValue != NULL) && (mcuArchValue[0] != '\0')) {
+    snprintf(mcuArch, sizeof(mcuArch), "%s", mcuArchValue);
+  }
+  const char *mcuIdValue = network_getMcuIdStr();
+  if ((mcuIdValue != NULL) && (mcuIdValue[0] != '\0')) {
+    snprintf(mcuId, sizeof(mcuId), "%s", mcuIdValue);
+  }
+
+  ip_addr_t currentIp = network_getCurrentIp();
+  bool hasIp = !ip_addr_isany(&currentIp);
+  term_printString(hasIp ? "Connected\n" : "Not connected\n");
+
+  if (hasIp) {
+    term_getIpStringOrNA(&currentIp, ipAddress, sizeof(ipAddress));
+
+    wifi_network_info_t currentNetwork = network_getCurrentNetworkInfo();
+    if (currentNetwork.ssid[0] != '\0') {
+      snprintf(ssid, sizeof(ssid), "%s", currentNetwork.ssid);
+      snprintf(authMode, sizeof(authMode), "%s",
+               network_getAuthTypeString(currentNetwork.auth_mode));
+    }
+    if (currentNetwork.bssid[0] != '\0') {
+      snprintf(bssid, sizeof(bssid), "%s", currentNetwork.bssid);
+    }
+    if ((currentNetwork.rssi <= 0) && (currentNetwork.rssi >= -120)) {
+      snprintf(signalDb, sizeof(signalDb), "%d dBm", currentNetwork.rssi);
     }
   }
-  lastProtocolValid = false;
+
+  struct netif *netIf = netif_default;
+
+  if (netIf != NULL) {
+    term_getIpStringOrNA(&(netIf->gw), gateway, sizeof(gateway));
+    term_getIpStringOrNA(&(netIf->netmask), netmask, sizeof(netmask));
+
+#if defined(LWIP_NETIF_HOSTNAME) && LWIP_NETIF_HOSTNAME
+    const char *runtimeHostname = netif_get_hostname(netIf);
+    if ((runtimeHostname != NULL) && (runtimeHostname[0] != '\0')) {
+      snprintf(hostName, sizeof(hostName), "%s", runtimeHostname);
+    }
+#endif
+  }
+
+  term_getIpStringOrNA(dns_getserver(0), dns1, sizeof(dns1));
+  term_getIpStringOrNA(dns_getserver(1), dns2, sizeof(dns2));
+#else
+  term_printString("Unavailable\n");
+#endif
+
+  menuRowsValid = false;
+
+  termPrintMenuLine("MCU type  : %s (%s)", mcuArch, mcuId);
+  termPrintMenuLine("Host name : %s", hostName);
+  termPrintMenuLine("WiFi      : %s (%s)", wifiMode, wifiLink);
+  termPrintMenuLine("IP        : %s (%s)", ipAddress, ipMode);
+  termPrintMenuLine("Netmask   : %s", netmask);
+  termPrintMenuLine("Gateway   : %s", gateway);
+  termPrintMenuLine("DNS       : %s, %s", dns1, dns2);
+  termPrintMenuLine("WiFi MAC  : %s", wifiMac);
+
+  menuRowSsid = cursorY;
+  termPrintMenuLine("SSID      : %s (%s)", ssid, signalDb);
+
+  termPrintMenuLine("BSSID     : %s", bssid);
+  termPrintMenuLine("Auth mode : %s", authMode);
+
+  term_printString("\n");
+  menuRowSelect = cursorY;
+  termPrintMenuLine("SELECT    : %s", selectState);
+
+  term_printString("\n");
+  menuRowSd = cursorY;
+  termPrintMenuLine("SD card   : %s (%s)", sdStatus, sdSpace);
+
+  menuRowsValid = true;
+}
+
+void term_markMenuPromptCursor(void) {
+  menuPromptRow = cursorY;
+  menuPromptCol = cursorX;
+  menuPromptValid = true;
+}
+
+static void term_appendMoveAndClearLine(char *buffer, size_t bufferSize,
+                                        size_t *offset, uint8_t row) {
+  if ((buffer == NULL) || (offset == NULL) || (*offset >= bufferSize)) {
+    return;
+  }
+
+  size_t remaining = bufferSize - *offset;
+  int written = snprintf(buffer + *offset, remaining,
+                         "\x1B"
+                         "Y%c%c\x1B"
+                         "K",
+                         (char)(TERM_POS_Y + row), (char)(TERM_POS_X));
+  if (written < 0) {
+    return;
+  }
+
+  size_t writeSize = (size_t)written;
+  if (writeSize >= remaining) {
+    *offset = bufferSize - 1;
+    return;
+  }
+
+  *offset += writeSize;
+}
+
+static void term_appendText(char *buffer, size_t bufferSize, size_t *offset,
+                            const char *text) {
+  if ((buffer == NULL) || (offset == NULL) || (text == NULL) ||
+      (*offset >= bufferSize)) {
+    return;
+  }
+
+  size_t remaining = bufferSize - *offset;
+  int written = snprintf(buffer + *offset, remaining, "%s", text);
+  if (written < 0) {
+    return;
+  }
+
+  size_t writeSize = (size_t)written;
+  if (writeSize >= remaining) {
+    *offset = bufferSize - 1;
+    return;
+  }
+
+  *offset += writeSize;
+}
+
+static bool term_buildLiveMenuLines(char *ssidLine, size_t ssidLineSize,
+                                    char *selectLine, size_t selectLineSize,
+                                    char *sdLine, size_t sdLineSize) {
+  if ((ssidLine == NULL) || (selectLine == NULL) || (sdLine == NULL) ||
+      (ssidLineSize == 0) || (selectLineSize == 0) || (sdLineSize == 0)) {
+    return false;
+  }
+
+  // Static, not on the stack, like the menu's own values; each one is
+  // written below before it is read.
+  static char ssid[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char signalDb[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char selectState[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char sdStatus[TERM_NETWORK_INFO_VALUE_SIZE];
+  static char sdSpace[TERM_NETWORK_INFO_VALUE_SIZE];
+
+  snprintf(ssid, sizeof(ssid), "N/A");
+  snprintf(signalDb, sizeof(signalDb), "N/A");
+  snprintf(selectState, sizeof(selectState), "%s",
+           select_detectPush() ? "Pressed" : "Released");
+  snprintf(sdStatus, sizeof(sdStatus), "Not mounted");
+  snprintf(sdSpace, sizeof(sdSpace), "N/A");
+
+  uint32_t sdTotalMb = 0;
+  uint32_t sdFreeMb = 0;
+  if (sdcard_getMountedInfo(&sdTotalMb, &sdFreeMb)) {
+    snprintf(sdStatus, sizeof(sdStatus), "Mounted");
+    snprintf(sdSpace, sizeof(sdSpace), "%lu/%lu MB", (unsigned long)sdFreeMb,
+             (unsigned long)sdTotalMb);
+  } else if (sdcard_isMounted()) {
+    snprintf(sdStatus, sizeof(sdStatus), "Error");
+  }
+
+#if defined(CYW43_WL_GPIO_LED_PIN)
+  ip_addr_t currentIp = network_getCurrentIp();
+  bool hasIp = !ip_addr_isany(&currentIp);
+  if (hasIp) {
+    wifi_network_info_t currentNetwork = network_getCurrentNetworkInfo();
+    if (currentNetwork.ssid[0] != '\0') {
+      snprintf(ssid, sizeof(ssid), "%s", currentNetwork.ssid);
+    }
+    if ((currentNetwork.rssi <= 0) && (currentNetwork.rssi >= -120)) {
+      snprintf(signalDb, sizeof(signalDb), "%d dBm", currentNetwork.rssi);
+    }
+  }
+#endif
+
+  // Cut like termPrintMenuLine, so the refresh never wraps either.
+  size_t maxLine = TERM_SCREEN_SIZE_X;
+  snprintf(ssidLine, ssidLineSize < maxLine ? ssidLineSize : maxLine,
+           "SSID      : %s (%s)", ssid, signalDb);
+  snprintf(selectLine, selectLineSize < maxLine ? selectLineSize : maxLine,
+           "SELECT    : %s", selectState);
+  snprintf(sdLine, sdLineSize < maxLine ? sdLineSize : maxLine,
+           "SD card   : %s (%s)", sdStatus, sdSpace);
+
+  return true;
+}
+
+void term_refreshMenuLiveInfo(void) {
+  static char prevSsidLine[TERM_MENU_LIVE_LINE_MAX] = {0};
+  static char prevSelectLine[TERM_MENU_LIVE_LINE_MAX] = {0};
+  static char prevSdLine[TERM_MENU_LIVE_LINE_MAX] = {0};
+
+  // Static, not on the stack (together almost a kilobyte): the three lines
+  // are written in full before they are read, and the update is built from
+  // offset 0 with snprintf, which terminates it.
+  static char ssidLine[TERM_MENU_LIVE_LINE_MAX];
+  static char selectLine[TERM_MENU_LIVE_LINE_MAX];
+  static char sdLine[TERM_MENU_LIVE_LINE_MAX];
+
+  if (!menuRowsValid ||
+      !term_buildLiveMenuLines(ssidLine, sizeof(ssidLine), selectLine,
+                               sizeof(selectLine), sdLine, sizeof(sdLine))) {
+    return;
+  }
+
+  bool updateSsid = (strcmp(ssidLine, prevSsidLine) != 0);
+  bool updateSelect = (strcmp(selectLine, prevSelectLine) != 0);
+  bool updateSd = (strcmp(sdLine, prevSdLine) != 0);
+
+  if (!updateSsid && !updateSelect && !updateSd) {
+    return;
+  }
+
+  static char updateBuffer[512];
+  size_t offset = 0;
+
+  if (updateSsid) {
+    term_appendMoveAndClearLine(updateBuffer, sizeof(updateBuffer), &offset,
+                                menuRowSsid);
+    term_appendText(updateBuffer, sizeof(updateBuffer), &offset, ssidLine);
+  }
+
+  if (updateSelect) {
+    term_appendMoveAndClearLine(updateBuffer, sizeof(updateBuffer), &offset,
+                                menuRowSelect);
+    term_appendText(updateBuffer, sizeof(updateBuffer), &offset, selectLine);
+  }
+
+  if (updateSd) {
+    term_appendMoveAndClearLine(updateBuffer, sizeof(updateBuffer), &offset,
+                                menuRowSd);
+    term_appendText(updateBuffer, sizeof(updateBuffer), &offset, sdLine);
+  }
+
+  // Restore the cursor to the menu prompt input position.
+  if (menuPromptValid && (offset < sizeof(updateBuffer))) {
+    size_t remaining = sizeof(updateBuffer) - offset;
+    int written = snprintf(updateBuffer + offset, remaining,
+                           "\x1B"
+                           "Y%c%c",
+                           (char)(TERM_POS_Y + menuPromptRow),
+                           (char)(TERM_POS_X + menuPromptCol));
+    if (written > 0) {
+      size_t writeSize = (size_t)written;
+      if (writeSize >= remaining) {
+        offset = sizeof(updateBuffer) - 1;
+      } else {
+        offset += writeSize;
+      }
+    }
+  }
+
+  snprintf(prevSsidLine, sizeof(prevSsidLine), "%s", ssidLine);
+  snprintf(prevSelectLine, sizeof(prevSelectLine), "%s", selectLine);
+  snprintf(prevSdLine, sizeof(prevSdLine), "%s", sdLine);
+
+  term_printString(updateBuffer);
+}
+
+static bool term_parseKeyAndTail(const char *arg, char *key, size_t keySize,
+                                 const char **tail) {
+  if ((arg == NULL) || (key == NULL) || (keySize == 0)) {
+    return false;
+  }
+
+  while (isspace((unsigned char)*arg)) {
+    arg++;
+  }
+  if (*arg == '\0') {
+    return false;
+  }
+
+  const char *end = arg;
+  while ((*end != '\0') && !isspace((unsigned char)*end)) {
+    end++;
+  }
+
+  size_t keyLen = (size_t)(end - arg);
+  if ((keyLen == 0) || (keyLen >= keySize)) {
+    return false;
+  }
+
+  memcpy(key, arg, keyLen);
+  key[keyLen] = '\0';
+
+  while (isspace((unsigned char)*end)) {
+    end++;
+  }
+
+  if (tail != NULL) {
+    *tail = end;
+  }
+  return true;
+}
+
+static bool term_parseBoolToken(const char *valueToken, bool *value) {
+  if ((valueToken == NULL) || (value == NULL)) {
+    return false;
+  }
+
+  char valueStr[TERM_BOOL_INPUT_BUFF] = {0};
+  size_t valueLen = strcspn(valueToken, " \t\r\n");
+  if ((valueLen == 0) || (valueLen >= sizeof(valueStr))) {
+    return false;
+  }
+  memcpy(valueStr, valueToken, valueLen);
+  valueStr[valueLen] = '\0';
+
+  for (size_t i = 0; valueStr[i] != '\0'; i++) {
+    valueStr[i] = (char)tolower((unsigned char)valueStr[i]);
+  }
+
+  if ((strcmp(valueStr, "true") == 0) || (strcmp(valueStr, "t") == 0) ||
+      (strcmp(valueStr, "1") == 0)) {
+    *value = true;
+    return true;
+  }
+  if ((strcmp(valueStr, "false") == 0) || (strcmp(valueStr, "f") == 0) ||
+      (strcmp(valueStr, "0") == 0)) {
+    *value = false;
+    return true;
+  }
+
+  return false;
 }
 
 // Command handlers
@@ -536,7 +1221,7 @@ void term_cmdSettings(const char *arg) {
   term_printString("  put_int - Set integer (key and value)\n");
   term_printString("  put_bool- Set boolean (key and value)\n");
   term_printString("  put_str - Set string (key and value)\n");
-  term_printString("\n");
+  term_printString("\nEnter 'm' to return to the main menu.\n\n");
 }
 
 void term_cmdPrint(const char *arg) {
@@ -563,12 +1248,19 @@ void term_cmdUnknown(const char *arg) {
 }
 
 void term_cmdSave(const char *arg) {
-  settings_save(aconfig_getContext(), true);
+  if (settings_save(aconfig_getContext(), true) < 0) {
+    term_printString("Error: settings not saved.\n");
+    return;
+  }
   term_printString("Settings saved.\n");
 }
 
 void term_cmdErase(const char *arg) {
   settings_erase(aconfig_getContext());
+  // Erasing frees every entry, and the app goes on looking them up by name:
+  // back to the defaults in RAM, as on a device that never saved any. They
+  // reach flash with the next save, or at the next boot.
+  aconfig_init(CURRENT_APP_UUID_KEY);
   term_printString("Settings erased.\n");
 }
 
@@ -605,12 +1297,27 @@ void term_cmdGet(const char *arg) {
 
 void term_cmdPutInt(const char *arg) {
   char key[SETTINGS_MAX_KEY_LENGTH] = {0};
-  int value = 0;
-  if (sscanf(arg, "%s %d", key, &value) == 2) {
+  const char *valueStr = NULL;
+  if (term_parseKeyAndTail(arg, key, sizeof(key), &valueStr) &&
+      (valueStr != NULL) && (valueStr[0] != '\0')) {
+    char *endPtr = NULL;
+    long parsedValue = strtol(valueStr, &endPtr, DEC_BASE);
+    while ((endPtr != NULL) && isspace((unsigned char)*endPtr)) {
+      endPtr++;
+    }
+    if ((endPtr == valueStr) || ((endPtr != NULL) && (*endPtr != '\0')) ||
+        (parsedValue < INT_MIN) || (parsedValue > INT_MAX)) {
+      TPRINTF("Invalid arguments for 'put_int' command.\n");
+      return;
+    }
+
+    int value = (int)parsedValue;
     int err = settings_put_integer(aconfig_getContext(), key, value);
     if (err == 0) {
       TPRINTF("Key: %s\n", key);
       TPRINTF("Value: %d\n", value);
+    } else {
+      TPRINTF("Error setting integer value for key: %s\n", key);
     }
   } else {
     TPRINTF("Invalid arguments for 'put_int' command.\n");
@@ -619,37 +1326,18 @@ void term_cmdPutInt(const char *arg) {
 
 void term_cmdPutBool(const char *arg) {
   char key[SETTINGS_MAX_KEY_LENGTH] = {0};
+  const char *valueToken = NULL;
+  bool value = false;
 
-  char valueStr[TERM_BOOL_INPUT_BUFF] = {
-      0};  // Small buffer to store the value string (e.g., "true", "false")
-  bool value;
-
-  // Scan the key and the value string
-  if (sscanf(arg, "%s %7s", key, valueStr) == 2) {
-    // Convert the value_str to lowercase for easier comparison
-    for (int i = 0; valueStr[i]; i++) {
-      valueStr[i] = tolower(valueStr[i]);
-    }
-
-    // Check if the value is true or false
-    if (strcmp(valueStr, "true") == 0 || strcmp(valueStr, "t") == 0 ||
-        strcmp(valueStr, "1") == 0) {
-      value = true;
-    } else if (strcmp(valueStr, "false") == 0 || strcmp(valueStr, "f") == 0 ||
-               strcmp(valueStr, "0") == 0) {
-      value = false;
-    } else {
-      TPRINTF(
-          "Invalid boolean value. Use 'true', 'false', 't', 'f', '1', or "
-          "'0'.\n");
-      return;
-    }
-
+  if (term_parseKeyAndTail(arg, key, sizeof(key), &valueToken) &&
+      (valueToken != NULL) && term_parseBoolToken(valueToken, &value)) {
     // Store the boolean value
     int err = settings_put_bool(aconfig_getContext(), key, value);
     if (err == 0) {
       TPRINTF("Key: %s\n", key);
       TPRINTF("Value: %s\n", value ? "true" : "false");
+    } else {
+      TPRINTF("Error setting boolean value for key: %s\n", key);
     }
   } else {
     TPRINTF(
@@ -660,35 +1348,16 @@ void term_cmdPutBool(const char *arg) {
 
 void term_cmdPutString(const char *arg) {
   char key[SETTINGS_MAX_KEY_LENGTH] = {0};
+  const char *value = NULL;
 
-  // Scan the first word (key)
-  if (sscanf(arg, "%s", key) == 1) {
-    // Find the position after the key in the argument string
-    const char *value = strchr(arg, ' ');
-    if (value) {
-      // Move past the space to the start of the value
-      value++;
-
-      // Check if the value is non-empty
-      if (strlen(value) > 0) {
-        int err = settings_put_string(aconfig_getContext(), key, value);
-        if (err == 0) {
-          TPRINTF("Key: %s\n", key);
-          TPRINTF("Value: %s\n", value);
-        }
-      } else {
-        int err = settings_put_string(aconfig_getContext(), key, value);
-        if (err == 0) {
-          TPRINTF("Key: %s\n", key);
-          TPRINTF("Value: <EMPTY>\n");
-        }
-      }
+  if (term_parseKeyAndTail(arg, key, sizeof(key), &value)) {
+    const char *safeValue = (value != NULL) ? value : "";
+    int err = settings_put_string(aconfig_getContext(), key, safeValue);
+    if (err == 0) {
+      TPRINTF("Key: %s\n", key);
+      TPRINTF("Value: %s\n", (safeValue[0] != '\0') ? safeValue : "<EMPTY>");
     } else {
-      int err = settings_put_string(aconfig_getContext(), key, value);
-      if (err == 0) {
-        TPRINTF("Key: %s\n", key);
-        TPRINTF("Value: <EMPTY>\n");
-      }
+      TPRINTF("Error setting string value for key: %s\n", key);
     }
   } else {
     TPRINTF("Invalid arguments for 'put_string' command.\n");
