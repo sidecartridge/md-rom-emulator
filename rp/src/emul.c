@@ -222,6 +222,15 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
     case DEVHOOKS_APP_WIFI:
       netTestWifi((payloadSize >= 2U) && (payload[0] != 0U));
       return 1;
+    case DEVHOOKS_APP_SD:
+      if (payloadSize < 2U) {
+        return 0;
+      }
+      sdcard_testSetRemoved(payload[0] == 0U);
+      if (payload[0] == 0U) {
+        sdcard_checkPresence();
+      }
+      return 1;
     case DEVHOOKS_APP_HEALTH:
       if (payloadSize < 2U || payload[0] == HEALTH_TEST_NONE ||
           payload[0] > HEALTH_TEST_STACK_OVERFLOW) {
@@ -344,8 +353,23 @@ static const uint8_t *romFlashRead(uint32_t offset) {
 // Between sectors: the ST is answered, SELECT is seen, and a mark goes on the
 // progress line for every 1/ROMSTORE_PROGRESS_MARKS of the write.
 #define ROMSTORE_PROGRESS_MARKS 32
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Debug builds only, set over SWD by symbol: each sector of a ROM write waits
+// this long, answering the ST, so the write lasts long enough for a hand to
+// pull the SD card in the middle of it. Any reset clears it.
+volatile uint32_t romstoreTestSectorDelayMs = 0;
+#endif
+
 static void romFlashTick(uint32_t done, uint32_t total) {
   emul_pollTick();
+#if defined(_DEBUG) && (_DEBUG != 0)
+  if (romstoreTestSectorDelayMs != 0U) {
+    absolute_time_t until = make_timeout_time_ms(romstoreTestSectorDelayMs);
+    while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
+      emul_pollTick();
+    }
+  }
+#endif
   if (!romstoreHeaderShown) {
     // Only once the first sector is erased: a refused file shows no write.
     term_printString("\nWriting the ROM to flash:\n");
@@ -685,6 +709,9 @@ static void menu(void) {
   term_printString("\n");
 
   // The network, then the last download
+  if (!sdcard_isMounted()) {
+    term_printString("SD card: none. Put one in.\n");
+  }
   term_printString("Network: ");
   switch (netState) {
     case NET_CONNECTING:
@@ -794,6 +821,12 @@ static void describeDownload(download_err_t err, char *out, size_t size) {
 
 static void catalogRefreshStart(void) {
   if (downloadKind != DOWNLOAD_KIND_NONE || netState != NET_UP) {
+    return;
+  }
+  if (!sdcard_isMounted()) {
+    // Tried again when a card is mounted (cardPoll()).
+    catalogRefresh = CATALOG_REFRESH_FAILED;
+    snprintf(catalogReason, sizeof(catalogReason), "no SD card");
     return;
   }
   const char *url = catalogUrl();
@@ -956,7 +989,13 @@ static void downloadsPoll(void) {
     snprintf(downloadMessage, sizeof(downloadMessage), DOWNLOADED_PREFIX "%.*s",
              (int)(TERM_SCREEN_SIZE_X - sizeof(DOWNLOADED_PREFIX)), name);
   } else {
-    describeDownload(err, reason, sizeof(reason));
+    // A write that failed because the card left reads as a transfer error:
+    // ask the card, and say so.
+    if (sdcard_checkPresence()) {
+      describeDownload(err, reason, sizeof(reason));
+    } else {
+      snprintf(reason, sizeof(reason), "the SD card is gone");
+    }
     snprintf(downloadMessage, sizeof(downloadMessage), "Download failed: %s",
              reason);
   }
@@ -1186,6 +1225,40 @@ static void listKey(char key) {
   }
 }
 
+// No card mounted: say so, and that one put in is found by itself.
+static bool cardMissing(void) {
+  if (sdcard_isMounted()) {
+    return false;
+  }
+  term_printString("No SD card. Put one in: it is found\nby itself.\n");
+  return true;
+}
+
+// The card going or coming, seen by sdcard_pollRemount() or by a failed
+// operation's presence check. An open list read the old card (and the
+// catalog's page index is the old card's), so it closes; a new card needs
+// its own copy of the catalog.
+static bool cardWasMounted = false;
+
+static void cardPoll(void) {
+  bool mounted = sdcard_isMounted();
+  if (mounted == cardWasMounted) {
+    return;
+  }
+  cardWasMounted = mounted;
+  DPRINTF("SD card %s\n", mounted ? "mounted" : "gone");
+  if (listKind != LIST_NONE) {
+    listClose();
+    menu();
+    display_refresh();
+  } else {
+    menuStatusChanged();
+  }
+  if (mounted && catalogRefresh != CATALOG_REFRESH_RUNNING) {
+    catalogRefreshStart();
+  }
+}
+
 static void listOpen(ListKind kind, uint32_t count) {
   listKind = kind;
   listDetails = false;
@@ -1195,6 +1268,9 @@ static void listOpen(ListKind kind, uint32_t count) {
 }
 
 void cmdCard(const char *arg) {
+  if (cardMissing()) {
+    return;
+  }
   FRESULT listed = readRomsSdcard(romsFolder);
   if (listed == FR_NOT_ENOUGH_CORE) {
     term_printString("Not enough memory for the ROM list.\n");
@@ -1202,6 +1278,10 @@ void cmdCard(const char *arg) {
   }
   if (listed != FR_OK) {
     listClose();
+    if (!sdcard_checkPresence()) {
+      cardMissing();
+      return;
+    }
     term_printString("The folder '");
     term_printString(romsFolder);
     term_printString(
@@ -1222,6 +1302,9 @@ void cmdCard(const char *arg) {
 }
 
 void cmdNetwork(const char *arg) {
+  if (cardMissing()) {
+    return;
+  }
   // A refresh that failed is tried again here, not in a loop.
   if (netState == NET_UP && catalogRefresh == CATALOG_REFRESH_FAILED) {
     catalogRefreshStart();
@@ -1234,6 +1317,10 @@ void cmdNetwork(const char *arg) {
           (unsigned long)(time_us_32() - openUs));
   if (opened != CATALOG_OK || catalog.count == 0) {
     catalog_close(&catalog);
+    if (opened == CATALOG_READ_ERROR && !sdcard_checkPresence()) {
+      cardMissing();
+      return;
+    }
     if (netState == NET_CONNECTING ||
         catalogRefresh == CATALOG_REFRESH_RUNNING) {
       term_printString("The catalog is still downloading:\n");
@@ -1274,6 +1361,9 @@ void cmdLaunch(const char *arg) {
     display_refresh();
     return;
   }
+  if (cardMissing()) {
+    return;
+  }
   char filename[MAX_PATH_SIZE];
   snprintf(filename, sizeof(filename), "%s/%s", romsFolder, romFile->value);
   DPRINTF("Loading ROM file into FLASH: %s\n", filename);
@@ -1285,6 +1375,13 @@ void cmdLaunch(const char *arg) {
   if (result != ROMSTORE_OK) {
     DPRINTF("Launch failed: %s\n", romstore_message(result));
     romstoreReport(result, &info);
+    if ((result == ROMSTORE_READ_ERROR || result == ROMSTORE_NOT_FOUND) &&
+        !sdcard_checkPresence()) {
+      term_printString("The SD card is gone.\n");
+    }
+    // The message stays until [M]: a status redraw (the card, the network)
+    // would wipe it before it was read.
+    menuState.menuLevel = TERM_ROMS_MENU_LAUNCH;
     term_printString("Press [M] for the menu.\n");
     display_refresh();
     return;
@@ -1590,22 +1687,17 @@ void emul_start() {
     folderName = folder->value;
   }
   health_setPhase(HEALTH_PHASE_SD_CARD);
-  int sdcardErr = sdcard_initFilesystem(&fsys, folderName);
+  sdcard_status_t sdcardErr = sdcard_initFilesystem(&fsys, folderName);
+  // A card an RP restart left inside a write answers "not ready": freed and
+  // mounted once more.
+  sdcardErr = sdcard_recoverAtBoot(sdcardErr);
   // A failing card can take a few seconds to give up.
   health_feed();
+  cardWasMounted = (sdcardErr == SDCARD_INIT_OK);
   if (sdcardErr != SDCARD_INIT_OK) {
+    // No card, or none that mounts: the menu says so, and the main loop
+    // mounts one as soon as it is put in (sdcard_pollRemount()).
     DPRINTF("Error initializing the SD card: %i\n", sdcardErr);
-    failure(
-        "SD card error.\nCheck the card is inserted correctly.\nInsert card "
-        "and restart the computer.");
-    while (1) {
-      // Wait forever, answering the ST
-      emul_pollTick();
-#ifdef BLINK_H
-      blink_toogle();
-#endif
-      sleep_ms(SLEEP_LOOP_MS);
-    }
   } else {
     DPRINTF("SD card found & initialized\n");
     // The configured folder: romsFolder is set later, by init().
@@ -1668,7 +1760,9 @@ void emul_start() {
     // output, etc.).
     term_loop();
 
-    // The network coming up, and the download running
+    // The card going or coming, the network coming up, the download running
+    sdcard_pollRemount();
+    cardPoll();
     netPoll();
     downloadsPoll();
     // A hang past here is the loop's, not the connect's or the download's.

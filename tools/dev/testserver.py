@@ -24,6 +24,8 @@ Generated routes, for any name:
   fail-loop*           a redirect to itself
   *slow-*.img          the 64 KB pattern image in 4 KB pieces, one a second:
                        a download that lasts 16 s and completes
+  *slow-long-*.img     the same, one piece every 10 s: 160 s, long enough to
+                       pull the SD card by hand in the middle of it
   302, 301, rel, cd, 302cd, tohttps   the redirect cases of md-browser's
                        server, ending at file.bin (64 KB, printed MD5)
   autorun/roms.csv     a catalog for the autorun run (point HTTP_CATALOG
@@ -79,7 +81,7 @@ AUTORUN_ROM = "DiagROMCart.rom"
 FAILURES = ["fail-404.img", "fail-500.img", "fail-html200.img",
             "fail-truncated.img", "fail-stall.img", "fail-loop.img",
             "302", "301", "rel", "cd", "302cd", "tohttps", "slow-pattern.img",
-            "a-slow-early.img"]
+            "a-slow-early.img", "slow-long-pattern.img"]
 
 
 def catalog(rows: list[list[str]]) -> bytes:
@@ -163,10 +165,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/octet-stream")
             self.send_header("Content-Length", str(len(SYNTHETIC)))
             self.end_headers()
+            pause = 10 if "slow-long-" in name else 1
             for start in range(0, len(SYNTHETIC), 4096):
                 self.wfile.write(SYNTHETIC[start:start + 4096])
                 self.wfile.flush()
-                time.sleep(1)
+                time.sleep(pause)
         elif name.startswith("synthetic-") and name.endswith(".img"):
             self.send(200, SYNTHETIC)
         elif name == "file.bin":
