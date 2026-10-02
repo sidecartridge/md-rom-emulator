@@ -161,7 +161,9 @@ COUNTERS = ("chandlerHandled", "chandlerDropped", "chandlerRepeated",
             "chandlerChecksumErrors", "commOverruns", "chandlerBusyUs",
             "chandlerMaxBusyUs", "chandlerGapUs", "chandlerMaxGapUs",
             "chandlerQuietUs", "chandlerMaxQuietUs", "chandlerFramePolls",
-            "chandlerPollUs", "chandlerInjected")
+            "chandlerPollUs")
+# Counters a build may lack (added later): read when the ELF has them.
+OPTIONAL_COUNTERS = ("chandlerInjected",)
 POSTMORTEM_VARIABLES = ("keepActive", "menuScreenActive", "protocolPending",
                         "incrementalCmdCount", "commReadIdx") + COUNTERS
 BUILD_ID_SYMBOL = "release_build_id"
@@ -1053,11 +1055,12 @@ def heap_line(snap: dict) -> str:
 def cmd_counters(args: argparse.Namespace) -> int:
     """The command channel's counters, read while the RP runs."""
     elf = matching_elf(args.elf)
-    sym = elf_symbols(elf, *COUNTERS)
+    sym = elf_symbols(elf, *COUNTERS, *OPTIONAL_COUNTERS)
     missing = [n for n in COUNTERS if n not in sym]
     if missing:
         raise SwdError(f"{os.path.basename(elf)} lacks {', '.join(missing)}")
-    first, last = min(sym[n][0] for n in COUNTERS), max(sym[n][0] for n in COUNTERS)
+    names = [n for n in COUNTERS + OPTIONAL_COUNTERS if n in sym]
+    first, last = min(sym[n][0] for n in names), max(sym[n][0] for n in names)
     data = read_memory(first, last - first + 4)
     v = {n: struct.unpack_from("<I", data, sym[n][0] - first)[0] for n in COUNTERS}
     n = v["chandlerHandled"]
@@ -1071,8 +1074,9 @@ def cmd_counters(args: argparse.Namespace) -> int:
           f"(max {v['chandlerMaxGapUs']}), of which quiet {avg('chandlerQuietUs')} us "
           f"(max {v['chandlerMaxQuietUs']}); passes per frame "
           f"{v['chandlerFramePolls'] / n:.2f}" if n else "per command: -")
-    print(f"ring drained for {v['chandlerPollUs'] / 1e6:.3f} s in all; "
-          f"commands injected by the probe {v['chandlerInjected']}")
+    injected = (f"; commands injected by the probe {v['chandlerInjected']}"
+                if "chandlerInjected" in v else "")
+    print(f"ring drained for {v['chandlerPollUs'] / 1e6:.3f} s in all{injected}")
     return 0
 
 
