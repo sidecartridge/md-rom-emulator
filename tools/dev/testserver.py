@@ -31,6 +31,9 @@ Generated routes, for any name:
                        AUTORUN_ROM) and autorun-off/.autorun (empty). Both
                        save as .autorun; the empty one disarms it. Kept out
                        of roms.csv, so a fill never arms it by accident.
+  autorun-name/NAME/.autorun   a .autorun naming NAME, any ROM: download it
+                       into the folder under test (a ROM that is safe on the
+                       ST, such as selfcheck.img, or one that must be refused)
   failures/roms.csv    a catalog of every route above that fails or
                        redirects, make_catalog.py's --cases rows and
                        pattern-64k.img as the control: what the device does
@@ -184,6 +187,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send(200, AUTORUN_ROM.encode() + b"\n")
         elif name == "autorun-off/.autorun":
             self.send(200, b"")
+        elif (name.startswith("autorun-name/") and name.endswith("/.autorun")
+              and name.count("/") == 2):
+            self.send(200, name.split("/")[1].encode() + b"\n")
         else:
             path = os.path.realpath(os.path.join(ROOT, name))
             if (os.path.dirname(path) == os.path.realpath(ROOT)

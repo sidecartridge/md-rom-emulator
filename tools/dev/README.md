@@ -98,7 +98,10 @@ make -C tests/host test                                   # host tests, ASan and
   `fail-loop*`, `*slow-*.img` (a 64 KB download that takes 16 s and completes),
   `synthetic-NNNN.img` for paging tests, and two catalogs apart: `failures/roms.csv` (every failure
   and redirect route, `make_catalog.py`'s `--cases` rows and a control), and `autorun/roms.csv`,
-  which arms (`autorun-on/.autorun`) and disarms (`autorun-off/.autorun`, empty) the autorun. The firmware fetches catalog entries
+  which arms (`autorun-on/.autorun`) and disarms (`autorun-off/.autorun`, empty) the autorun;
+  `autorun-name/NAME/.autorun` is a `.autorun` naming any ROM (`selfcheck.img` is safe on the ST,
+  `oversize-132k.ROM` must be refused). `oversize-132k.ROM` itself is served too, now that the
+  loader refuses it before touching flash. The firmware fetches catalog entries
   from the catalog's own host on port 80, which is why those are the default ports. Requests are
   logged to `tools/dev/logs/testserver.log`.
 - The self-check cartridge (`selfcheck/selfcheck.s`) reads every patterned word of both banks
@@ -111,6 +114,10 @@ make -C tests/host test                                   # host tests, ASan and
   back under it, and its last step reboots the ST into the menu through the agent: a run leaves
   the ST where it found it. With the self-check, a `verdict` step reads its report from the ROM3 capture a
   debug build runs in ROM mode (`swd.py ring`: `0x7f01` pass, `0x7f02` fail).
+- The power-cut test of a ROM write: a 128 KB write takes about 1.45 s, faster than a hand on a
+  power switch. On a debug build, set `romstoreTestEraseRepeats` (a RAM word, by symbol) to 10 over
+  SWD just before typing `[L]`: each sector is erased 11 times and the erase phase lasts about 14 s,
+  its progress marks advancing about once a second. Any reset clears it.
 - `select_harness.py short --expect rom|start` covers ROM mode's other outcomes: `rom` for the
   autorun's blink (the press restarts the RP into the ROM it stored), `start` for the Delay wait
   (the ROM goes live without a restart); it reads `romModeLiveUs`.
