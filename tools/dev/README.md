@@ -224,7 +224,8 @@ python3 tools/dev/swd.py key down                                # a named key: 
 python3 tools/dev/swd.py app heap_hold 16                        # hold 16 KB more heap (0 releases)
 python3 tools/dev/swd.py app wifi 0                              # Wi-Fi down as a lost network (1: up)
 python3 tools/dev/swd.py inject 0x0001 0x0067 0                  # any protocol command
-python3 tools/dev/swd.py crash                                   # why did it last reboot?
+python3 tools/dev/swd.py crash                                   # why did it last reboot? (health.c's record)
+python3 tools/dev/swd.py app health 3                            # provoke a hang (1 panic, 2 fault, 4 stall, 5 overflow)
 python3 tools/dev/swd.py postmortem                              # halt, backtraces, resume
 python3 tools/dev/swd.py heap                                    # heap size, peak, free space
 python3 tools/dev/swd.py counters                                # command channel counters, no halt
@@ -293,6 +294,13 @@ by name for the cursor keys (`swd.py key down`: ASCII 0 and the ST's scan code).
 - `heap_hold KB`: hold KB more kilobytes of heap, on top of what is already held (`heap_hold 0`
   releases everything). Result 0 when the allocation is refused, so repeated calls walk the heap
   down to a known remainder. Watch it with `swd.py heap`.
+- `health N`: provoke a failure from the main loop 250 ms later (`health.h`'s `health_test_t`): 1
+  `panic()`, 2 a HardFault, 3 a hang (the watchdog), 4 a 500 ms stall (no reboot), 5 a stack
+  overflow into the guard. Each reboots and names itself in `swd.py crash`, on the console and on
+  the menu's "Last restart:" line. Three within 60 s trip the crash-loop guard (setup mode, no
+  autorun); a SELECT press clears it. A hang in ROM mode or the Delay wait: write 1 to
+  `romModeTestHang` over SWD (a GDB `set var`), and the watchdog reboots the RP into the same ROM.
+  `healthMaxFeedGapUs` and `healthMaxFeedGapPhase` hold the longest gap between watchdog feeds.
 - `wifi 0|1`: 0 leaves the access point as a lost network would (the menu's `Network:` line says
   so, `[D]` shows the card's catalog under a notice); 1 connects again, and the catalog refreshes
   by itself. For the offline paths without touching the AP.

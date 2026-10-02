@@ -130,6 +130,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         download.c
         emul.c
         gconfig.c
+        health.c
         httpc/httpc.c
         hw_config.c
         navlist.c
@@ -146,6 +147,11 @@ target_sources(${PROJECT_NAME} PRIVATE
 
 # Create map/bin/hex/uf2 files
 pico_add_extra_outputs(${PROJECT_NAME})
+
+# A panic() records the reason and reboots through the watchdog instead of
+# stopping at a breakpoint nobody sees (health.c).
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    PICO_PANIC_FUNCTION=health_panic)
 
 # Link libraries required for the project
 target_link_libraries(${PROJECT_NAME} PRIVATE

@@ -42,6 +42,8 @@ static inline void reset_jump_to_booster(void) {
   // clear every interrupt here, and Booster enables what it needs itself.
   irq_set_mask_enabled(0xFFFFFFFFu, false);
   *((volatile uint32_t *)(PPB_BASE + M0PLUS_NVIC_ICPR_OFFSET)) = 0xFFFFFFFFu;
+  // Booster does not feed the watchdog: one left running would reset it.
+  watchdog_disable();
   __dsb();
   __isb();
   // This code jumps to the Booster application at the top of the flash memory.

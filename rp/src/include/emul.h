@@ -105,5 +105,10 @@ void emul_start();
 //   wifi 0|1       take Wi-Fi down (0, as a lost network) or connect it again
 //                  (1), for the offline paths of [D]ownload.
 #define DEVHOOKS_APP_WIFI 3
+//   health N       provoke a failure from the main loop, 250 ms later
+//                  (health.h's health_test_t): 1 panic, 2 HardFault, 3 hang,
+//                  4 a 500 ms stall, 5 stack overflow. Each must end in a
+//                  reboot that names itself, but the stall.
+#define DEVHOOKS_APP_HEALTH 4
 
 #endif  // EMUL_H

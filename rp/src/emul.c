@@ -27,6 +27,7 @@
 #include "gconfig.h"
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "health.h"
 #include "memfunc.h"
 #include "navlist.h"
 #include "network.h"
@@ -221,6 +222,13 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
     case DEVHOOKS_APP_WIFI:
       netTestWifi((payloadSize >= 2U) && (payload[0] != 0U));
       return 1;
+    case DEVHOOKS_APP_HEALTH:
+      if (payloadSize < 2U || payload[0] == HEALTH_TEST_NONE ||
+          payload[0] > HEALTH_TEST_STACK_OVERFLOW) {
+        return 0;
+      }
+      health_requestTest((health_test_t)payload[0]);
+      return 1;
     default:
       return 0;
   }
@@ -232,6 +240,7 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
 static void emul_serviceFor(uint32_t durationMs) {
   absolute_time_t until = make_timeout_time_ms(durationMs);
   while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
+    health_feed();
     chandler_loop();
   }
 }
@@ -261,6 +270,7 @@ static void emul_quiesceAndFactoryReset(void) {
 static bool emul_waitForStReboot(uint32_t maxMs) {
   absolute_time_t until = make_timeout_time_ms(maxMs);
   while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
+    health_feed();
     chandler_loop();
     int32_t offset = romemul_lastReadOffset();
     if (offset >= 0 && offset < CARTRIDGE_HEADER_BYTES) {
@@ -273,6 +283,7 @@ static bool emul_waitForStReboot(uint32_t maxMs) {
 // What every long wait runs, so the ST's commands are answered and SELECT is
 // seen meanwhile.
 static void __not_in_flash_func(emul_pollTick)(void) {
+  health_feed();
   chandler_loop();
   term_loop();
   select_poll();
@@ -354,6 +365,7 @@ static const romstore_flash_t romFlash = {romFlashErase, romFlashProgram,
                                           romFlashRead, romFlashTick};
 
 static void romFlashBegin(void) {
+  health_setPhase(HEALTH_PHASE_FLASH_WRITE);
   romstoreWriteStartUs = time_us_32();
   romstoreProgressMarks = 0;
   romstoreHeaderShown = false;
@@ -637,6 +649,12 @@ static void showTitle() {
 static void menu(void) {
   menuState.menuLevel = TERM_ROMS_MENU_MAIN;
   showTitle();
+  // Why the RP restarted, when nobody asked for it, on the free row under
+  // the title, for as long as this boot lasts.
+  char bootLine[TERM_SCREEN_SIZE_X];
+  if (health_getBootLine(bootLine, sizeof(bootLine))) {
+    term_printString(bootLine);
+  }
   term_printString("\n\n");
   term_printString("[B] Browse ROMs in microSD card\n");
   term_printString("[D] Download ROMs from the catalog\n");
@@ -849,6 +867,7 @@ static void netPoll(void) {
   if (netState != NET_CONNECTING) {
     return;
   }
+  health_setPhase(HEALTH_PHASE_WIFI_CONNECT);
   wifi_sta_conn_process_status_t result = network_wifiStaConnectPoll();
   if (result == NETWORK_WIFI_STA_CONN_IN_PROGRESS) {
     return;
@@ -875,6 +894,9 @@ static void downloadsPoll(void) {
   if (downloadKind == DOWNLOAD_KIND_NONE) {
     return;
   }
+  health_setPhase((downloadKind == DOWNLOAD_KIND_CATALOG)
+                      ? HEALTH_PHASE_CATALOG_DOWNLOAD
+                      : HEALTH_PHASE_ROM_DOWNLOAD);
   download_status_t status = download_getStatus();
   if (status == DOWNLOAD_STATUS_STARTED ||
       status == DOWNLOAD_STATUS_IN_PROGRESS) {
@@ -1366,9 +1388,21 @@ static void init(const char *folder) {
 static volatile bool selectPressed = false;
 static void romModeSelectPressed(void) { selectPressed = true; }
 
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Debug builds only, set over SWD by symbol: the ROM-mode wait stops feeding
+// the watchdog, as a hang there would, so its reboot can be checked.
+volatile uint32_t romModeTestHang = 0;
+#endif
+
 static void __not_in_flash_func(romModeWaitForSelect)(void) {
   selectPressed = false;
   while (!selectPressed) {
+#if defined(_DEBUG) && (_DEBUG != 0)
+    while (romModeTestHang != 0) {
+      tight_loop_contents();
+    }
+#endif
+    health_feed();
     select_poll();
     sleep_ms(1);
   }
@@ -1424,6 +1458,7 @@ static void romMode(int appModeValue) {
     // Delay/Ripper mode: the ST boots without the cartridge, as the old
     // ripper cartridges worked, until SELECT is pressed.
     DPRINTF("Delay mode: waiting for SELECT to start the ROM\n");
+    health_setPhase(HEALTH_PHASE_DELAY_WAIT);
     romModeWaitForSelect();
   }
 
@@ -1452,6 +1487,7 @@ static void romMode(int appModeValue) {
 #endif
 
   DPRINTF("ROM emulation mode started. Waiting for SELECT button\n");
+  health_setPhase(HEALTH_PHASE_ROM_MODE);
   romModeWaitForSelect();
   DPRINTF("SELECT button pressed: back to the setup menu\n");
 
@@ -1472,6 +1508,11 @@ static void romMode(int appModeValue) {
 }
 
 void emul_start() {
+  // 0. Why the RP started, then the watchdog, in both modes (D-14): from
+  // here a hang reboots the RP and says where it was.
+  health_init();
+  health_watchdogStart();
+
   // 1. ROM mode or setup mode, from the settings
   SettingsConfigEntry *appMode =
       settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_MODE);
@@ -1481,6 +1522,13 @@ void emul_start() {
   } else {
     appModeValue = atoi(appMode->value);
     DPRINTF("Start ROM emulation in mode: %i\n", appModeValue);
+  }
+  // Crashing again and again: setup mode for this boot, with no autorun, and
+  // the reason on the menu. The settings are not changed.
+  bool crashLoop = health_isCrashLoop();
+  if (crashLoop && appModeValue != ROM_MODE_SETUP) {
+    DPRINTF("Crash loop: setup mode instead of ROM mode %i\n", appModeValue);
+    appModeValue = ROM_MODE_SETUP;
   }
 
   // 2. ROM mode: the ST owns the whole window, no command channel.
@@ -1541,7 +1589,10 @@ void emul_start() {
     DPRINTF("FOLDER: %s\n", folder->value);
     folderName = folder->value;
   }
+  health_setPhase(HEALTH_PHASE_SD_CARD);
   int sdcardErr = sdcard_initFilesystem(&fsys, folderName);
+  // A failing card can take a few seconds to give up.
+  health_feed();
   if (sdcardErr != SDCARD_INIT_OK) {
     DPRINTF("Error initializing the SD card: %i\n", sdcardErr);
     failure(
@@ -1558,7 +1609,8 @@ void emul_start() {
   } else {
     DPRINTF("SD card found & initialized\n");
     // The configured folder: romsFolder is set later, by init().
-    AutorunResult autorunResult = autorunIfRequested(folderName);
+    AutorunResult autorunResult = crashLoop ? AUTORUN_ERR_AUTORUN_NOT_FOUND
+                                            : autorunIfRequested(folderName);
     if (autorunResult != AUTORUN_OK) {
       DPRINTF("Autorun error: %i. Continue.\n", autorunResult);
     }
@@ -1587,6 +1639,8 @@ void emul_start() {
   DPRINTF("Start the app loop here\n");
   absolute_time_t nextNetworkPoll = get_absolute_time();
   while (getKeepActive()) {
+    health_feed();
+    health_setPhase(HEALTH_PHASE_MAIN_LOOP);
     devhooks_poll();
     devdownload_poll();
     select_poll();
@@ -1617,6 +1671,11 @@ void emul_start() {
     // The network coming up, and the download running
     netPoll();
     downloadsPoll();
+    // A hang past here is the loop's, not the connect's or the download's.
+    health_setPhase(HEALTH_PHASE_MAIN_LOOP);
+
+    // Heap sampling, the debug summary and the debug test hooks
+    health_tick();
   }
   listClose();
 
@@ -1649,9 +1708,10 @@ void emul_start() {
                          ROM_MODE_SETUP);
     settings_save(aconfig_getContext(), true);
 
-    // Jump to the booster app
+    // Jump to the booster app, which does not feed the watchdog
     DPRINTF("Jumping to the booster app...\n");
     emul_quiesce();
+    health_prepareJump();
     reset_jump_to_booster();
   }
 }

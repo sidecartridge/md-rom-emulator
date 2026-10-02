@@ -94,7 +94,9 @@ FatFs then refuses to replace it. The addresses and registers are the
 build's: read them from `arm-none-eabi-objdump -dl`.
 
 `crash` explains the last reboot without stopping the RP: the watchdog reason
-and scratch registers, with code addresses resolved to source lines.
+and scratch registers and, when the ELF has them, the record health.c decoded
+at boot (bootCause, bootPhase, bootPc, bootLr, bootSp, as in md-devops), with
+code addresses resolved to source lines.
 `postmortem` halts the RP and prints both cores' backtraces, the registers, the
 watchdog registers and key variables through GDB
 ($ARM_GDB_PATH/bin/arm-none-eabi-gdb or arm-none-eabi-gdb), then resumes it
@@ -161,9 +163,15 @@ COUNTERS = ("chandlerHandled", "chandlerDropped", "chandlerRepeated",
             "chandlerChecksumErrors", "commOverruns", "chandlerBusyUs",
             "chandlerMaxBusyUs", "chandlerGapUs", "chandlerMaxGapUs",
             "chandlerQuietUs", "chandlerMaxQuietUs", "chandlerFramePolls",
-            "chandlerPollUs", "chandlerInjected")
+            "chandlerPollUs")
+# Counters a build may lack (added later): read when the ELF has them.
+OPTIONAL_COUNTERS = ("chandlerInjected",)
 POSTMORTEM_VARIABLES = ("keepActive", "menuScreenActive", "protocolPending",
-                        "incrementalCmdCount", "commReadIdx") + COUNTERS
+                        "incrementalCmdCount", "commReadIdx") + COUNTERS + (
+    # health.c: why this boot happened, the crash-loop guard, the watchdog.
+    "bootCause", "bootPhase", "bootPc", "bootLr", "bootSp", "crashCount",
+    "feedCount", "stallMs", "healthMaxFeedGapUs", "healthMaxFeedGapPhase",
+    "heapMinFree", "sbrkHighWater")
 BUILD_ID_SYMBOL = "release_build_id"
 # The ROM3 capture ring (commemul.c): its DMA channel's registers, and where
 # `ring --mark` keeps its position. RING_PARAMS 32-bit parameters are printed.
@@ -1053,13 +1061,14 @@ def heap_line(snap: dict) -> str:
 def cmd_counters(args: argparse.Namespace) -> int:
     """The command channel's counters, read while the RP runs."""
     elf = matching_elf(args.elf)
-    sym = elf_symbols(elf, *COUNTERS)
+    sym = elf_symbols(elf, *COUNTERS, *OPTIONAL_COUNTERS)
     missing = [n for n in COUNTERS if n not in sym]
     if missing:
         raise SwdError(f"{os.path.basename(elf)} lacks {', '.join(missing)}")
-    first, last = min(sym[n][0] for n in COUNTERS), max(sym[n][0] for n in COUNTERS)
+    names = [n for n in COUNTERS + OPTIONAL_COUNTERS if n in sym]
+    first, last = min(sym[n][0] for n in names), max(sym[n][0] for n in names)
     data = read_memory(first, last - first + 4)
-    v = {n: struct.unpack_from("<I", data, sym[n][0] - first)[0] for n in COUNTERS}
+    v = {n: struct.unpack_from("<I", data, sym[n][0] - first)[0] for n in names}
     n = v["chandlerHandled"]
     avg = lambda key: f"{v[key] / n:.0f}" if n else "-"
     print(f"commands answered {n}, dropped while one was pending "
@@ -1071,8 +1080,9 @@ def cmd_counters(args: argparse.Namespace) -> int:
           f"(max {v['chandlerMaxGapUs']}), of which quiet {avg('chandlerQuietUs')} us "
           f"(max {v['chandlerMaxQuietUs']}); passes per frame "
           f"{v['chandlerFramePolls'] / n:.2f}" if n else "per command: -")
-    print(f"ring drained for {v['chandlerPollUs'] / 1e6:.3f} s in all; "
-          f"commands injected by the probe {v['chandlerInjected']}")
+    injected = (f"; commands injected by the probe {v['chandlerInjected']}"
+                if "chandlerInjected" in v else "")
+    print(f"ring drained for {v['chandlerPollUs'] / 1e6:.3f} s in all{injected}")
     return 0
 
 
@@ -1453,15 +1463,62 @@ def resolve_address(elf: str, address: int) -> str:
     return "" if out.startswith("??") else out.replace("\n", "; ")
 
 
+def header_enums(path: str) -> dict[str, dict[int, str]]:
+    """Values of each `typedef enum {...} name;` in a C header."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        text = f.read()
+    text = re.sub(r"/\*.*?\*/", " ", text, flags=re.S)
+    text = re.sub(r"//[^\n]*", " ", text)
+    enums = {}
+    for body, name in re.findall(r"typedef\s+enum\s*\{([^}]*)\}\s*(\w+)\s*;",
+                                 text):
+        values, nxt = {}, 0
+        for item in (i.strip() for i in body.split(",")):
+            if not item:
+                continue
+            m = re.match(r"(\w+)\s*(?:=\s*(\S+))?$", item)
+            if not m:
+                continue
+            if m.group(2):
+                nxt = int(m.group(2), 0)
+            values[nxt] = m.group(1)
+            nxt += 1
+        enums[name] = values
+    return enums
+
+
 def cmd_crash(args: argparse.Namespace) -> int:
     elf = matching_elf(args.elf)
     reason, *scratch = struct.unpack("<5I", read_memory(WATCHDOG_REASON, 20))
     print(f"watchdog reason 0x{reason:08x}; scratch 0-3: " +
           " ".join(f"0x{v:08x}" for v in scratch))
-    for i, v in enumerate(scratch):
-        where = resolve_address(elf, v)
-        if where:
-            print(f"  scratch {i}: {where}")
+    names = ("bootCause", "bootPhase", "bootPc", "bootLr", "bootSp")
+    syms = elf_symbols(elf, *names)
+    if len(syms) < len(names):
+        for i, v in enumerate(scratch):
+            where = resolve_address(elf, v)
+            if where:
+                print(f"  scratch {i}: {where}")
+        return 0
+    values = {}
+    for name in names:
+        addr, size = syms[name]
+        values[name] = int.from_bytes(read_memory(addr, size or 4), "little")
+    enums = {}
+    for header in glob.glob(os.path.join(INCLUDE_DIR, "*.h")):
+        enums.update(header_enums(header))
+    cause = enums.get("health_boot_t", {}).get(values["bootCause"],
+                                               str(values["bootCause"]))
+    print(f"last boot cause: {cause}")
+    if cause.endswith("HANG"):
+        phase = enums.get("health_phase_t", {}).get(values["bootPhase"],
+                                                    str(values["bootPhase"]))
+        print(f"  phase: {phase}")
+    for label, name in (("pc", "bootPc"), ("lr", "bootLr"), ("sp", "bootSp")):
+        v = values[name]
+        if v:
+            where = resolve_address(elf, v)
+            print(f"  {label} 0x{v:08x}" + (f"  {where}" if where else ""))
     return 0
 
 
