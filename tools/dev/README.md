@@ -63,7 +63,7 @@ What differs here:
   not the template's 64 KB at `0x20030000`. The tools find it through the ELF's
   `__rom_in_ram_start__`, and the framebuffer through `DISPLAY_BUFFER_OFFSET` in
   `rp/src/include/display.h` (`0xE0C0` into the window, the top of ROM4, as in the template).
-- `flash.sh` checks the submodule pins and uses the CMake build type (MinSizeRel) of this
+- `flash.sh` checks the submodule pins and uses the CMake build type (Release) of this
   repository's `rp/build.sh`.
 - The setup menu is this app's, not the template's: `select_harness.py` counts the menu as shown
   when the terminal reads its prompt (the ELF has no `menuScreenActive`), `tools_harness.py` skips
@@ -186,7 +186,7 @@ tools/dev/flash.sh debug --src /tmp/src   # build a copy of rp/src (for example 
 Builds out of tree in `tools/dev/builds/<type>`, incrementally, the profile releases ship (HTTP and
 HTTPS downloads; `APP_DOWNLOAD_HTTPS=0` builds HTTP only, in `tools/dev/builds/<type>-http`). It does not touch `rp/build` or
 the submodules, and warns when a submodule is not at the version `rp/build.sh` pins. It builds
-with the same CMake build type as `rp/build.sh` (MinSizeRel; `RP_CMAKE_BUILD_TYPE` overrides it,
+with the same CMake build type as `rp/build.sh` (Release; `RP_CMAKE_BUILD_TYPE` overrides it,
 with a warning, in a folder of its own). The m68k
 image is not rebuilt: after changing `target/atarist`, run `target/atarist/build.sh` first (it
 regenerates `rp/src/include/target_firmware.h`), then `flash.sh`.

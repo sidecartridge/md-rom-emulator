@@ -333,9 +333,10 @@ add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 # the link guarantees: a build whose static data leaves less fails to link.
 # Measured: 13.1 KB of heap at the peak after boot and the menu commands; with
 # HTTPS downloads (their TLS buffers are in the window, see emul.c) 18.6 KB over
-# every test download, so an HTTPS build guarantees that and 11 KB more.
+# every test download, so an HTTPS build guarantees that and 8 KB more. A CMake
+# Release build keeps 34.2 KB of heap, 29.2 KB with DEBUG_MODE.
 if(APP_DOWNLOAD_HTTPS)
-    set(APP_HEAP_SIZE 0x7600)
+    set(APP_HEAP_SIZE 0x6C00)
 else()
     set(APP_HEAP_SIZE 0x8000)
 endif()

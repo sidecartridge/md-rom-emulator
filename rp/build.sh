@@ -86,12 +86,15 @@ case "$BUILD_TYPE" in
 esac
 export BUILD_TYPE
 
-# MinSizeRel for now: v2.1.1 found a Release build that broke at runtime, and
-# that symptom is to be reproduced and explained before both build types move
-# to CMake Release. RP_CMAKE_BUILD_TYPE replaces only the CMake build type:
-# Release to compare, Debug (-Og, asserts on) to step through the code in a
-# debugger.
-CMAKE_BUILD_TYPE_ARG=MinSizeRel
+# CMake Release for both build types: a debug build only adds DEBUG_MODE=1.
+# v2.1.1's Release trouble came from defects that are gone: core 0's stack ran
+# past its 4 KB into core 1's during downloads (deeper at -O3), and in ROM mode
+# the Wi-Fi driver's background timer interrupt (threadsafe_background) hung
+# the main loop; the stack now has its own bank and a guard, and the driver is
+# polled. mbedTLS stays -Os whatever the type (src/CMakeLists.txt).
+# RP_CMAKE_BUILD_TYPE replaces only the CMake build type: MinSizeRel to
+# compare, Debug (-Og, asserts on) to step through the code in a debugger.
+CMAKE_BUILD_TYPE_ARG=Release
 if [ -n "$RP_CMAKE_BUILD_TYPE" ]; then
     CMAKE_BUILD_TYPE_ARG=$RP_CMAKE_BUILD_TYPE
     echo "************************************************************"
