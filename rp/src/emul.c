@@ -2324,7 +2324,10 @@ void emul_start() {
     chandler_loop();
     if (chandler_consumeStBoot()) {
       // A new ST session: nothing typed before the reset carries over, and
-      // the ST gets a freshly drawn menu.
+      // the ST gets a freshly drawn menu. A command still in the sentinel was
+      // the last session's (the desktop after [E]): left there, every reset
+      // went straight to the desktop again.
+      SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_NOP);
       term_clearInputBuffer();
       listClose();
       menu();
