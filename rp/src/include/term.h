@@ -54,6 +54,19 @@
 #define TERM_KEYBOARD_KEY_START 0x20         // Start of the ASCII table
 #define TERM_KEYBOARD_KEY_END 0x7E           // End of the ASCII table
 #define TERM_KEYBOARD_KEY_MASK 0xFF          // Mask for the key
+
+// The cursor keys: the ST sends them as ASCII 0 with these scan codes, and a
+// key handler (term_setKeyHandler) gets them as the TERM_KEY_* codes below
+// (md-drives-emulator's values).
+#define TERM_KEYBOARD_SCAN_CODE_UP 72
+#define TERM_KEYBOARD_SCAN_CODE_DOWN 80
+#define TERM_KEYBOARD_SCAN_CODE_LEFT 75
+#define TERM_KEYBOARD_SCAN_CODE_RIGHT 77
+#define TERM_KEY_UP 16
+#define TERM_KEY_DOWN 14
+#define TERM_KEY_LEFT 2
+#define TERM_KEY_RIGHT 6
+#define TERM_KEY_ESC 27
 #define TERM_KEYBOARD_SHIFT_MASK 0xFF000000  // Mask for the shift key
 #define TERM_KEYBOARD_SHIFT_SHIFT 24         // Shift for the shift key
 #define TERM_KEYBOARD_SCAN_MASK 0xFF0000     // Mask for the scan code
@@ -124,6 +137,13 @@ void term_setCommands(const Command *cmds, size_t count);
  * ensuring that subsequent input operations start with a clean state.
  */
 void term_clearInputBuffer(void);
+
+/**
+ * @brief While a handler is set, every keystroke goes to it, the cursor keys
+ * as TERM_KEY_*, instead of to the line editor. NULL gives the keys back.
+ */
+typedef void (*TermKeyHandler)(char key);
+void term_setKeyHandler(TermKeyHandler handler);
 
 /**
  * @brief Retrieve the current terminal input buffer.

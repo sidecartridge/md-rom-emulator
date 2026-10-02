@@ -670,7 +670,14 @@ static void srv_txt(struct mdns_service *service, void *txt_userdata) {
 }
 #endif
 
-wifi_sta_conn_process_status_t network_wifiStaConnect() {
+// A connection network_wifiStaConnectStart() started and
+// network_wifiStaConnectPoll() follows.
+static bool staConnecting = false;
+static wifi_sta_conn_status_t staPrevStatus = DISCONNECTED;
+static absolute_time_t staStatusTime;
+static absolute_time_t staTimeout;
+
+wifi_sta_conn_process_status_t network_wifiStaConnectStart() {
   if (!cyw43Initialized) {
     DPRINTF("WiFi not initialized. Cancelling connection\n");
     return NETWORK_WIFI_STA_CONN_ERR_NOT_INITIALIZED;
@@ -889,22 +896,55 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
     return NETWORK_WIFI_STA_CONN_ERR_CONNECTION_FAILED;
   }
 
-  // Enter a loop until the device has a WiFi connection with an IP address. Or
-  // timesout.
-  wifi_sta_conn_status_t prevStatus = DISCONNECTED;
-  int wifiConnPollingInterval = 1;  // 1 seconds
-  absolute_time_t wifiConnStatusTime = make_timeout_time_ms(1 * SEC_TO_MS);
-  absolute_time_t wifiConnConnTimeout =
-      make_timeout_time_ms(NETWORK_CONNECT_TIMEOUT * SEC_TO_MS);  // 30 seconds
-  while (absolute_time_diff_us(get_absolute_time(), wifiConnConnTimeout) > 0) {
+  staPrevStatus = DISCONNECTED;
+  staStatusTime = make_timeout_time_ms(1 * SEC_TO_MS);
+  staTimeout = make_timeout_time_ms(NETWORK_CONNECT_TIMEOUT * SEC_TO_MS);
+  staConnecting = true;
+  return NETWORK_WIFI_STA_CONN_OK;
+}
+
+wifi_sta_conn_process_status_t network_wifiStaConnectPoll() {
+  if (!staConnecting) {
+    return NETWORK_WIFI_STA_CONN_ERR_NOT_INITIALIZED;
+  }
+  if (absolute_time_diff_us(get_absolute_time(), staTimeout) <= 0) {
+    DPRINTF("WiFi connection timeout\n");
+    staConnecting = false;
+    return NETWORK_WIFI_STA_CONN_ERR_TIMEOUT;
+  }
+  wifi_sta_conn_status_t status = network_wifiConnStatus(&staStatusTime, 1);
+#if PICO_CYW43_ARCH_POLL
+  network_safePoll();
+#endif
+  if (status != staPrevStatus) {
+    DPRINTF("WiFi connection status: %s[%i]\n", network_wifiConnStatusStr(),
+            status);
+    staPrevStatus = status;
+  }
+  if (status != CONNECTED_WIFI_IP) {
+    return NETWORK_WIFI_STA_CONN_IN_PROGRESS;
+  }
+#ifdef BLINK_H
+  blink_on();
+#endif
+  staConnecting = false;
+  DPRINTF("Connected. Check the connection status...\n");
+  network_updateCurrentNetworkInfoRadio();
+  return NETWORK_WIFI_STA_CONN_OK;
+}
+
+wifi_sta_conn_process_status_t network_wifiStaConnect() {
+  // Until the device has a WiFi connection with an IP address, or times out.
+  wifi_sta_conn_process_status_t result = network_wifiStaConnectStart();
+  while (result == NETWORK_WIFI_STA_CONN_OK) {
 #ifdef BLINK_H
     blink_morse('T');
 #endif
-
-    wifi_sta_conn_status_t status =
-        network_wifiConnStatus(&wifiConnStatusTime, wifiConnPollingInterval);
+    result = network_wifiStaConnectPoll();
+    if (result != NETWORK_WIFI_STA_CONN_IN_PROGRESS) {
+      break;
+    }
 #if PICO_CYW43_ARCH_POLL
-    network_safePoll();
     cyw43_arch_wait_for_work_until(make_timeout_time_ms(2 * SEC_TO_MS));
 #else
     sleep_ms(NETWORK_POLLING_INTERVAL);
@@ -912,27 +952,9 @@ wifi_sta_conn_process_status_t network_wifiStaConnect() {
     if (networkPollingCallback != NULL) {
       networkPollingCallback();
     }
-    if (status != prevStatus) {
-      DPRINTF("WiFi connection status: %s[%i]\n", network_wifiConnStatusStr(),
-              status);
-      prevStatus = status;
-    }
-    if (status == CONNECTED_WIFI_IP) {
-#ifdef BLINK_H
-      blink_on();
-#endif
-      break;
-    }
+    result = NETWORK_WIFI_STA_CONN_OK;
   }
-  if (absolute_time_diff_us(get_absolute_time(), wifiConnConnTimeout) <= 0) {
-    DPRINTF("WiFi connection timeout\n");
-    // Return the error code
-    return NETWORK_WIFI_STA_CONN_ERR_TIMEOUT;
-  }
-
-  DPRINTF("Connected. Check the connection status...\n");
-  network_updateCurrentNetworkInfoRadio();
-  return 0;
+  return result;
 }
 
 char *network_wifiConnStatusStr() { return connectionStatusStr; }

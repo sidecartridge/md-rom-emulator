@@ -15,6 +15,7 @@
 
 // included in the C file to avoid multiple definitions
 #include "aconfig.h"
+#include "catalog.h"
 #include "chandler.h"
 #include "commemul.h"
 #include "constants.h"
@@ -27,6 +28,7 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "memfunc.h"
+#include "navlist.h"
 #include "network.h"
 #include "pico/stdlib.h"
 #include "reset.h"
@@ -50,8 +52,6 @@
 
 // Command handlers
 static void cmdMenu(const char *arg);
-static void cmdNext(const char *arg);
-static void cmdPrev(const char *arg);
 static void cmdClear(const char *arg);
 static void cmdExit(const char *arg);
 static void cmdHelp(const char *arg);
@@ -63,13 +63,12 @@ static void cmdDelay(const char *arg);
 static void cmdUnknown(const char *arg);
 #if defined(_DEBUG) && (_DEBUG != 0)
 static void cmdFirmware(const char *arg);
+static void netTestWifi(bool up);
 #endif
 
 // Command table
 static const Command commands[] = {
     {"m", cmdMenu},
-    {"n", cmdNext},
-    {"p", cmdPrev},
     {"h", cmdHelp},
     {"b", cmdCard},
     {"d", cmdNetwork},
@@ -98,17 +97,8 @@ static const Command commands[] = {
 // Number of commands in the table
 static const size_t numCommands = sizeof(commands) / sizeof(commands[0]);
 
-// Global array to store ROM info.
-static ROM *roms = NULL;
-static int romsCount = 0;
-
 // ROMs folder. Initialize with the default value.
 static char romsFolder[MAX_PATH_SIZE] = "/roms";
-
-// Pagination info
-static int currentRomPage = 0;
-static int maxRomPages = 0;
-static int downloadRomSelected = -1;
 
 // Menu status
 static MenuState menuState = {0, 0};
@@ -120,15 +110,67 @@ static bool keepActive = true;
 // By default, we reset the device.
 static bool resetDeviceAtBoot = true;
 
-// Do we have network or not?
-static bool hasNetwork = false;
-static bool wifiConnected = false;
-static bool catalogAvailable = false;
-
 // Delay/ripper mode?
 static bool delayMode = false;
-// A ROM download from the catalog is running: romDownloadPoll() finishes it.
-static bool romDownloadActive = false;
+
+// The network, brought up behind the menu: the menu never waits for it.
+typedef enum {
+  NET_OFF = 0,     // no Wi-Fi settings, or Booster's AP mode
+  NET_CONNECTING,  // network_wifiStaConnectPoll() from the main loop
+  NET_UP,
+  NET_FAILED,
+} NetState;
+static NetState netState = NET_OFF;
+static const char *netReason = "Wi-Fi is not configured.";
+static int netAttempts = 0;
+#define NET_CONNECT_ATTEMPTS 3
+
+// The catalog on the card, <FOLDER>/roms.csv, refreshed once the network is
+// up; the card's copy is replaced only by a complete download.
+typedef enum {
+  CATALOG_REFRESH_NONE = 0,
+  CATALOG_REFRESH_RUNNING,
+  CATALOG_REFRESH_DONE,
+  CATALOG_REFRESH_FAILED,
+} CatalogRefresh;
+static CatalogRefresh catalogRefresh = CATALOG_REFRESH_NONE;
+static char catalogReason[TERM_SCREEN_SIZE_X] = "";
+
+// Where the catalog came from, after its redirects: a ROM is fetched from
+// the catalog's host, whatever was downloaded since.
+static struct {
+  char protocol[DOWNLOAD_PROTOCOL_SIZE];
+  char host[DOWNLOAD_HOSTNAME_SIZE];
+  uint16_t port;
+  bool known;
+} catalogOrigin;
+
+// One download at a time: the catalog refresh, or a ROM from it.
+typedef enum {
+  DOWNLOAD_KIND_NONE = 0,
+  DOWNLOAD_KIND_CATALOG,
+  DOWNLOAD_KIND_ROM,
+} DownloadKind;
+static DownloadKind downloadKind = DOWNLOAD_KIND_NONE;
+// The ROM being downloaded, copied when it started: selected on success, and
+// its size in the catalog, which the file must match.
+static char downloadRomName[CATALOG_SAVED_NAME_BYTES] = "";
+static uint32_t downloadRomSizeKb = 0;
+// The last download's outcome, a line on the menu.
+static char downloadMessage[TERM_SCREEN_SIZE_X * 2] = "";
+
+// The lists: [B]rowse (the ROM files on the card) and [D]ownload (the
+// catalog), a page at a time (navlist.c), keys taken one at a time.
+typedef enum { LIST_NONE = 0, LIST_CARD, LIST_CATALOG } ListKind;
+static ListKind listKind = LIST_NONE;
+static navlist_t listNav;
+static bool listDetails = false;
+static SdRom *sdRoms = NULL;  // [B]: only while the list is open
+static uint32_t sdRomsCount = 0;
+static catalog_t catalog;  // [D]: the page index, while the list is open
+static uint32_t catalogPageCached = UINT32_MAX;
+static char catalogNames[NAVLIST_PAGE_LINES][CATALOG_SHOWN_BYTES];
+static catalog_entry_t catalogEntry;  // the one on the details screen
 
 #if defined(_DEBUG) && (_DEBUG != 0)
 // Heap held on request by `swd.py app heap_hold`, to test running out of it.
@@ -163,6 +205,9 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
     }
     case DEVHOOKS_APP_DOWNLOAD:
       return devdownload_start();
+    case DEVHOOKS_APP_WIFI:
+      netTestWifi((payloadSize >= 2u) && (payload[0] != 0u));
+      return 1;
     default:
       return 0;
   }
@@ -477,61 +522,11 @@ static int hasValidExtension(const char *filename) {
   return 0;
 }
 
-/**
- * @brief Comparison function for qsort to sort ROMs lexicographically
- * (case-insensitive).
- */
-static int compareRoms(const void *first, const void *second) {
-  const ROM *romA = (const ROM *)first;
-  const ROM *romB = (const ROM *)second;
-  return strcasecmp(romA->filename, romB->filename);
-}
-
-//-----------------------------------------------------------------
-// Helper: URL-decode a string.
-// Converts %xx sequences into their character values.
-// dest_size includes room for the null terminator.
-static void urlDecode(const char *src, char *dest, size_t destSize) {
-  size_t idx = 0;
-  while (*src && idx < destSize - 1) {
-    if (*src == '%') {
-      // Check if next two characters are valid hex digits.
-      if (isxdigit((unsigned char)*(src + 1)) &&
-          isxdigit((unsigned char)*(src + 2))) {
-        char hex[3] = {*(src + 1), *(src + 2), '\0'};
-        dest[idx++] = (char)strtol(hex, NULL, HEX_BASE);
-        src += 3;
-        continue;
-      }
-    }
-    dest[idx++] = *src++;
-  }
-  dest[idx] = '\0';
-}
-
-// Percent-encode a path for a request line: everything but RFC 3986's
-// unreserved characters and '/'. The catalog's names are decoded for the
-// screen and the card ("Buggy Boy.img"); the request needs them encoded.
-static void urlEncodePath(const char *src, char *dest, size_t destSize) {
-  static const char hexDigits[] = "0123456789ABCDEF";
-  size_t idx = 0;
-  for (; *src != '\0'; src++) {
-    unsigned char chr = (unsigned char)*src;
-    bool plain = (isalnum(chr) != 0) || chr == '-' || chr == '_' ||
-                 chr == '.' || chr == '~' || chr == '/';
-    size_t need = plain ? 1U : 3U;
-    if (idx + need >= destSize) {
-      break;
-    }
-    if (plain) {
-      dest[idx++] = (char)chr;
-    } else {
-      dest[idx++] = '%';
-      dest[idx++] = hexDigits[chr / HEX_BASE];
-      dest[idx++] = hexDigits[chr % HEX_BASE];
-    }
-  }
-  dest[idx] = '\0';
+// [B]rowse sorts by the name shown, case-insensitively.
+static int compareSdRoms(const void *first, const void *second) {
+  const SdRom *romA = (const SdRom *)first;
+  const SdRom *romB = (const SdRom *)second;
+  return strcasecmp(romA->name, romB->name);
 }
 
 // The ROM's full name for EMULATED, from the name the browse list opens (the
@@ -568,241 +563,54 @@ static void termPrintCut(const char *text, int width) {
   term_printString(cut);
 }
 
+// The ROM files in folder, into sdRoms (allocated here, freed by
+// listClose()), sorted by name. The list is empty when the folder cannot be
+// read.
 static FRESULT readRomsSdcard(const char *folder) {
-  FRESULT res;
+  sdRomsCount = 0;
+  if (sdRoms == NULL) {
+    sdRoms = (SdRom *)malloc(MAX_ROMS * sizeof(SdRom));
+    if (sdRoms == NULL) {
+      return FR_NOT_ENOUGH_CORE;
+    }
+  }
   DIR dir;
   FILINFO fno;
-
-  // The list empties first: a folder that cannot be read leaves no stale one.
-  romsCount = 0;
-  maxRomPages = 0;
-  res = f_opendir(&dir, folder);
+  FRESULT res = f_opendir(&dir, folder);
   if (res != FR_OK) {
     DPRINTF("Error opening directory %s: %d\n", folder, res);
     return res;
   }
-
-  // Read each directory entry.
   for (;;) {
     // A large folder takes a while: keep answering the ST.
     emul_pollTick();
     res = f_readdir(&dir, &fno);
     if (res != FR_OK || fno.fname[0] == 0) {
-      break;  // Break on error or end of directory
+      break;
     }
-
-    // Skip directories if you only want files.
-    if (fno.fattrib & AM_DIR) {
+    if ((fno.fattrib & AM_DIR) || fno.fname[0] == '.' ||
+        !hasValidExtension(fno.fname)) {
       continue;
     }
-
-    // Skip files starting with '.'
-    if (fno.fname[0] == '.') {
-      continue;
-    }
-
-    // Only add files with valid extensions.
-    if (!hasValidExtension(fno.fname)) {
-      continue;
-    }
-
-    // Store the filename into the roms[] array if there is space.
-    if (romsCount < MAX_ROMS) {
-      // The name to open: the long name when the field holds it whole, the
-      // card's short 8.3 name otherwise, which opens the same file. The name
-      // on screen is the long one, cut to the field.
-      const char *openName = (strlen(fno.fname) < MAX_FILENAME_LENGTH ||
-                              fno.altname[0] == '\0')
-                                 ? fno.fname
-                                 : fno.altname;
-      strncpy(roms[romsCount].filename, openName, MAX_FILENAME_LENGTH - 1);
-      roms[romsCount].filename[MAX_FILENAME_LENGTH - 1] = '\0';
-      strncpy(roms[romsCount].name, fno.fname, MAX_FILENAME_LENGTH - 1);
-      roms[romsCount].name[MAX_FILENAME_LENGTH - 1] = '\0';
-      romsCount++;
-    } else {
+    if (sdRomsCount >= MAX_ROMS) {
       DPRINTF("Maximum ROM count reached (%d)\n", MAX_ROMS);
       break;
     }
+    // The name to open: the long name when the field holds it whole, the
+    // card's short 8.3 name otherwise, which opens the same file. The name
+    // on screen is the long one, cut to the field.
+    const char *openName =
+        (strlen(fno.fname) < MAX_FILENAME_LENGTH || fno.altname[0] == '\0')
+            ? fno.fname
+            : fno.altname;
+    SdRom *rom = &sdRoms[sdRomsCount++];
+    snprintf(rom->open, sizeof(rom->open), "%s", openName);
+    snprintf(rom->name, sizeof(rom->name), "%s", fno.fname);
   }
-
   f_closedir(&dir);
-
-  // Sort the roms array alphabetically (lexicographically) by filename.
-  qsort(roms, romsCount, sizeof(ROM), compareRoms);
-
-  DPRINTF("Found %d ROMs on the SD card.\n", romsCount);
-  maxRomPages = (romsCount + MAX_ROMS_PER_PAGE - 1) / MAX_ROMS_PER_PAGE;
+  qsort(sdRoms, sdRomsCount, sizeof(SdRom), compareSdRoms);
+  DPRINTF("Found %lu ROMs on the SD card.\n", (unsigned long)sdRomsCount);
   return FR_OK;
-}
-
-static void readRomsCsv(const char *csvFilepath) {
-  FRESULT res;
-  FIL csvFile;
-  const size_t lineSize = 256;
-  char *line = malloc(lineSize);  // If you really have huge CSV lines, make
-                                  // this larger, but 256 is often enough.
-  int lineNum = 0;
-  // Reduce stack usage: keep field buffers in static storage.
-  static char field1[MAX_PATH_SIZE];  // URL
-  static char field2[MAX_PATH_SIZE];  // Name
-  static char field3[MAX_PATH_SIZE];  // Description (tune this)
-  static char field4[MAX_PATH_SIZE];  // Tags (tune this)
-  static char field5[12];             // Size (KB) (should never be big)
-
-  romsCount = 0;
-
-  if (line == NULL) {
-    DPRINTF("Error allocating memory for CSV line buffer\n");
-    return;
-  }
-
-  res = f_open(&csvFile, csvFilepath, FA_READ);
-  if (res != FR_OK) {
-    DPRINTF("Error opening CSV file %s: %d\n", csvFilepath, res);
-    free(line);
-    return;
-  }
-
-  // Skip header
-  if (f_gets(line, lineSize, &csvFile) == NULL) {
-    DPRINTF("Error reading header from CSV file\n");
-    f_close(&csvFile);
-    free(line);
-    return;
-  }
-
-  while (f_gets(line, lineSize, &csvFile) != NULL) {
-    lineNum++;
-    DPRINTF("Line %d: %s", lineNum, line);
-
-    if (line[0] == '\0' || line[0] == '\n') continue;
-
-    // These should be as small as possible!
-    memset(field1, 0, sizeof(field1));
-    memset(field2, 0, sizeof(field2));
-    memset(field3, 0, sizeof(field3));
-    memset(field4, 0, sizeof(field4));
-    memset(field5, 0, sizeof(field5));
-
-    char *ptr = line;
-    int jdx;
-
-// Tiny helper: extracts quoted CSV field (no inner quotes support)
-#define EXTRACT_FIELD(dest)                                \
-  do {                                                     \
-    while (*ptr && isspace((unsigned char)*ptr)) ptr++;    \
-    if (*ptr != '\"') goto next_line;                      \
-    ptr++;                                                 \
-    jdx = 0;                                               \
-    while (*ptr && *ptr != '\"' && jdx < sizeof(dest) - 1) \
-      dest[jdx++] = *ptr++;                                \
-    dest[jdx] = 0;                                         \
-    if (*ptr == '\"') ptr++;                               \
-    while (*ptr && (*ptr == ',' || isspace(*ptr))) ptr++;  \
-  } while (0)
-
-    EXTRACT_FIELD(field1);  // URL
-    EXTRACT_FIELD(field2);  // Name
-    EXTRACT_FIELD(field3);  // Description
-    EXTRACT_FIELD(field4);  // Tags
-    EXTRACT_FIELD(field5);  // Size
-
-    // --- Decode fields directly into their struct fields ---
-    if (romsCount < MAX_ROMS) {
-      ROM *r = &roms[romsCount];
-
-      urlDecode(field1, r->filename, sizeof(r->filename));
-      urlDecode(field2, r->name, sizeof(r->name));
-      urlDecode(field3, r->description, sizeof(r->description));
-      urlDecode(field4, r->tags, sizeof(r->tags));
-      r->size = atoi(field5);
-
-      romsCount++;
-    } else {
-      DPRINTF("Maximum ROM count reached (%d)\n", MAX_ROMS);
-      break;
-    }
-  next_line:;
-  }
-  f_close(&csvFile);
-  free(line);
-
-  qsort(roms, romsCount, sizeof(ROM), compareRoms);
-
-  DPRINTF("Found %d ROMs in CSV file.\n", romsCount);
-  maxRomPages = (romsCount + MAX_ROMS_PER_PAGE - 1) / MAX_ROMS_PER_PAGE;
-#undef EXTRACT_FIELD
-}
-
-/**
- * @brief Displays a single page of ROM entries.
- *
- * @param roms        The array of ROM structures.
- * @param roms_count  The total number of ROM entries.
- * @param page_size   The number of lines (or rows) per page.
- * @param page_number The page number to display (starting with 0).
- */
-static void displayRomsPage(const ROM roms[], int romsCount, int pageSize,
-                            int pageNumber) {
-  if (pageSize <= 0) {
-    pageSize = 0;
-  }
-
-  if (roms == NULL || romsCount <= 0) {
-    term_printString("No ROMs to show.\n");
-    return;
-  }
-  int startIndex = pageNumber * pageSize;
-  if (startIndex >= romsCount) {
-    startIndex = romsCount - 1;
-  }
-
-  int endIndex = startIndex + pageSize;
-  if (endIndex > romsCount) {
-    endIndex = romsCount;
-  }
-
-  const size_t buffSize = TERM_SCREEN_SIZE_X;
-  char *buff = malloc(buffSize);
-  if (buff == NULL) {
-    DPRINTF("Error allocating memory for display buffer\n");
-    return;
-  }
-  // Page starts at 1 for user display.
-  snprintf(buff, buffSize, "Page %d, ROMs %d to %d of %d:\n\n", pageNumber + 1,
-           startIndex + 1, endIndex, romsCount);
-  term_printString(buff);
-
-  for (int i = startIndex; i < endIndex; i++) {
-    // ROMs starts at 1 for user display.
-    snprintf(buff, buffSize, "%d. %s\n", i + 1, roms[i].name);
-    if (strlen(buff) >= (buffSize - 2)) {
-      if (buff[strlen(buff) - 2] != '\n') {
-        buff[strlen(buff) - 2] = '\n';
-        buff[strlen(buff) - 1] = '\0';
-      }
-    }
-    term_printString(buff);
-  }
-  free(buff);
-
-  currentRomPage = pageNumber;
-}
-
-static void navigatePages(int pageNumber) {
-  term_printString(
-      "\x1B"
-      "E");
-  displayRomsPage(roms, romsCount, MAX_ROMS_PER_PAGE, pageNumber);
-  term_printString("\n");
-  if (pageNumber < maxRomPages - 1) {
-    term_printString("[N]ext ");
-  }
-  if (pageNumber > 0) {
-    term_printString("[P]rev ");
-  }
-  term_printString("[M]enu or ROM number");
 }
 
 static void showTitle() {
@@ -814,18 +622,12 @@ static void showTitle() {
 
 static void menu(void) {
   menuState.menuLevel = TERM_ROMS_MENU_MAIN;
-  // Before [D] is offered: v2.1.2 set this only while drawing the status line
-  // below, and showed [D] because it drew the menu twice at boot.
-  ip_addr_t currentIp = network_getCurrentIp();
-  hasNetwork = wifiConnected || (currentIp.addr != 0);
   showTitle();
   term_printString("\n\n");
   term_printString("[B] Browse ROMs in microSD card\n");
-  if (hasNetwork && catalogAvailable) {
-    term_printString("[D] Download ROMs from internet server\n");
-  }
+  term_printString("[D] Download ROMs from the catalog\n");
   term_printString("[S] Settings\n\n");
-  term_printString("[E] Exit to desktop\n");
+  term_printString("[E] Exit to desktop (or hold SHIFT)\n");
   term_printString("[X] Return to booster menu\n\n");
 
   if (delayMode) {
@@ -850,35 +652,33 @@ static void menu(void) {
 
   term_printString("\n");
 
-  // Display network status
-  term_printString("Network status: ");
-  if (hasNetwork) {
-    term_printString("Connected\n");
-  } else {
-    term_printString("Not connected\n");
+  // The network, then the last download
+  term_printString("Network: ");
+  switch (netState) {
+    case NET_CONNECTING:
+      term_printString("connecting...\n");
+      break;
+    case NET_UP:
+      term_printString(catalogRefresh == CATALOG_REFRESH_RUNNING
+                           ? "connected, refreshing\n"
+                           : "connected\n");
+      break;
+    default:
+      term_printString(netReason);
+      term_printString("\n");
+      break;
   }
-
-  term_printString("\n");
+  if (downloadMessage[0] != '\0') {
+    term_printString(downloadMessage);
+    term_printString("\n");
+  } else {
+    term_printString("\n");
+  }
   term_printString("Select an option: ");
 }
 
 // Command handlers
 void cmdMenu(const char *arg) { menu(); }
-
-void cmdNext(const char *arg) {
-  if (currentRomPage < maxRomPages - 1) {
-    currentRomPage++;
-  }
-  navigatePages(currentRomPage);
-}
-
-void cmdPrev(const char *arg) {
-  currentRomPage--;
-  if (currentRomPage < 0) {
-    currentRomPage = 0;
-  }
-  navigatePages(currentRomPage);
-}
 
 void cmdHelp(const char *arg) {
   // term_printString("\x1B" "E" "Available commands:\n");
@@ -897,53 +697,527 @@ void cmdExit(const char *arg) {
   SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_CONTINUE);
 }
 
-// The ROM list is allocated once, when the menu starts; without it neither
-// list can be shown.
-static bool romsAvailable(void) {
-  if (roms == NULL) {
-    term_printString("Not enough memory for the ROM list.\n");
+// --- The network and the catalog refresh, behind the menu ------------------
+
+// The menu shows the network and the last download on its status lines:
+// redraw it when they change, unless a list or another screen is up.
+static void menuStatusChanged(void) {
+  if (listKind == LIST_NONE && menuState.menuLevel == TERM_ROMS_MENU_MAIN) {
+    menu();
+    display_refresh();
+  }
+}
+
+static const char *catalogUrl(void) {
+#if APP_DOWNLOAD_HTTPS == 1
+  SettingsConfigEntry *entry = settings_find_entry(
+      aconfig_getContext(), ACONFIG_PARAM_ROM_HTTPS_CATALOG);
+#else
+  SettingsConfigEntry *entry =
+      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_HTTP_CATALOG);
+#endif
+  return (entry != NULL && entry->value[0] != '\0') ? entry->value : NULL;
+}
+
+// Why a download failed, in a few words.
+static void describeDownload(download_err_t err, char *out, size_t size) {
+  switch (err) {
+    case DOWNLOAD_HTTPSTATUS_ERROR:
+      snprintf(out, size, "the server answered %d", download_getHttpStatus());
+      break;
+    case DOWNLOAD_TIMEOUT_ERROR:
+      snprintf(out, size, "the server stopped answering");
+      break;
+    case DOWNLOAD_TRANSFER_ERROR:
+      snprintf(out, size, "the connection failed");
+      break;
+    case DOWNLOAD_CANNOTSTARTDOWNLOAD_ERROR:
+      snprintf(out, size, "no connection to the server");
+      break;
+    case DOWNLOAD_FORCEDABORT_ERROR:
+      snprintf(out, size, "it was stopped");
+      break;
+    case DOWNLOAD_TOOMANYREDIRECTS_ERROR:
+      snprintf(out, size, "too many redirects");
+      break;
+    case DOWNLOAD_HTTPSNOTBUILT_ERROR:
+      snprintf(out, size, "https:// is not in this build");
+      break;
+    case DOWNLOAD_URLTOOLONG_ERROR:
+    case DOWNLOAD_CANNOTPARSEURL_ERROR:
+    case DOWNLOAD_UNSUPPORTEDSCHEME_ERROR:
+      snprintf(out, size, "the URL is not usable");
+      break;
+    case DOWNLOAD_CANNOTOPENFILE_ERROR:
+    case DOWNLOAD_CANNOTCLOSEFILE_ERROR:
+    case DOWNLOAD_CANNOTREADFILE_ERROR:
+    case DOWNLOAD_CANNOTRENAMEFILE_ERROR:
+      snprintf(out, size, "the SD card refused the file");
+      break;
+    default:
+      snprintf(out, size, "error %d", (int)err);
+      break;
+  }
+}
+
+static void catalogRefreshStart(void) {
+  if (downloadKind != DOWNLOAD_KIND_NONE || netState != NET_UP) {
+    return;
+  }
+  const char *url = catalogUrl();
+  if (url == NULL) {
+    catalogRefresh = CATALOG_REFRESH_FAILED;
+    snprintf(catalogReason, sizeof(catalogReason), "no catalog URL is set");
+    return;
+  }
+  DPRINTF("Catalog URL: %s\n", url);
+  download_setFilepath(url);
+  download_err_t err = download_start();
+  if (err != DOWNLOAD_OK) {
+    catalogRefresh = CATALOG_REFRESH_FAILED;
+    describeDownload(err, catalogReason, sizeof(catalogReason));
+    return;
+  }
+  downloadKind = DOWNLOAD_KIND_CATALOG;
+  catalogRefresh = CATALOG_REFRESH_RUNNING;
+}
+
+static void netConnect(void);
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+// The Wi-Fi debug hook: down as a lost network would be (the station leaves
+// the AP), or a new connection.
+static void netTestWifi(bool up) {
+  if (up) {
+    netAttempts = 0;
+    netConnect();
+  } else {
+    cyw43_wifi_leave(&cyw43_state, CYW43_ITF_STA);
+    netState = NET_FAILED;
+    netReason = "Wi-Fi went down.";
+  }
+  menuStatusChanged();
+}
+#endif
+
+static void netConnect(void) {
+  netAttempts++;
+  wifi_sta_conn_process_status_t result = network_wifiStaConnectStart();
+  if (result == NETWORK_WIFI_STA_CONN_OK) {
+    netState = NET_CONNECTING;
+    return;
+  }
+  netState = NET_FAILED;
+  netReason = (result == NETWORK_WIFI_STA_CONN_ERR_NO_SSID)
+                  ? "Wi-Fi is not configured."
+                  : "Wi-Fi did not connect.";
+}
+
+// At boot, once the menu is up. Booster owns the Wi-Fi settings.
+static void netStart(void) {
+  netAttempts = 0;
+  SettingsConfigEntry *wifiMode =
+      settings_find_entry(gconfig_getContext(), PARAM_WIFI_MODE);
+  if (wifiMode == NULL || (wifi_mode_t)atoi(wifiMode->value) == WIFI_MODE_AP) {
+    netState = NET_OFF;
+    netReason = "Wi-Fi is not configured.";
+  } else if (network_wifiInit(WIFI_MODE_STA) != 0) {
+    netState = NET_FAILED;
+    netReason = "The Wi-Fi chip did not start.";
+  } else {
+    netConnect();
+  }
+  menuStatusChanged();
+}
+
+// One step of the connection, from the main loop: three attempts, as before.
+static void netPoll(void) {
+  if (netState != NET_CONNECTING) {
+    return;
+  }
+  wifi_sta_conn_process_status_t result = network_wifiStaConnectPoll();
+  if (result == NETWORK_WIFI_STA_CONN_IN_PROGRESS) {
+    return;
+  }
+  if (result == NETWORK_WIFI_STA_CONN_OK) {
+    netState = NET_UP;
+    catalogRefreshStart();
+  } else if (result == NETWORK_WIFI_STA_CONN_ERR_TIMEOUT &&
+             netAttempts < NET_CONNECT_ATTEMPTS) {
+    netConnect();
+    if (netState == NET_CONNECTING) {
+      return;
+    }
+  } else {
+    netState = NET_FAILED;
+    netReason = "Wi-Fi did not connect.";
+  }
+  menuStatusChanged();
+}
+
+// The download running, from the main loop: the catalog replaces the card's
+// copy only when complete (download.c), a ROM is selected only when complete.
+static void downloadsPoll(void) {
+  if (downloadKind == DOWNLOAD_KIND_NONE) {
+    return;
+  }
+  download_status_t status = download_getStatus();
+  if (status == DOWNLOAD_STATUS_STARTED ||
+      status == DOWNLOAD_STATUS_IN_PROGRESS) {
+    download_poll();
+    return;
+  }
+  if (status != DOWNLOAD_STATUS_COMPLETED && status != DOWNLOAD_STATUS_FAILED) {
+    return;
+  }
+  download_err_t err = download_finish();
+  if (err == DOWNLOAD_OK) {
+    err = download_confirm();
+  }
+  download_setStatus(DOWNLOAD_STATUS_IDLE);
+  DownloadKind kind = downloadKind;
+  downloadKind = DOWNLOAD_KIND_NONE;
+  char reason[TERM_SCREEN_SIZE_X];
+  if (kind == DOWNLOAD_KIND_CATALOG) {
+    if (err == DOWNLOAD_OK) {
+      catalogRefresh = CATALOG_REFRESH_DONE;
+      const download_url_components_t *origin = download_getUrlComponents();
+      snprintf(catalogOrigin.protocol, sizeof(catalogOrigin.protocol), "%s",
+               origin->protocol);
+      snprintf(catalogOrigin.host, sizeof(catalogOrigin.host), "%s",
+               origin->host);
+      catalogOrigin.port = origin->port;
+      catalogOrigin.known = true;
+    } else {
+      catalogRefresh = CATALOG_REFRESH_FAILED;
+      describeDownload(err, catalogReason, sizeof(catalogReason));
+      DPRINTF("Catalog refresh failed: %s\n", catalogReason);
+    }
+  } else if (err == DOWNLOAD_OK) {
+    // The name the file was saved under, the one the download started for.
+    const char *saved = download_getFilename();
+    const char *name =
+        (saved != NULL && saved[0] != '\0') ? saved : downloadRomName;
+    // A whole 2xx can still be the wrong thing (an error page served as
+    // 200): the file must be the size the catalog gives, to a KB.
+    char path[MAX_PATH_SIZE];
+    snprintf(path, sizeof(path), "%s/%s", romsFolder, name);
+    FILINFO fno;
+    if (downloadRomSizeKb > 0 && f_stat(path, &fno) == FR_OK) {
+      uint32_t gotKb = (uint32_t)((fno.fsize + 1023u) / 1024u);
+      if (gotKb + 1 < downloadRomSizeKb || gotKb > downloadRomSizeKb + 1) {
+        f_unlink(path);
+        snprintf(downloadMessage, sizeof(downloadMessage),
+                 "Download failed: %lu KB, catalog %lu KB",
+                 (unsigned long)gotKb, (unsigned long)downloadRomSizeKb);
+        menuStatusChanged();
+        return;
+      }
+    }
+    settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, name);
+    settings_save(aconfig_getContext(), true);
+    snprintf(downloadMessage, sizeof(downloadMessage), "Downloaded: %.*s",
+             TERM_SCREEN_SIZE_X - 13, name);
+  } else {
+    describeDownload(err, reason, sizeof(reason));
+    snprintf(downloadMessage, sizeof(downloadMessage), "Download failed: %s",
+             reason);
+  }
+  menuStatusChanged();
+}
+
+// --- The lists ---------------------------------------------------------------
+
+static void listClose(void) {
+  term_setKeyHandler(NULL);
+  free(sdRoms);
+  sdRoms = NULL;
+  sdRomsCount = 0;
+  catalog_close(&catalog);
+  catalogPageCached = UINT32_MAX;
+  listKind = LIST_NONE;
+  listDetails = false;
+}
+
+static const char *listName(uint32_t index) {
+  if (listKind == LIST_CARD) {
+    return sdRoms[index].name;
+  }
+  uint32_t page = index / NAVLIST_PAGE_LINES;
+  if (page != catalogPageCached) {
+    uint32_t startUs = time_us_32();
+    catalog_readPage(&catalog, page, catalogNames, NAVLIST_PAGE_LINES);
+    DPRINTF("Catalog page %lu read in %lu us\n", (unsigned long)page,
+            (unsigned long)(time_us_32() - startUs));
+    catalogPageCached = page;
+  }
+  return catalogNames[index % NAVLIST_PAGE_LINES];
+}
+
+// Two lines at most above the catalog: why it may be old.
+static void catalogNotice(void) {
+  if (netState == NET_CONNECTING || catalogRefresh == CATALOG_REFRESH_RUNNING) {
+    term_printString("Refreshing the catalog...\n");
+  } else if (netState != NET_UP) {
+    term_printString("Offline: the copy on the SD card.\n");
+    term_printString(netReason);
+    term_printString("\n");
+  } else if (catalogRefresh == CATALOG_REFRESH_FAILED) {
+    term_printString("Offline: the copy on the SD card.\n");
+    term_printString("Server: ");
+    term_printString(catalogReason);
+    term_printString("\n");
+  }
+}
+
+static void listDraw(void) {
+  showTitle();
+  if (listKind == LIST_CARD) {
+    term_printString("ROMs on the SD card\n");
+  } else {
+    term_printString("ROM catalog\n");
+    catalogNotice();
+  }
+  uint32_t first = navlist_first(&listNav);
+  uint32_t shown = navlist_onPage(&listNav);
+  for (uint32_t i = 0; i < shown; i++) {
+    char line[TERM_SCREEN_SIZE_X + 1];
+    snprintf(line, sizeof(line), "%c %.*s\n",
+             (first + i == listNav.selected) ? '>' : ' ',
+             TERM_SCREEN_SIZE_X - 3, listName(first + i));
+    term_printString(line);
+  }
+  char footer[TERM_SCREEN_SIZE_X + 1];
+  snprintf(footer, sizeof(footer), "\nPage %lu/%lu, %lu ROMs\n",
+           (unsigned long)(navlist_page(&listNav) + 1),
+           (unsigned long)navlist_pages(&listNav),
+           (unsigned long)listNav.count);
+  term_printString(footer);
+  term_printString("UP/DOWN select, LEFT/RIGHT page\n");
+  term_printString("RETURN details, ESC menu");
+  display_refresh();
+}
+
+static bool catalogEntryAllowed(void) {
+  switch (catalog_check(&catalogEntry)) {
+    case CATALOG_ENTRY_TOO_LARGE: {
+      char line[TERM_SCREEN_SIZE_X * 2];
+      snprintf(line, sizeof(line),
+               "\nToo large: %lu KB, the limit is 128 KB.\n",
+               (unsigned long)catalogEntry.sizeKb);
+      term_printString(line);
+      return false;
+    }
+    case CATALOG_ENTRY_BAD_NAME:
+      term_printString("\nRefused: its file name is not safe.\n");
+      return false;
+    case CATALOG_ENTRY_LONG_NAME:
+      term_printString("\nRefused: its file name is too long.\n");
+      return false;
+    default:
+      break;
+  }
+  if (netState != NET_UP) {
+    term_printString("\nThe network is needed to download it:\n");
+    term_printString(netReason);
+    term_printString("\nFix Wi-Fi in Booster, then restart.\n");
+    return false;
+  }
+  if (!catalogOrigin.known) {
+    term_printString("\nThe catalog has not been refreshed\n");
+    term_printString("from its server yet: try again soon.\n");
+    return false;
+  }
+  if (downloadKind != DOWNLOAD_KIND_NONE) {
+    term_printString("\nA download is running: wait for it.\n");
     return false;
   }
   return true;
 }
 
-void cmdCard(const char *arg) {
-  if (!romsAvailable()) {
+static void listDetailsDraw(void) {
+  showTitle();
+  term_printString("\n");
+  if (listKind == LIST_CARD) {
+    char name[SETTINGS_MAX_VALUE_LENGTH];
+    romFullName(sdRoms[listNav.selected].open, name, sizeof(name));
+    term_printString("ROM: ");
+    term_printString(name);
+    term_printString("\n\nRETURN launch, ESC back");
+    display_refresh();
     return;
   }
-  FRESULT listed = readRomsSdcard(romsFolder);
-  menuState.menuLevel = TERM_ROMS_MENU_BROWSE_SD;
+  if (catalog_readEntry(&catalog, listNav.selected, &catalogEntry) !=
+      CATALOG_OK) {
+    term_printString("The catalog could not be read.\n\nESC back");
+    display_refresh();
+    return;
+  }
+  char line[TERM_SCREEN_SIZE_X * 3];
+  snprintf(line, sizeof(line), "Name: %s\nFile: %s\n", catalogEntry.name,
+           catalog_fileName(&catalogEntry));
+  term_printString(line);
+  snprintf(line, sizeof(line), "Description: %s\nTags: %s\nSize: %lu KB\n",
+           catalogEntry.description, catalogEntry.tags,
+           (unsigned long)catalogEntry.sizeKb);
+  term_printString(line);
+  if (catalogEntryAllowed()) {
+    term_printString("\nRETURN download, ESC back");
+  } else {
+    term_printString("\nESC back");
+  }
+  display_refresh();
+}
 
+static void listAct(void) {
+  if (listKind == LIST_CARD) {
+    char name[SETTINGS_MAX_VALUE_LENGTH];
+    romFullName(sdRoms[listNav.selected].open, name, sizeof(name));
+    // The pick is held in the settings in RAM and reaches flash with MODE,
+    // after the launch has written and read back the ROM.
+    settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, name);
+    listClose();
+    showTitle();
+    cmdLaunch(NULL);
+    return;
+  }
+  if (!catalogEntryAllowed()) {
+    return;
+  }
+  char encoded[CATALOG_URL_BYTES * 3];
+  char url[DOWNLOAD_URL_SIZE];
+  bool fits = catalog_urlEncodePath(catalogEntry.url, encoded, sizeof(encoded));
+  int length =
+      (catalogOrigin.port != 0)
+          ? snprintf(url, sizeof(url), "%s://%s:%u/%s", catalogOrigin.protocol,
+                     catalogOrigin.host, (unsigned)catalogOrigin.port, encoded)
+          : snprintf(url, sizeof(url), "%s://%s/%s", catalogOrigin.protocol,
+                     catalogOrigin.host, encoded);
+  if (!fits || length < 0 || (size_t)length >= sizeof(url)) {
+    term_printString("\nRefused: its URL is too long.\n");
+    return;
+  }
+  DPRINTF("Downloading ROM: %s\n", url);
+  download_setFilepath(url);
+  download_err_t err = download_start();
+  if (err != DOWNLOAD_OK) {
+    char reason[TERM_SCREEN_SIZE_X];
+    describeDownload(err, reason, sizeof(reason));
+    term_printString("\nThe download did not start:\n");
+    term_printString(reason);
+    term_printString("\n");
+    return;
+  }
+  downloadKind = DOWNLOAD_KIND_ROM;
+  snprintf(downloadRomName, sizeof(downloadRomName), "%s",
+           catalog_fileName(&catalogEntry));
+  downloadRomSizeKb = catalogEntry.sizeKb;
+  snprintf(downloadMessage, sizeof(downloadMessage), "Downloading: %.*s",
+           TERM_SCREEN_SIZE_X - 14, downloadRomName);
+  listClose();
+  menu();
+  display_refresh();
+}
+
+static void listKey(char key) {
+  if (listDetails) {
+    if (key == '\r' || key == '\n') {
+      listAct();
+    } else if (key == TERM_KEY_ESC || key == 'm' || key == 'M') {
+      listDetails = false;
+      listDraw();
+    }
+    return;
+  }
+  switch (navlist_key(&listNav, key)) {
+    case NAVLIST_MOVED:
+    case NAVLIST_PAGE_TURNED:
+      listDraw();
+      break;
+    case NAVLIST_CHOSEN:
+      listDetails = true;
+      listDetailsDraw();
+      break;
+    case NAVLIST_LEAVE:
+      listClose();
+      menu();
+      display_refresh();
+      break;
+    default:
+      break;
+  }
+}
+
+static void listOpen(ListKind kind, uint32_t count) {
+  listKind = kind;
+  listDetails = false;
+  navlist_reset(&listNav, count);
+  term_setKeyHandler(listKey);
+  listDraw();
+}
+
+void cmdCard(const char *arg) {
+  FRESULT listed = readRomsSdcard(romsFolder);
+  if (listed == FR_NOT_ENOUGH_CORE) {
+    term_printString("Not enough memory for the ROM list.\n");
+    return;
+  }
   if (listed != FR_OK) {
+    listClose();
     term_printString("The folder '");
     term_printString(romsFolder);
-    term_printString("' could not be read\nfrom the SD card. Check FOLDER in\n[S]ettings.\n\n");
-  } else if (romsCount == 0) {
+    term_printString(
+        "' could not be read\nfrom the SD card. Check FOLDER in\n"
+        "[S]ettings.\n\n");
+    return;
+  }
+  if (sdRomsCount == 0) {
+    listClose();
     term_printString("No ROMs found in the SD card.\n");
     term_printString("Download ROMs from internet,\n");
     term_printString("or copy them to folder '");
     term_printString(romsFolder);
     term_printString("'\n\n");
-  } else {
-    currentRomPage = 0;
-    navigatePages(currentRomPage);
+    return;
   }
+  listOpen(LIST_CARD, sdRomsCount);
 }
 
 void cmdNetwork(const char *arg) {
-  if (!catalogAvailable || network_getCurrentIp().addr == 0) {
-    term_printString("Network catalog not available.\n");
+  // A refresh that failed is tried again here, not in a loop.
+  if (netState == NET_UP && catalogRefresh == CATALOG_REFRESH_FAILED) {
+    catalogRefreshStart();
+  }
+  char path[MAX_PATH_SIZE];
+  snprintf(path, sizeof(path), "%s/roms.csv", romsFolder);
+  uint32_t openUs = time_us_32();
+  catalog_result_t opened = catalog_open(&catalog, path);
+  DPRINTF("Catalog indexed in %lu us\n",
+          (unsigned long)(time_us_32() - openUs));
+  if (opened != CATALOG_OK || catalog.count == 0) {
+    catalog_close(&catalog);
+    if (netState == NET_CONNECTING ||
+        catalogRefresh == CATALOG_REFRESH_RUNNING) {
+      term_printString("The catalog is still downloading:\n");
+      term_printString("try [D] again in a moment.\n");
+    } else if (opened == CATALOG_NO_MEMORY) {
+      term_printString("Not enough memory for the catalog.\n");
+    } else {
+      term_printString("No catalog on the SD card");
+      if (netState != NET_UP) {
+        term_printString(", and no\nnetwork: ");
+        term_printString(netReason);
+        term_printString("\nSet up Wi-Fi in Booster.\n");
+      } else {
+        term_printString(":\n");
+        term_printString(catalogReason[0] ? catalogReason : "empty");
+        term_printString("\n");
+      }
+    }
     return;
   }
-  if (!romsAvailable()) {
-    return;
-  }
-  char csvPath[MAX_PATH_SIZE];
-  snprintf(csvPath, sizeof(csvPath), "%s/roms.csv", romsFolder);
-  readRomsCsv(csvPath);
-  menuState.menuLevel = TERM_ROMS_MENU_BROWSE_NETWORK;
-  currentRomPage = 0;
-  navigatePages(currentRomPage);
+  catalogPageCached = UINT32_MAX;
+  listOpen(LIST_CATALOG, catalog.count);
 }
 
 // The selection, saved only once the ROM is in ROM_TEMP and read back.
@@ -991,117 +1265,14 @@ void cmdLaunch(const char *arg) {
   keepActive = false;  // Exit the active loop
 }
 
+// A line that is not a command: the menu again (the lists take their keys
+// one at a time, through listKey()).
 void cmdUnknown(const char *arg) {
-  switch (menuState.menuLevel) {
-    case TERM_ROMS_MENU_MAIN:
-      menu();
-      break;
-    case TERM_ROMS_MENU_BROWSE_SD: {
-      // Convert to integer the argument
-      int romNumber = atoi(arg);
-      if (romNumber > 0 && romNumber <= romsCount) {
-        char selected[SETTINGS_MAX_VALUE_LENGTH];
-        romFullName(roms[romNumber - 1].filename, selected, sizeof(selected));
-        term_printString("Selected ROM: ");
-        term_printString(selected);
-        term_printString("\n");
-        // The pick is held in the settings in RAM and reaches flash with
-        // MODE, after the launch has written and read back the ROM: a write
-        // cut short comes back to the previous selection.
-        settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
-                            selected);
-        menu();
-      } else {
-        term_printString(
-            "Invalid ROM number. Please select a valid ROM "
-            "number.\n");
-      }
-    } break;
-    case TERM_ROMS_MENU_BROWSE_NETWORK: {
-      // Convert to integer the argument
-      int romNumber = atoi(arg);
-      if (romNumber > 0 && romNumber <= romsCount) {
-        term_printString("\nROM number: ");
-        term_printString(arg);
-        term_printString("\n");
-
-        // The
-        term_printString("Name: ");
-        term_printString(roms[romNumber - 1].name);
-        term_printString("\n");
-
-        term_printString("Filename: ");
-        term_printString(roms[romNumber - 1].filename);
-        term_printString("\n");
-
-        term_printString("Description: ");
-        term_printString(roms[romNumber - 1].description);
-        term_printString("\n");
-
-        term_printString("Tags: ");
-        term_printString(roms[romNumber - 1].tags);
-        term_printString("\n");
-
-        term_printString("Size: ");
-        char sizeStr[MAX_PATH_SIZE / 4];
-        snprintf(sizeStr, sizeof(sizeStr), "%d KB\n", roms[romNumber - 1].size);
-        term_printString(sizeStr);
-
-        term_printString("\nPress RETURN to load the ROM.\n");
-        term_printString("Press any other key to return to the menu.\n");
-        downloadRomSelected = romNumber - 1;
-        menuState.menuLevel =
-            TERM_ROMS_MENU_BROWSE_NETWORK + TERM_ROMS_MENU_SUBMENU;
-
-      } else {
-        term_printString(
-            "Invalid ROM number. Please select a valid ROM "
-            "number.\n");
-      }
-    } break;
-    case TERM_ROMS_MENU_BROWSE_NETWORK + TERM_ROMS_MENU_SUBMENU:
-      if (arg[0] == '\0' || arg[0] == '\n') {
-        // Clean the ROM_SELECTED setting
-        settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
-                            "");
-        settings_save(aconfig_getContext(), true);
-
-        // The ROM is fetched from the catalog's own host, at the root.
-        const download_url_components_t *catalogUrl =
-            download_getUrlComponents();
-        char encoded[MAX_PATH_SIZE * 3];
-        urlEncodePath(roms[downloadRomSelected].filename, encoded,
-                      sizeof(encoded));
-        char url[DOWNLOAD_URL_SIZE];
-        if (catalogUrl->port != 0) {
-          snprintf(url, sizeof(url), "%s://%s:%u/%s", catalogUrl->protocol,
-                   catalogUrl->host, (unsigned)catalogUrl->port, encoded);
-        } else {
-          snprintf(url, sizeof(url), "%s://%s/%s", catalogUrl->protocol,
-                   catalogUrl->host, encoded);
-        }
-        DPRINTF("Downloading ROM: %s/%s\n", romsFolder,
-                roms[downloadRomSelected].filename);
-        DPRINTF("URL: %s\n", url);
-        download_setFilepath(url);
-        download_err_t err = download_start();
-        if (err != DOWNLOAD_OK) {
-          DPRINTF("Error starting download: %d\n", err);
-        } else {
-          romDownloadActive = true;
-        }
-        menuState.menuLevel = TERM_ROMS_MENU_MAIN;
-        menu();
-      } else {
-        menuState.menuLevel = TERM_ROMS_MENU_BROWSE_NETWORK;
-        navigatePages(currentRomPage);
-      }
-      break;
-    case TERM_ROMS_MENU_LAUNCH:
-      break;
-    default:
-      term_printString(
-          "Unknown command. Type 'help' for a list of commands.\n");
+  (void)arg;
+  if (menuState.menuLevel == TERM_ROMS_MENU_MAIN) {
+    menu();
+  } else {
+    term_printString("Unknown command. Type 'help' for a list of commands.\n");
   }
 }
 
@@ -1142,22 +1313,6 @@ static bool getKeepActive() { return keepActive; }
 
 static bool getResetDevice() { return resetDeviceAtBoot; }
 
-static void preinit() {
-  // Initialize the terminal
-  term_init();
-
-  // Clear the screen
-  term_clearScreen();
-
-  // Show the title
-  showTitle();
-  term_printString("\n\n");
-  term_printString("Configuring network... please wait...\n");
-  term_printString("or press SHIFT to boot to desktop.\n");
-
-  display_refresh();
-}
-
 void failure(const char *message) {
   // Initialize the terminal
   term_init();
@@ -1171,46 +1326,6 @@ void failure(const char *message) {
   term_printString(message);
 
   display_refresh();
-}
-
-static void romDownloadUpdate() {
-  // Save the selected ROM to the settings
-  if (downloadRomSelected > 0) {
-    settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED,
-                        roms[downloadRomSelected].filename);
-    settings_save(aconfig_getContext(), true);
-    menu();
-  }
-}
-
-// One step of a download the user started from the catalog: poll it while it
-// runs, then keep the file and select it, or drop it. Downloads started
-// elsewhere (the devdownload hook) are their starter's to finish.
-static void romDownloadPoll(void) {
-  if (!romDownloadActive) {
-    return;
-  }
-  download_status_t status = download_getStatus();
-  if (status == DOWNLOAD_STATUS_STARTED ||
-      status == DOWNLOAD_STATUS_IN_PROGRESS) {
-    download_poll();
-    return;
-  }
-  if (status != DOWNLOAD_STATUS_COMPLETED &&
-      status != DOWNLOAD_STATUS_FAILED) {
-    return;
-  }
-  romDownloadActive = false;
-  download_err_t err = download_finish();
-  if (err == DOWNLOAD_OK) {
-    err = download_confirm();
-  }
-  download_setStatus(DOWNLOAD_STATUS_IDLE);
-  if (err != DOWNLOAD_OK) {
-    DPRINTF("ROM download failed: %d\n", err);
-    return;
-  }
-  romDownloadUpdate();
 }
 
 static void init(const char *folder) {
@@ -1434,99 +1549,11 @@ void emul_start() {
   // Initialize the display again (in case the terminal emulator changed it)
   display_setupU8g2();
 
-  // The "please wait" screen while the network comes up
-  preinit();
-
-  // 6. The network. Its parameters are Booster's global settings.
-  SettingsConfigEntry *wifiMode =
-      settings_find_entry(gconfig_getContext(), PARAM_WIFI_MODE);
-  wifi_mode_t wifiModeValue = WIFI_MODE_STA;
-  wifiConnected = false;
-  if (wifiMode == NULL) {
-    DPRINTF("No WiFi mode found in the settings. No initializing.\n");
-  } else {
-    wifiModeValue = (wifi_mode_t)atoi(wifiMode->value);
-    if (wifiModeValue != WIFI_MODE_AP) {
-      DPRINTF("WiFi mode is STA\n");
-      wifiModeValue = WIFI_MODE_STA;
-      int err = network_wifiInit(wifiModeValue);
-      if (err != 0) {
-        DPRINTF("Error initializing the network: %i. No initializing.\n", err);
-      } else {
-        // Answer the ST during the (multi-second) connect, so its commands
-        // don't pile up in the ROM3 ring.
-        network_setPollingCallback(emul_pollTick);
-        int maxAttempts = 3;
-        int attempt = 0;
-        err = NETWORK_WIFI_STA_CONN_ERR_TIMEOUT;
-
-        while ((attempt < maxAttempts) &&
-               (err == NETWORK_WIFI_STA_CONN_ERR_TIMEOUT)) {
-          err = network_wifiStaConnect();
-          attempt++;
-
-          if ((err > 0) && (err < NETWORK_WIFI_STA_CONN_ERR_TIMEOUT)) {
-            DPRINTF("Error connecting to the WiFi network: %i\n", err);
-          }
-        }
-
-        if (err == NETWORK_WIFI_STA_CONN_ERR_TIMEOUT) {
-          DPRINTF("Timeout connecting to the WiFi network after %d attempts\n",
-                  maxAttempts);
-        } else if (err == 0) {
-          wifiConnected = true;
-        }
-        network_setPollingCallback(NULL);
-      }
-    } else {
-      DPRINTF("WiFi mode is AP. No initializing.\n");
-    }
-  }
-
-  // 7. The ROM catalog, downloaded into the ROMs folder at every boot.
-#if APP_DOWNLOAD_HTTPS == 1
-  SettingsConfigEntry *catalog =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_HTTPS_CATALOG);
-#else
-  SettingsConfigEntry *catalog =
-      settings_find_entry(aconfig_getContext(), ACONFIG_PARAM_ROM_HTTP_CATALOG);
-#endif
-  if (!wifiConnected) {
-    DPRINTF("WiFi not connected. Skipping catalog download.\n");
-    catalogAvailable = false;
-  } else if (catalog == NULL) {
-    DPRINTF("No catalog URL found in the settings. No initializing.\n");
-    catalogAvailable = false;
-  } else {
-    DPRINTF("Catalog URL: %s\n", catalog->value);
-    download_setFilepath(catalog->value);
-    download_err_t err = download_start();
-    if (err != DOWNLOAD_OK) {
-      DPRINTF("Error starting catalog download: %d\n", err);
-      catalogAvailable = false;
-    } else {
-      DPRINTF("Waiting for catalog download to complete...\n");
-      download_status_t status = download_getStatus();
-      while (status == DOWNLOAD_STATUS_STARTED ||
-             status == DOWNLOAD_STATUS_IN_PROGRESS) {
-        download_poll();
-        emul_pollTick();
-        status = download_getStatus();
-      }
-      err = download_finish();
-      if (err == DOWNLOAD_OK) {
-        err = download_confirm();
-      }
-      download_setStatus(DOWNLOAD_STATUS_IDLE);
-      catalogAvailable = (err == DOWNLOAD_OK);
-      if (!catalogAvailable) {
-        DPRINTF("Catalog download failed: %d\n", err);
-      }
-    }
-  }
-
-  // 8. The terminal and the menu
+  // 6. The menu first: the network and the catalog refresh come up behind
+  // it, from the main loop (netPoll(), downloadsPoll()), so the menu never
+  // waits for them.
   init(folderName);
+  netStart();
 
   // Blink on
 #ifdef BLINK_H
@@ -1534,10 +1561,6 @@ void emul_start() {
 #endif
 
   // 9. The main loop, until a ROM is launched or Booster is chosen
-  roms = malloc(MAX_ROMS * sizeof(ROM));
-  if (roms == NULL) {
-    DPRINTF("Error allocating memory for ROMs\n");
-  }
 #if defined(_DEBUG) && (_DEBUG != 0)
   // Debug builds only: serve the SWD mailbox of tools/dev/swd.py
   devhooks_setAppHandler(emul_devhooksApp);
@@ -1556,6 +1579,7 @@ void emul_start() {
       // A new ST session: nothing typed before the reset carries over, and
       // the ST gets a freshly drawn menu.
       term_clearInputBuffer();
+      listClose();
       menu();
       display_refresh();
     }
@@ -1572,13 +1596,11 @@ void emul_start() {
     // output, etc.).
     term_loop();
 
-    // A download the user started from the catalog
-    romDownloadPoll();
+    // The network coming up, and the download running
+    netPoll();
+    downloadsPoll();
   }
-  if (roms != NULL) {
-    free(roms);
-    roms = NULL;
-  }
+  listClose();
 
   // 10. Reset the computer, then this device or Booster. Hold the command
   // long enough for the ST's menu loop to see it, and keep answering: a
