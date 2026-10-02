@@ -942,7 +942,7 @@ static void menu(void) {
   term_printAt(MENU_ROW_DEVICE, MENU_COL_LABEL, MENU_LABEL_DEVICE);
   term_printAt(MENU_ROW_SETTINGS, MENU_COL_KEY, "[S]ettings");
   term_printAt(MENU_ROW_EXIT, MENU_COL_KEY,
-               "[E]xit to desktop (or hold SHIFT)");
+               "[E]xit to desktop");
   term_printAt(MENU_ROW_BOOSTER, MENU_COL_KEY,
                "[X] Back to Booster   [M] Refresh");
   const char *url = catalogUrl();
