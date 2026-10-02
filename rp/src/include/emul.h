@@ -34,22 +34,18 @@
 #define SLEEP_LOOP_MS 100
 
 #define MAX_ROMS 100
-#define MAX_ROMS_PER_PAGE 20
 #define MAX_FILENAME_LENGTH 36
 #define MAX_PATH_SIZE 128
 
 #define AUTORUN_BLINK_MS 200
 
+// A ROM file on the SD card as [B]rowse lists it: the name it opens by (the
+// long name when it fits, the card's 8.3 alias otherwise) and the name shown,
+// cut to the field. The list holds MAX_ROMS of them while it is open.
 typedef struct {
-  char filename[MAX_FILENAME_LENGTH];
-  // No path: the folder and the file name make it when it is needed. A ROM
-  // list is MAX_ROMS entries on the heap.
+  char open[MAX_FILENAME_LENGTH];
   char name[MAX_FILENAME_LENGTH];
-  char description[MAX_PATH_SIZE];
-  char tags[MAX_FILENAME_LENGTH];
-  int size;
-
-} ROM;
+} SdRom;
 
 enum {
   ROM_MODE_DIRECT = 0,  // ROM direct (no delay)
@@ -106,5 +102,8 @@ void emul_start();
 //                  tools/dev/download_harness.py drives it and reads the
 //                  outcome.
 #define DEVHOOKS_APP_DOWNLOAD 2
+//   wifi 0|1       take Wi-Fi down (0, as a lost network) or connect it again
+//                  (1), for the offline paths of [D]ownload.
+#define DEVHOOKS_APP_WIFI 3
 
 #endif  // EMUL_H

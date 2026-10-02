@@ -68,6 +68,8 @@
 
 // Connection errors as an enumeration
 typedef enum {
+  NETWORK_WIFI_STA_CONN_IN_PROGRESS =
+      1,                         // connecting (network_wifiStaConnectPoll)
   NETWORK_WIFI_STA_CONN_OK = 0,  // WiFi connected successfully
   NETWORK_WIFI_STA_CONN_ERR_NOT_INITIALIZED = -1,  // WiFi not initialized
   NETWORK_WIFI_STA_CONN_ERR_INVALID_MODE = -2,     // Invalid WiFi mode
@@ -178,6 +180,26 @@ bool network_getStaticConfigRejected(const char** reason);
  * @return Status code indicating connection success or failure.
  */
 wifi_sta_conn_process_status_t network_wifiStaConnect();
+
+/**
+ * @brief Starts connecting in station mode and returns at once.
+ *
+ * The settings and the radio are set up as network_wifiStaConnect() does.
+ *
+ * @return NETWORK_WIFI_STA_CONN_OK when the connection is under way, an error
+ * code otherwise.
+ */
+wifi_sta_conn_process_status_t network_wifiStaConnectStart();
+
+/**
+ * @brief One step of the connection network_wifiStaConnectStart() started,
+ * without waiting: call it from a loop that also calls network_safePoll().
+ *
+ * @return NETWORK_WIFI_STA_CONN_IN_PROGRESS while connecting,
+ * NETWORK_WIFI_STA_CONN_OK once connected with an IP address,
+ * NETWORK_WIFI_STA_CONN_ERR_TIMEOUT after NETWORK_CONNECT_TIMEOUT seconds.
+ */
+wifi_sta_conn_process_status_t network_wifiStaConnectPoll();
 
 /**
  * @brief Obtains the current WiFi connection status.

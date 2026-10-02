@@ -121,6 +121,7 @@ pico_generate_pio_header(${PROJECT_NAME} ${CMAKE_CURRENT_LIST_DIR}/commemul.pio)
 target_sources(${PROJECT_NAME} PRIVATE
         aconfig.c
         blink.c
+        catalog.c
         chandler.c
         commemul.c
         devdownload.c
@@ -131,6 +132,7 @@ target_sources(${PROJECT_NAME} PRIVATE
         gconfig.c
         httpc/httpc.c
         hw_config.c
+        navlist.c
         network.c
         reset.c
         romemul.c

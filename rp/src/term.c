@@ -552,6 +552,34 @@ void term_init(void) {
 
 // Invoke this function to process the commands from the active loop in the
 // main function
+// A list on screen takes the keys one at a time (term_setKeyHandler).
+static TermKeyHandler termKeyHandler = NULL;
+
+void term_setKeyHandler(TermKeyHandler handler) { termKeyHandler = handler; }
+
+static void termKeyToHandler(char keystroke, uint8_t scanCode) {
+  char key = keystroke;
+  if (key == 0) {
+    switch (scanCode) {
+      case TERM_KEYBOARD_SCAN_CODE_UP:
+        key = TERM_KEY_UP;
+        break;
+      case TERM_KEYBOARD_SCAN_CODE_DOWN:
+        key = TERM_KEY_DOWN;
+        break;
+      case TERM_KEYBOARD_SCAN_CODE_LEFT:
+        key = TERM_KEY_LEFT;
+        break;
+      case TERM_KEYBOARD_SCAN_CODE_RIGHT:
+        key = TERM_KEY_RIGHT;
+        break;
+      default:
+        return;
+    }
+  }
+  termKeyHandler(key);
+}
+
 void __not_in_flash_func(term_loop)() {
   // Read the published slot in place: a copy cost over 4 KB of stack, twice
   // the stack core 0 has. The double buffer keeps term_command_cb off this
@@ -646,6 +674,10 @@ void __not_in_flash_func(term_loop)() {
           // Print the keystroke and the shift key status
           DPRINTF("Keystroke: %d. Shift key: %d, Scan code: %d\n", keystroke,
                   shiftKey, scanCode);
+        }
+        if (termKeyHandler != NULL) {
+          termKeyToHandler(keystroke, scanCode);
+          break;
         }
         termInputChar(keystroke);
         break;

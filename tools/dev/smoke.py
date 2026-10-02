@@ -11,14 +11,15 @@ does not), reads the terminal and the ST's screen, and checks what happened:
   menu       the menu comes up
   st-reset   the ST reboots (swd.py st-reset) and comes back to the menu;
              skipped when nothing on the ST is listening
-  browse     [B]rowse lists the card, pages forward and back
-  select     the ROM given with --rom is picked by its number
-  launch     [L]aunch: the RP restarts in ROM mode and the window holds
+  browse     [B]rowse lists the card; with the cursor keys a page forward
+             and back
+  select     the marker moved onto the ROM given with --rom, its details
+  launch     RETURN on its details: the RP restarts in ROM mode and the window holds
              exactly that file (swd.py window, against --images/<rom>)
   verdict    the self-check's verdict from the ROM3 capture (debug builds;
              only for selfcheck.img)
   select-back  after --rom-seconds, a SELECT press brings the setup menu back
-  catalog    (--catalog) [D]ownload lists the catalog
+  catalog    (--catalog) [D]ownload lists the catalog, ESC leaves it
   st-back    the ST reboots into the menu (swd.py st-reset, through the
              agent the self-check left); skipped when nothing listens
 
@@ -90,6 +91,33 @@ class Session:
         defs = swd.include_defines()
         command_id = (defs["APP_TERMINAL"] << 8) | defs["APP_TERMINAL_KEYSTROKE"]
         swd.send_protocol(self.elf, command_id, [ord(char) & 0xFFFF, 0])
+
+    def press(self, name: str) -> None:
+        """A key by name (swd.NAMED_KEYS): the cursor keys, esc, return."""
+        defs = swd.include_defines()
+        command_id = (defs["APP_TERMINAL"] << 8) | defs["APP_TERMINAL_KEYSTROKE"]
+        ascii_code, scan = swd.NAMED_KEYS[name]
+        param = ascii_code | (scan << defs["TERM_KEYBOARD_SCAN_SHIFT"])
+        swd.send_protocol(self.elf, command_id, [param & 0xFFFF, param >> 16])
+
+    def mark(self, rom: str) -> bool:
+        """Moves the list's marker onto rom, page by page."""
+        while True:
+            lines = [l for l in self.text().splitlines() if l[:2] in ("> ", "  ")]
+            names = [l[2:].strip() for l in lines]
+            marked = next((i for i, l in enumerate(lines) if l.startswith(">")), 0)
+            target = next((i for i, n in enumerate(names)
+                           if n == rom or (len(n) >= 20 and rom.startswith(n))), None)
+            if target is not None:
+                for _ in range(target - marked):
+                    self.press("down")
+                time.sleep(0.5)
+                return True
+            page = re.search(r"Page (\d+)/(\d+)", self.text())
+            if not page or page.group(1) == page.group(2):
+                return False
+            self.press("right")
+            self.wait_for(f"Page {int(page.group(1)) + 1}/", 10)
 
     def typeline(self, line: str) -> None:
         for char in line + "\r":
@@ -212,30 +240,25 @@ class Session:
                       "needs its reset button once")
 
         self.typeline("b")
-        listed = self.wait_for("Page 1")
+        listed = self.wait_for("ROMs on the SD card") and self.wait_for("Page 1/")
         self.step("browse", listed)
         if not listed:
             return self.finish()
-        # "Page 1, ROMs 1 to 20 of 25:": page when the list goes on.
-        counts = re.search(r"ROMs (\d+) to (\d+) of (\d+)", self.text())
-        if counts and int(counts.group(2)) < int(counts.group(3)):
-            self.typeline("n")
-            forward = self.wait_for("Page 2")
-            self.typeline("p")
-            self.step("page", forward and self.wait_for("Page 1"))
+        # More than a page: turn it and back with the cursor keys.
+        pages = re.search(r"Page \d+/(\d+)", self.text())
+        if pages and int(pages.group(1)) > 1:
+            self.press("right")
+            forward = self.wait_for("Page 2/")
+            self.press("left")
+            self.step("page", forward and self.wait_for("Page 1/"))
 
-        number = next((line.split(".")[0].strip()
-                       for line in self.text().splitlines()
-                       if line.strip().split(". ", 1)[-1].startswith(
-                           os.path.splitext(a.rom)[0])), None)
-        if number is None:
-            self.step("select", False, f"{a.rom} is not on this page of the card")
+        if not self.mark(a.rom):
+            self.step("select", False, f"{a.rom} is not on the card")
             return self.finish()
-        self.typeline(number)
-        self.typeline("m")
-        self.step("select", self.wait_for(f"Launch ROM: {a.rom}"))
+        self.press("return")
+        self.step("select", self.wait_for(f"ROM: {a.rom}"))
         self.reset_expected = True
-        self.typeline("l")
+        self.press("return")
         time.sleep(a.boot_seconds)
         rom_path = os.path.join(a.images, a.rom)
         verdict = swd.cmd_window(argparse.Namespace(
@@ -258,8 +281,9 @@ class Session:
 
         if a.catalog:
             self.typeline("d")
-            self.step("catalog", self.wait_for("Page 1", 60))
-            self.typeline("m")
+            self.step("catalog", self.wait_for("ROM catalog", 60)
+                      and self.wait_for("Page 1/", 10))
+            self.press("esc")
 
         if self.st_listening():
             verdict = swd.cmd_st_reset(argparse.Namespace(

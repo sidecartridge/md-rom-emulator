@@ -90,14 +90,16 @@ make -C tests/host test                                   # host tests, ASan and
 
 - `make_rom_images.py` writes images whose word at `$FA0000 + 2*i` is `i ^ 0xA55A`, so `swd.py
   window` and the self-check cartridge can check every word: 64 KB, 128 KB, a STEEM `.stc`, a
-  zero-headed image without a STEEM header, 40,001 bytes, an empty file, a long name, and
-  `oversize-132k.ROM`, which must never be launched on a firmware that does not bound its flash
+  zero-headed image without a STEEM header, 40,001 bytes, an empty file, a long name, the three
+  files `make_catalog.py --cases` names (so their downloads succeed), and `oversize-132k.ROM`, which must never be launched on a firmware that does not bound its flash
   writes (the write runs into Booster's flash).
 - `testserver.py` serves a folder (default `tools/dev/builds/testserver`) and generated failure
   routes: `fail-404*`, `fail-500*`, `fail-html200*`, `fail-truncated*`, `fail-stall*`,
   `fail-loop*`, `*slow-*.img` (a 64 KB download that takes 16 s and completes),
-  `synthetic-NNNN.img` for paging tests, and two catalogs apart: `failures/roms.csv` (every failure
-  and redirect route, `make_catalog.py`'s `--cases` rows and a control), and `autorun/roms.csv`,
+  `synthetic-NNNN.img` for paging tests, `synthetic-N/roms.csv` (a catalog of N of them, up to
+  20,000, for the page index), and two catalogs apart: `failures/roms.csv` (every failure and
+  redirect route with the size it really serves, since the device deletes a download that is not
+  the catalog's size, `make_catalog.py`'s `--cases` rows and a control), and `autorun/roms.csv`,
   which arms (`autorun-on/.autorun`) and disarms (`autorun-off/.autorun`, empty) the autorun;
   `autorun-name/NAME/.autorun` is a `.autorun` naming any ROM (`selfcheck.img` is safe on the ST,
   `oversize-132k.ROM` must be refused). `oversize-132k.ROM` itself is served too, now that the
@@ -107,7 +109,8 @@ make -C tests/host test                                   # host tests, ASan and
 - The self-check cartridge (`selfcheck/selfcheck.s`) reads every patterned word of both banks
   through the cartridge port at boot, prints PASS or the first bad address, and sends the verdict
   as a `$7F01`/`$7F02` frame through ROM3 reads for a ROM3 capture to decode.
-- `smoke.py` drives the menu with `swd.py key`, checks each step on the terminal text and the
+- `smoke.py` drives the menu with `swd.py key` (the `[B]` and `[D]` lists with the cursor keys:
+  down to the ROM, a page right and back, RETURN for its details, RETURN to launch), checks each step on the terminal text and the
   window, fails when the RP restarts unasked or the heap runs low, and writes screen PNGs and a
   JSON report to `tools/dev/logs/smoke-<time>/`. After the launch it waits `--rom-seconds` (15),
   so the ROM (the self-check by default) finishes on the ST before SELECT brings the setup menu
@@ -217,7 +220,9 @@ python3 tools/dev/select_harness.py backup settings.bin          # save the sett
 python3 tools/dev/select_harness.py long --force                 # 10 s press: factory reset
 python3 tools/dev/select_harness.py restore settings.bin         # put the settings back
 python3 tools/dev/swd.py key g                                   # a keystroke, as if typed on the ST
+python3 tools/dev/swd.py key down                                # a named key: up down left right esc return space
 python3 tools/dev/swd.py app heap_hold 16                        # hold 16 KB more heap (0 releases)
+python3 tools/dev/swd.py app wifi 0                              # Wi-Fi down as a lost network (1: up)
 python3 tools/dev/swd.py inject 0x0001 0x0067 0                  # any protocol command
 python3 tools/dev/swd.py crash                                   # why did it last reboot?
 python3 tools/dev/swd.py postmortem                              # halt, backtraces, resume
@@ -281,12 +286,16 @@ probe until it ends: to look at the device during a press, put the reads in that
 acknowledge it. `key` and `inject` queue a protocol command as if the ST had sent it, through
 `chandler_injectProtocol()`, so the firmware handles it through its normal path: the same
 callbacks, the same answer. The setup terminal is line-based, so a menu command is its key and
-then Enter (`swd.py key h`, then `swd.py key $'\n'`). `app NAME` runs the app command defined as
+then Enter (`swd.py key h`, then `swd.py key $'\n'`); the `[B]` and `[D]` lists take single keys,
+by name for the cursor keys (`swd.py key down`: ASCII 0 and the ST's scan code). `app NAME` runs the app command defined as
 `DEVHOOKS_APP_<NAME>` in `rp/src/include/emul.h`, handled by `emul_devhooksApp()`:
 
 - `heap_hold KB`: hold KB more kilobytes of heap, on top of what is already held (`heap_hold 0`
   releases everything). Result 0 when the allocation is refused, so repeated calls walk the heap
   down to a known remainder. Watch it with `swd.py heap`.
+- `wifi 0|1`: 0 leaves the access point as a lost network would (the menu's `Network:` line says
+  so, `[D]` shows the card's catalog under a notice); 1 connects again, and the catalog refreshes
+  by itself. For the offline paths without touching the AP.
 
 Add an app's own commands the same way: a `DEVHOOKS_APP_<NAME>` define and a case in the handler.
 Useful ones in other microfirmwares: stop a boot countdown; stall or fail the next answer on
