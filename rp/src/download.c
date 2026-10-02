@@ -48,6 +48,7 @@ static absolute_time_t reissueAt;
 static struct pbuf *pending = NULL;
 static struct altcp_pcb *pendingConn = NULL;
 static uint8_t *writeChunk = NULL;  // on the heap only while a download runs
+static uint32_t bytesWritten = 0;  // of the request in flight, for its progress
 // What the header callback copies out of the headers: a header's name
 // ("Location:") and the status line's start ("HTTP/1.1 302 ").
 #define DOWNLOAD_HEADER_NAME_SIZE 16
@@ -105,6 +106,7 @@ static void writePendingChunk(void) {
   UINT written = 0;
   FRESULT res = f_write(&file, writeChunk, len, &written);
   pending = pbuf_free_header(pending, len);
+  bytesWritten += written;
   if (res != FR_OK || written != len) {
     DPRINTF("Error writing to file: %i\n", res);
     if (request.complete) {
@@ -444,6 +446,7 @@ static download_err_t issue(const char *url) {
 
   // Open file for writing or create if it doesn't exist
   DPRINTF("Opening file for writing\n");
+  bytesWritten = 0;
   res = f_open(&file, filename, FA_WRITE | FA_CREATE_ALWAYS);
   if (res == FR_LOCKED) {
     DPRINTF("File is locked. Attempting to resolve...\n");
@@ -661,3 +664,5 @@ const char *download_getFilename() { return fileUrl.filename; }
 download_err_t download_getError() { return downloadError; }
 
 int download_getHttpStatus() { return httpStatus; }
+
+uint32_t download_getBytesWritten(void) { return bytesWritten; }
