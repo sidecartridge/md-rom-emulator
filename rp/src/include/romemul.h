@@ -33,7 +33,7 @@ int init_romemul(bool copyFlashToRAM);
 // ROM mode: serve ROM4 ($FA0000) from the lower 64 KB of the window and ROM3
 // ($FB0000) from the upper 64 KB. The command channel is not started in ROM
 // mode: the ST owns the whole window. Returns the read state machine, or -1.
-int init_romemul_two_banks(bool copyFlashToRAM);
+int romemul_initTwoBanks(bool copyFlashToRAM);
 
 // Stops whichever engine is running: its state machines off, its DMA channels
 // aborted, the latch controls back at idle and the data lines as inputs.

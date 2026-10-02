@@ -16,7 +16,7 @@ to their source as this firmware allows, so a fix travels both ways with a plain
 | `testserver.py` (extended) | md-browser's redirect and TLS test server | none: kept outside git there |
 | `hatari_check.py` (its Hatari runs) | md-drives-emulator's `hatari_tests.py` | `1c09e49` |
 | `smoke.py` (its shape) | md-devops' `smoke.py` | `495b6f9` |
-| `make_rom_images.py`, `make_catalog.py`, `selfcheck/`, `gdb/` | this repository | |
+| `make_rom_images.py`, `make_catalog.py`, `selfcheck/`, `gdb/`, `tidy.sh` | this repository | |
 | `../../tests/host/` (framework and shims) | md-framebuffer-template | `0af40ae` |
 
 Added to `swd.py` here, and worth taking back: `key` and `inject` fall back to
@@ -408,5 +408,11 @@ python3 tools/dev/download_harness.py                        # real downloads, c
   `-fcallgraph-info=su`, and reports the flash, RAM and heap numbers.
 - `stackdepth.py` computes worst-case stack depth from those builds (static call edges only, so
   treat its answer as a floor).
+- `tidy.sh [--build debug|release] [FILE ...]` runs clang-tidy with the repository's `.clang-tidy`
+  on the app's own sources (`emul.c`, `catalog.c`, `navlist.c`, `romstore.c`) or the files given,
+  relative to `rp/src`, using a `flash.sh --build-only` build's compile commands. They are
+  `arm-none-eabi-gcc`'s, so clang parses them as ARMv6-M with the toolchain's newlib as its sysroot;
+  without that every C library header is missing and the checks run on a broken parse. It reports
+  the files given and their own headers, and exits non-zero when anything was found.
 
 `logs/` and `builds/` are generated here and are gitignored.

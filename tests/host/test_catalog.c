@@ -16,8 +16,14 @@ static const char *cardPath = "/roms/roms.csv";
 static char *cardData;
 static FSIZE_t cardSize;
 
+// When set, what every f_open answers.
+static FRESULT openResult = FR_OK;
+
 FRESULT f_open(FIL *fp, const char *path, BYTE mode) {
   (void)mode;
+  if (openResult != FR_OK) {
+    return openResult;
+  }
   if (cardData == NULL || strcmp(path, cardPath) != 0) {
     return FR_NO_FILE;
   }
@@ -76,6 +82,12 @@ int main(void) {
   // No file.
   CHECK_EQ(catalog_open(&cat, "/roms/none.csv"), CATALOG_NOT_FOUND);
   CHECK_EQ(cat.count, 0);
+
+  // No heap for FatFs's long-name buffer: out of memory, not a read error.
+  putCard(HEADER);
+  openResult = FR_NOT_ENOUGH_CORE;
+  CHECK_EQ(catalog_open(&cat, cardPath), CATALOG_NO_MEMORY);
+  openResult = FR_OK;
 
   // A header alone: no entries, no pages.
   putCard(HEADER);

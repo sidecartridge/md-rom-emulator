@@ -61,13 +61,18 @@ static const romstore_flash_t fake = {fakeErase, fakeProgram, fakeRead,
 
 static void select(void) { logOp(OP_SELECT, 0, 0); }
 
-// The card: one file at a time.
+// The card: one file at a time. openResult, when set, is what every f_open
+// answers.
 static const char *cardPath;
 static uint8_t *cardData;
 static FSIZE_t cardSize;
+static FRESULT openResult = FR_OK;
 
 FRESULT f_open(FIL *fp, const char *path, BYTE mode) {
   (void)mode;
+  if (openResult != FR_OK) {
+    return openResult;
+  }
   if (cardPath == NULL || strcmp(path, cardPath) != 0) {
     return FR_NO_FILE;
   }
@@ -101,6 +106,7 @@ static void reset(void) {
   opCount = 0;
   ticks = 0;
   corruptAt = UINT32_MAX;
+  openResult = FR_OK;
 }
 
 static void putFile(const char *path, uint32_t bytes, bool steemHeader) {
@@ -198,13 +204,21 @@ int main(void) {
            ROMSTORE_NOT_FOUND);
   CHECK_EQ(opCount, 0);
 
+  // No heap for FatFs's long-name buffer: out of memory, not unreadable.
+  reset();
+  putFile("/roms/pattern-64k.img", 65536, false);
+  openResult = FR_NOT_ENOUGH_CORE;
+  CHECK_EQ(romstore_write("/roms/pattern-64k.img", ROM_TEMP, &fake, &info),
+           ROMSTORE_NO_MEMORY);
+  CHECK_EQ(opCount, 0);
+
   // 64 KB: the whole area erased first, the ROM programmed, the rest 0xFF,
   // then the selection.
   reset();
   putFile("/roms/pattern-64k.img", 65536, false);
-  CHECK_EQ(romstore_launch("/roms/pattern-64k.img", ROM_TEMP, &fake, &info,
-                           select),
-           ROMSTORE_OK);
+  CHECK_EQ(
+      romstore_launch("/roms/pattern-64k.img", ROM_TEMP, &fake, &info, select),
+      ROMSTORE_OK);
   CHECK_EQ(info.romBytes, 65536);
   CHECK_EQ(count(OP_ERASE), ROMSTORE_MAX_BYTES / ROMSTORE_SECTOR_BYTES);
   CHECK_EQ(count(OP_PROGRAM), 65536 / ROMSTORE_SECTOR_BYTES);
@@ -219,9 +233,9 @@ int main(void) {
   // A STEEM image: the 4-byte header skipped, 128 KB of ROM.
   reset();
   putFile("/roms/PATTERN-128K.STC", 131076, true);
-  CHECK_EQ(romstore_launch("/roms/PATTERN-128K.STC", ROM_TEMP, &fake, &info,
-                           select),
-           ROMSTORE_OK);
+  CHECK_EQ(
+      romstore_launch("/roms/PATTERN-128K.STC", ROM_TEMP, &fake, &info, select),
+      ROMSTORE_OK);
   CHECK(info.steemHeader);
   CHECK_EQ(info.romBytes, 131072);
   checkOpsInside();
@@ -246,9 +260,9 @@ int main(void) {
   reset();
   putFile("/roms/pattern-128k.rom", 131072, false);
   corruptAt = ROM_TEMP + 70000;
-  CHECK_EQ(romstore_launch("/roms/pattern-128k.rom", ROM_TEMP, &fake, &info,
-                           select),
-           ROMSTORE_VERIFY_ERROR);
+  CHECK_EQ(
+      romstore_launch("/roms/pattern-128k.rom", ROM_TEMP, &fake, &info, select),
+      ROMSTORE_VERIFY_ERROR);
   CHECK_EQ(count(OP_SELECT), 0);
   checkOpsInside();
 

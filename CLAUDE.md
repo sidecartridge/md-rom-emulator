@@ -24,8 +24,9 @@ Prerequisites: `arm-none-eabi-*` toolchain, CMake 3.26+, Python, `stcmd` on PATH
 ./build.sh <pico|pico_w> <debug|release> <app_uuid_key>
 # e.g. ./build.sh pico_w debug 44444444-4444-4444-8444-444444444444
 
-# Target-only (regenerates rp/src/include/target_firmware.h)
-./target/atarist/build.sh "$(pwd)/target/atarist" release
+# Target-only (regenerates rp/src/include/target_firmware.h); it runs from its
+# own folder, and RELEASE_DATE fixes the cartridge header's date
+(cd target/atarist && ./build.sh "$(pwd)" release)
 
 # RP-only
 cd rp && ./build.sh <board_type> <build_type>
@@ -44,10 +45,10 @@ Build-script caveats (from AGENTS.md — respect these):
 
 ## Lint / format
 
-- `clang-tidy` runs automatically during the CMake build when installed; `.clang-tidy` at the root is the config. There is no standalone lint script.
+- `clang-tidy`: `tools/dev/tidy.sh [FILE ...]` (after `tools/dev/flash.sh <type> --build-only`) runs it with the root `.clang-tidy` over the app's own sources, or the files given; the build does not run it. The config skips `modernize-macro-to-enum` (the tools read the `#define`s) and `readability-implicit-bool-conversion` (in C, `!`, `&&` and comparisons are `int`), and lets `module_camelBack` function names through. The template's own files do not pass it; the app's files and the app's lines in template files do.
 - Format: `cmake --build rp/build --target clang-format`, or `clang-format -i rp/src/<file>.c` for one file. `.clang-format`: 2-space indent, 80 columns, attached braces, left pointer alignment (`type* ptr`).
 - Naming: functions/variables `camelBack` (functions commonly `module_camelBack`, e.g. `emul_start`, `term_printString`); fixed-width types for firmware interfaces.
-- `rp/build/compile_commands.json` exists after any CMake configure (`CMAKE_EXPORT_COMPILE_COMMANDS=ON`).
+- `compile_commands.json` exists after any CMake configure (`CMAKE_EXPORT_COMPILE_COMMANDS=ON`): `tools/dev/builds/<type>/` for `flash.sh`'s builds, `rp/build/` for `rp/build.sh`'s.
 
 ## Tests and developer tools
 
@@ -75,7 +76,7 @@ App settings keys live in `aconfig.h` (`FOLDER`, `EMULATED`, `MODE`, `HTTP_CATAL
 
 ### ROM bus emulation core (`romemul.c` + `romemul.pio`)
 
-PIO state machines watch the Atari cartridge bus (16 address/data GPIOs multiplexed through latches starting at GPIO 6, READ/WRITE latch signals on GPIO 27/28, `!ROM4` on GPIO 22 and `!ROM3` on GPIO 26; see `constants.h`), and DMA channels serve 16-bit reads directly from RAM with no CPU involvement and no IRQ. Setup mode loads the template's 16-bit program, which serves ROM4 (`$FA0000`) from the lower 64 KB of `ROM_IN_RAM`, plus the command ring below. ROM mode loads `romemul_read_two_banks` (17 address bits, `init_romemul_two_banks()`): ROM4 from the lower 64 KB and ROM3 (`$FB0000`) from the upper, and nothing else, because the user's ROM owns the whole window. Every DMA channel and state machine is claimed, never hard-coded, and `romemul_stop()` / `commemul_stop()` release the bus (state machines off, DMA aborted, the latch controls back at idle) before every reset and before the jump to Booster (`emul_quiesce()`). Before `[X]` jumps, the reset command stays in place until the ST has rebooted (its TOS reads the cartridge header); a launch instead holds it 500 ms and restarts the RP within the cartridge's own `PRE_RESET_WAIT` (about 2.4 s at 8 MHz), so TOS finds the new ROM. ROM mode is live 11.4 ms after reset (release) and records the boot race in RAM (`romModeLiveUs`, `romModeAccessBeforeLive`, `romModeFirstAccessUs`); a debug build also captures ROM3 reads in ROM mode, passively, so `swd.py ring` reads a test cartridge's reports. Hot paths are `__not_in_flash_func`.
+PIO state machines watch the Atari cartridge bus (16 address/data GPIOs multiplexed through latches starting at GPIO 6, READ/WRITE latch signals on GPIO 27/28, `!ROM4` on GPIO 22 and `!ROM3` on GPIO 26; see `constants.h`), and DMA channels serve 16-bit reads directly from RAM with no CPU involvement and no IRQ. Setup mode loads the template's 16-bit program, which serves ROM4 (`$FA0000`) from the lower 64 KB of `ROM_IN_RAM`, plus the command ring below. ROM mode loads `romemul_read_two_banks` (17 address bits, `romemul_initTwoBanks()`): ROM4 from the lower 64 KB and ROM3 (`$FB0000`) from the upper, and nothing else, because the user's ROM owns the whole window. Every DMA channel and state machine is claimed, never hard-coded, and `romemul_stop()` / `commemul_stop()` release the bus (state machines off, DMA aborted, the latch controls back at idle) before every reset and before the jump to Booster (`emul_quiesce()`). Before `[X]` jumps, the reset command stays in place until the ST has rebooted (its TOS reads the cartridge header); a launch instead holds it 500 ms and restarts the RP within the cartridge's own `PRE_RESET_WAIT` (about 2.4 s at 8 MHz), so TOS finds the new ROM. ROM mode is live 11.4 ms after reset (release) and records the boot race in RAM (`romModeLiveUs`, `romModeAccessBeforeLive`, `romModeFirstAccessUs`); a debug build also captures ROM3 reads in ROM mode, passively, so `swd.py ring` reads a test cartridge's reports. Hot paths are `__not_in_flash_func`.
 
 ### Setup-mode communication (Atari ⇄ RP2040)
 
@@ -113,6 +114,7 @@ Setup mode is the template's at `6935f53`; every other file under `rp/src` and `
 - **`tprotocol.h`:** a plain-C payload store for host builds (`tests/host`); the RP still uses the `strh` asm.
 - **`commemul.c`:** a `commemul_stop()`, which the template lacks.
 - **`main.s`:** the SHIFT keys are checked again (the setup screen offers SHIFT to boot to the desktop). **`userfw.s`:** a stub that returns to TOS.
+- **Fixes to the template's own code, reported upstream:** `term.c` drops a key typed during a long command instead of running it inside the command (`term_setBusy()` does the same for the autorun at boot), and `erase` reloads the defaults; `gconfig.c` passes its defaults table's size and `settings.c` reads stored entries up to the area's slots; `tprotocol.h`'s `MAX_PROTOCOL_PAYLOAD_SIZE` in parentheses; `chandler.c` counts the probe's injected commands apart (`chandlerInjected`) and does not answer them; `reset.c` prints its wait once; `commemul.c`'s 16 KB ring in its own section at the start of `RAM` (`memmap_rp.ld`); `download.c` refuses a download without a `FOLDER` setting; `main.s` rounds the RAM copy up to whole longs; `.clang-tidy` (see Lint).
 - **HTTP only:** the HTTPS download profile (`APP_DOWNLOAD_HTTPS=1`) compiles but does not fit in this app's 128 KB of `RAM` yet.
 
 ## Working style

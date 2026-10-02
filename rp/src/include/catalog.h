@@ -88,10 +88,10 @@ catalog_check_t catalog_check(const catalog_entry_t *entry);
 
 // %XX and + in a URL field, decoded into out (bounded). False when it did
 // not fit.
-bool catalog_urlDecode(const char *in, char *out, size_t outSize);
+bool catalog_urlDecode(const char *text, char *out, size_t outSize);
 
 // A path made safe for a request: every byte but unreserved characters and
 // '/' as %XX. False when it did not fit.
-bool catalog_urlEncodePath(const char *in, char *out, size_t outSize);
+bool catalog_urlEncodePath(const char *text, char *out, size_t outSize);
 
 #endif  // CATALOG_H
