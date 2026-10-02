@@ -31,9 +31,11 @@ end
 # app-state: the setup menu's state in emul.c.
 define app-state
   printf "menuLevel %d, submenuLevel %d\n", 'emul.c'::menuState.menuLevel, 'emul.c'::menuState.submenuLevel
-  printf "romsCount %d, page %d of %d, downloadRomSelected %d\n", 'emul.c'::romsCount, 'emul.c'::currentRomPage, 'emul.c'::maxRomPages, 'emul.c'::downloadRomSelected
-  printf "romsFolder %s\n", 'emul.c'::romsFolder
-  printf "keepActive %d, delayMode %d, hasNetwork %d, wifiConnected %d, catalogAvailable %d\n", 'emul.c'::keepActive, 'emul.c'::delayMode, 'emul.c'::hasNetwork, 'emul.c'::wifiConnected, 'emul.c'::catalogAvailable
+  printf "romsFolder %s, keepActive %d, delayMode %d\n", 'emul.c'::romsFolder, 'emul.c'::keepActive, 'emul.c'::delayMode
+  printf "netState %d (0 off, 1 connecting, 2 up, 3 failed), attempts %d: %s\n", 'emul.c'::netState, 'emul.c'::netAttempts, 'emul.c'::netReason
+  printf "catalogRefresh %d (0 none, 1 running, 2 done, 3 failed) %s\n", 'emul.c'::catalogRefresh, 'emul.c'::catalogReason
+  printf "downloadKind %d (0 none, 1 catalog, 2 ROM) %s, message: %s\n", 'emul.c'::downloadKind, 'emul.c'::downloadRomName, 'emul.c'::downloadMessage
+  printf "listKind %d (0 none, 1 card, 2 catalog), entry %d of %d\n", 'emul.c'::listKind, 'emul.c'::listNav.selected, 'emul.c'::listNav.count
 end
 document app-state
 The setup menu's state variables in emul.c.

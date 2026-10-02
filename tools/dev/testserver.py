@@ -31,6 +31,7 @@ Generated routes, for any name:
                        AUTORUN_ROM) and autorun-off/.autorun (empty). Both
                        save as .autorun; the empty one disarms it. Kept out
                        of roms.csv, so a fill never arms it by accident.
+  synthetic-N/roms.csv a catalog of N synthetic-NNNN.img entries, for paging
   autorun-name/NAME/.autorun   a .autorun naming NAME, any ROM: download it
                        into the folder under test (a ROM that is safe on the
                        ST, such as selfcheck.img, or one that must be refused)
@@ -62,7 +63,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 from make_rom_images import pattern  # noqa: E402
-from make_catalog import HEADER, row, rows_cases  # noqa: E402
+from make_catalog import HEADER, row, rows_cases, rows_synthetic  # noqa: E402
 
 PAYLOAD = bytes(range(256)) * 256          # file.bin: 64 KB, deterministic
 TARGET = b"relative-redirect-target-payload\n" * 64
@@ -89,8 +90,15 @@ def catalog(rows: list[list[str]]) -> bytes:
     return buf.getvalue().encode()
 
 
+# The size each route really serves, in KB as the catalog gives it: the
+# device checks a finished download against it.
+ROUTE_KB = {"rel": -(-len(TARGET) // 1024), "cd": -(-len(TARGET) // 1024),
+            "302cd": -(-len(TARGET) // 1024)}
+
+
 def failures_catalog() -> bytes:
-    return catalog([row(name, name, "A failure or redirect route.", "test", "64")
+    return catalog([row(name, name, "A failure or redirect route.", "test",
+                        str(ROUTE_KB.get(name, 64)))
                     for name in FAILURES] + rows_cases()
                    + [row("pattern-64k.img", "pattern-64k (control)",
                           "Served whole.", "test", "64")])
@@ -179,6 +187,11 @@ class Handler(BaseHTTPRequestHandler):
             self.redirect(302, "/cd")
         elif name == "tohttps":
             self.redirect(302, f"https://{host}:{PORTS['https']}/file.bin")
+        elif (name.startswith("synthetic-") and name.endswith("/roms.csv")
+              and name[len("synthetic-"):-len("/roms.csv")].isdigit()):
+            count = int(name[len("synthetic-"):-len("/roms.csv")])
+            self.send(200, catalog(rows_synthetic(min(count, 20000))),
+                      "text/csv")
         elif name == "failures/roms.csv":
             self.send(200, failures_catalog(), "text/csv")
         elif name == "autorun/roms.csv":

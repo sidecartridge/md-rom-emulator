@@ -1396,13 +1396,25 @@ def send_protocol(elf: str, command_id: int, words: list[int]) -> None:
     raise SwdError("the firmware kept another command pending")
 
 
+# Keys by name, as the ST's Bconin reports them: (ASCII, scan code). The
+# cursor keys come with ASCII 0.
+NAMED_KEYS = {"up": (0, 72), "down": (0, 80), "left": (0, 75),
+              "right": (0, 77), "esc": (27, 1), "return": (13, 28),
+              "space": (32, 57)}
+
+
 def cmd_key(args: argparse.Namespace) -> int:
     elf = matching_elf(args.elf)
     defs = include_defines()
-    if len(args.char) != 1:
-        raise SwdError("CHAR must be one character")
+    if args.char in NAMED_KEYS:
+        ascii_code, scan = NAMED_KEYS[args.char]
+    elif len(args.char) == 1:
+        ascii_code, scan = ord(args.char), args.scan
+    else:
+        raise SwdError("CHAR must be one character or one of "
+                       + ", ".join(NAMED_KEYS))
     command_id = (defs["APP_TERMINAL"] << 8) | defs["APP_TERMINAL_KEYSTROKE"]
-    param = (ord(args.char) | (args.scan << defs["TERM_KEYBOARD_SCAN_SHIFT"]) |
+    param = (ascii_code | (scan << defs["TERM_KEYBOARD_SCAN_SHIFT"]) |
              ((1 if args.shift else 0) << defs["TERM_KEYBOARD_SHIFT_SHIFT"]))
     send_protocol(elf, command_id, [param & 0xFFFF, param >> 16])
     print(f"key {args.char!r} sent")
@@ -1749,7 +1761,8 @@ def build_parser() -> argparse.ArgumentParser:
     se.set_defaults(func=cmd_select)
 
     k = sub.add_parser("key", help="send a keystroke as the ST would")
-    k.add_argument("char")
+    k.add_argument("char", help="one character, or up, down, left, right, "
+                   "esc, return, space")
     k.add_argument("--shift", action="store_true")
     k.add_argument("--scan", type=int, default=0)
     k.add_argument("--elf")

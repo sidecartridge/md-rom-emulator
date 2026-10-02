@@ -62,6 +62,13 @@ IMAGES = {
     "oversize-132k.ROM": lambda: pattern(WINDOW) + pattern(4 * 1024),
     "empty.bin": lambda: b"",
     LONG_NAME: lambda: pattern(64 * 1024),
+    # The files make_catalog.py --cases lists, so their downloads succeed:
+    # a 60-character catalog name, an entry with empty fields, and one whose
+    # name and description carry commas and quotes.
+    "a-catalog-entry-whose-name-is-sixty-characters-long-test.img":
+        lambda: pattern(64 * 1024),
+    "empty-fields.img": lambda: pattern(64 * 1024),
+    "commas-and-quotes.img": lambda: pattern(64 * 1024),
 }
 
 
