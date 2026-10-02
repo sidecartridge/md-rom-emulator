@@ -24,6 +24,12 @@
 // The size column's limit: 128 KB, and 129 for a STEEM image's 4-byte header
 // rounded up. romstore checks the real size at launch.
 #define CATALOG_MAX_SIZE_KB 129
+// A line's fields: URL, name, description, tags, size in KB.
+#define CATALOG_FIELDS 5
+#define DECIMAL_BASE 10
+#define HEX_BASE 16
+#define NIBBLE_BITS 4
+#define NIBBLE_MASK 0x0FU
 
 // A buffered reader over the file that knows the offset of every byte.
 typedef struct {
@@ -85,9 +91,9 @@ typedef struct {
   bool cut;
 } field_t;
 
-static void fieldPut(field_t *field, int c) {
+static void fieldPut(field_t *field, int chr) {
   if (field->length + 1 < field->size) {
-    field->text[field->length++] = (char)c;
+    field->text[field->length++] = (char)chr;
     field->text[field->length] = '\0';
   } else {
     field->cut = true;
@@ -104,8 +110,8 @@ static int readLine(reader_t *reader, field_t *fields, int count) {
     fields[i].cut = false;
     fields[i].text[0] = '\0';
   }
-  int c = readerGet(reader);
-  if (c < 0) {
+  int chr = readerGet(reader);
+  if (chr < 0) {
     return -1;
   }
   int index = 0;
@@ -113,33 +119,33 @@ static int readLine(reader_t *reader, field_t *fields, int count) {
   bool atStart = true;
   bool quoted = false;
   bool inQuotes = false;
-  while (c >= 0 && (c != '\n' || inQuotes)) {
+  while (chr >= 0 && (chr != '\n' || inQuotes)) {
     field_t *field = (index < count) ? &fields[index] : NULL;
     if (inQuotes) {
-      if (c == '"') {
-        c = readerGet(reader);
-        if (c == '"') {
+      if (chr == '"') {
+        chr = readerGet(reader);
+        if (chr == '"') {
           if (field != NULL) {
             fieldPut(field, '"');
           }
-          c = readerGet(reader);
+          chr = readerGet(reader);
         } else {
           inQuotes = false;
         }
         continue;
       }
       if (field != NULL) {
-        fieldPut(field, c);
+        fieldPut(field, chr);
       }
-    } else if (c == ',') {
+    } else if (chr == ',') {
       index++;
       atStart = true;
       quoted = false;
-    } else if (c == '\r') {
+    } else if (chr == '\r') {
       // dropped
-    } else if (atStart && (c == ' ' || c == '\t')) {
+    } else if (atStart && (chr == ' ' || chr == '\t')) {
       // leading blanks
-    } else if (atStart && c == '"') {
+    } else if (atStart && chr == '"') {
       quoted = true;
       inQuotes = true;
       atStart = false;
@@ -149,10 +155,10 @@ static int readLine(reader_t *reader, field_t *fields, int count) {
       seen = true;
       // After a closing quote, anything before the comma is ignored.
       if (!quoted && field != NULL) {
-        fieldPut(field, c);
+        fieldPut(field, chr);
       }
     }
-    c = readerGet(reader);
+    chr = readerGet(reader);
   }
   if (!seen && index == 0) {
     return 0;
@@ -160,46 +166,46 @@ static int readLine(reader_t *reader, field_t *fields, int count) {
   return index + 1;
 }
 
-bool catalog_urlDecode(const char *in, char *out, size_t outSize) {
+bool catalog_urlDecode(const char *text, char *out, size_t outSize) {
   size_t length = 0;
-  for (size_t i = 0; in[i] != '\0'; i++) {
-    char c = in[i];
-    if (c == '%' && isxdigit((unsigned char)in[i + 1]) &&
-        isxdigit((unsigned char)in[i + 2])) {
-      char hex[3] = {in[i + 1], in[i + 2], '\0'};
-      c = (char)strtol(hex, NULL, 16);
+  for (size_t i = 0; text[i] != '\0'; i++) {
+    char chr = text[i];
+    if (chr == '%' && isxdigit((unsigned char)text[i + 1]) &&
+        isxdigit((unsigned char)text[i + 2])) {
+      char hex[3] = {text[i + 1], text[i + 2], '\0'};
+      chr = (char)strtol(hex, NULL, HEX_BASE);
       i += 2;
-    } else if (c == '+') {
-      c = ' ';
+    } else if (chr == '+') {
+      chr = ' ';
     }
     if (length + 1 >= outSize) {
       out[length] = '\0';
       return false;
     }
-    out[length++] = c;
+    out[length++] = chr;
   }
   out[length] = '\0';
   return true;
 }
 
-bool catalog_urlEncodePath(const char *in, char *out, size_t outSize) {
+bool catalog_urlEncodePath(const char *text, char *out, size_t outSize) {
   static const char hex[] = "0123456789ABCDEF";
   size_t length = 0;
-  for (size_t i = 0; in[i] != '\0'; i++) {
-    unsigned char c = (unsigned char)in[i];
-    bool plain =
-        isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~' || c == '/';
+  for (size_t i = 0; text[i] != '\0'; i++) {
+    unsigned char chr = (unsigned char)text[i];
+    bool plain = (isalnum(chr) != 0) || chr == '-' || chr == '_' ||
+                 chr == '.' || chr == '~' || chr == '/';
     size_t need = plain ? 1U : 3U;
     if (length + need >= outSize) {
       out[length] = '\0';
       return false;
     }
     if (plain) {
-      out[length++] = (char)c;
+      out[length++] = (char)chr;
     } else {
       out[length++] = '%';
-      out[length++] = hex[c >> 4];
-      out[length++] = hex[c & 0x0F];
+      out[length++] = hex[chr >> NIBBLE_BITS];
+      out[length++] = hex[chr & NIBBLE_MASK];
     }
   }
   out[length] = '\0';
@@ -213,16 +219,16 @@ typedef struct {
   char description[CATALOG_TEXT_BYTES];
   char tags[CATALOG_TAGS_BYTES];
   char size[CATALOG_SIZE_BYTES];
-  field_t fields[5];
+  field_t fields[CATALOG_FIELDS];
 } line_t;
 
 static void lineInit(line_t *line) {
-  char *texts[5] = {line->url, line->name, line->description, line->tags,
-                    line->size};
-  size_t sizes[5] = {sizeof(line->url), sizeof(line->name),
-                     sizeof(line->description), sizeof(line->tags),
-                     sizeof(line->size)};
-  for (int i = 0; i < 5; i++) {
+  char *texts[CATALOG_FIELDS] = {line->url, line->name, line->description,
+                                 line->tags, line->size};
+  size_t sizes[CATALOG_FIELDS] = {sizeof(line->url), sizeof(line->name),
+                                  sizeof(line->description), sizeof(line->tags),
+                                  sizeof(line->size)};
+  for (int i = 0; i < CATALOG_FIELDS; i++) {
     line->fields[i] = (field_t){texts[i], sizes[i], 0, false};
   }
 }
@@ -231,7 +237,7 @@ static void lineInit(line_t *line) {
 // (empty, no URL, a URL that does not fit), 1 for an entry, decoded into
 // entry when it is not NULL.
 static int nextEntry(reader_t *reader, line_t *line, catalog_entry_t *entry) {
-  int fields = readLine(reader, line->fields, 5);
+  int fields = readLine(reader, line->fields, CATALOG_FIELDS);
   if (fields < 0) {
     return -1;
   }
@@ -247,7 +253,7 @@ static int nextEntry(reader_t *reader, line_t *line, catalog_entry_t *entry) {
   catalog_urlDecode(line->description, out->description,
                     sizeof(out->description));
   catalog_urlDecode(line->tags, out->tags, sizeof(out->tags));
-  out->sizeKb = (uint32_t)strtoul(line->size, NULL, 10);
+  out->sizeKb = (uint32_t)strtoul(line->size, NULL, DECIMAL_BASE);
   return 1;
 }
 
@@ -266,7 +272,7 @@ catalog_result_t catalog_open(catalog_t *cat, const char *path) {
   if (cat->pageOffsets != NULL && line != NULL && reader != NULL &&
       readerOpen(reader, path, 0, &result)) {
     lineInit(line);
-    readLine(reader, line->fields, 5);  // the header
+    readLine(reader, line->fields, CATALOG_FIELDS);  // the header
     for (;;) {
       uint32_t start = reader->offset;
       int found = nextEntry(reader, line, NULL);
@@ -307,7 +313,8 @@ catalog_result_t catalog_open(catalog_t *cat, const char *path) {
 // Reads from page's first entry: skips `skip` entries, then calls take for
 // up to max more. Returns how many were taken.
 static int readFrom(const catalog_t *cat, uint32_t page, uint32_t skip, int max,
-                    void (*take)(int n, const catalog_entry_t *e, void *ctx),
+                    void (*take)(int n, const catalog_entry_t *entry,
+                                 void *ctx),
                     void *ctx) {
   if (cat->pageOffsets == NULL || page >= cat->pages || max <= 0) {
     return 0;
@@ -342,9 +349,10 @@ static int readFrom(const catalog_t *cat, uint32_t page, uint32_t skip, int max,
   return taken;
 }
 
-static void takeName(int n, const catalog_entry_t *e, void *ctx) {
+static void takeName(int n, const catalog_entry_t *entry, void *ctx) {
   char (*names)[CATALOG_SHOWN_BYTES] = (char (*)[CATALOG_SHOWN_BYTES])ctx;
-  const char *shown = (e->name[0] != '\0') ? e->name : catalog_fileName(e);
+  const char *shown =
+      (entry->name[0] != '\0') ? entry->name : catalog_fileName(entry);
   snprintf(names[n], CATALOG_SHOWN_BYTES, "%.*s", CATALOG_SHOWN_BYTES - 1,
            shown);
 }
@@ -352,16 +360,16 @@ static void takeName(int n, const catalog_entry_t *e, void *ctx) {
 int catalog_readPage(const catalog_t *cat, uint32_t page,
                      char names[][CATALOG_SHOWN_BYTES], int max) {
   uint32_t left =
-      (page < cat->pages) ? cat->count - page * CATALOG_PAGE_ENTRIES : 0U;
+      (page < cat->pages) ? cat->count - (page * CATALOG_PAGE_ENTRIES) : 0U;
   if ((uint32_t)max > left) {
     max = (int)left;
   }
   return readFrom(cat, page, 0, max, takeName, names);
 }
 
-static void takeEntry(int n, const catalog_entry_t *e, void *ctx) {
+static void takeEntry(int n, const catalog_entry_t *entry, void *ctx) {
   (void)n;
-  memcpy(ctx, e, sizeof(*e));
+  memcpy(ctx, entry, sizeof(*entry));
 }
 
 catalog_result_t catalog_readEntry(const catalog_t *cat, uint32_t index,

@@ -46,6 +46,18 @@
 // The longest the jump to Booster waits for the ST to reboot: past main.s's
 // PRE_RESET_WAIT at 8 MHz (about 2.4 s).
 #define BOOSTER_HANDOVER_MAX_MS 4000
+// The cartridge header TOS reads at boot: a read below it means the ST has
+// rebooted.
+#define CARTRIDGE_HEADER_BYTES 0x100
+#define BYTES_PER_KB 1024U
+#define US_PER_MS 1000U
+// A 32-bit number with its thousands commas, and the terminator.
+#define NUMBER_TEXT_BYTES 16
+// The download message's prefixes: the name gets what is left of the line.
+#define DOWNLOADED_PREFIX "Downloaded: "
+#define DOWNLOADING_PREFIX "Downloading: "
+// How often the main loop gives lwIP's network stack a turn.
+#define NETWORK_POLL_MS 10
 
 // The largest file ROM_TEMP takes: two 64 KB banks, plus the 4 zero bytes a
 // STEEM cartridge image starts with.
@@ -63,7 +75,7 @@ static void cmdDelay(const char *arg);
 static void cmdUnknown(const char *arg);
 #if defined(_DEBUG) && (_DEBUG != 0)
 static void cmdFirmware(const char *arg);
-static void netTestWifi(bool up);
+static void netTestWifi(bool connect);
 #endif
 
 // Command table
@@ -184,8 +196,8 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
                                  uint16_t payloadSize) {
   switch (commandId) {
     case DEVHOOKS_APP_HEAP_HOLD: {
-      uint32_t kb = (payloadSize >= 2u) ? payload[0] : 0u;
-      if (kb == 0u) {
+      uint32_t holdKb = (payloadSize >= 2U) ? payload[0] : 0U;
+      if (holdKb == 0U) {
         while (devhooksHeldHeap != NULL) {
           DevhooksHeldBlock *next = devhooksHeldHeap->next;
           free(devhooksHeldHeap);
@@ -194,19 +206,20 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
         DPRINTF("devhooks: heap hold released\n");
         return 1;
       }
-      DevhooksHeldBlock *block = malloc(sizeof(DevhooksHeldBlock) + kb * 1024u);
+      DevhooksHeldBlock *block =
+          malloc(sizeof(DevhooksHeldBlock) + (holdKb * BYTES_PER_KB));
       if (block != NULL) {
         block->next = devhooksHeldHeap;
         devhooksHeldHeap = block;
       }
-      DPRINTF("devhooks: holding %lu KB more heap: %s\n", (unsigned long)kb,
+      DPRINTF("devhooks: holding %lu KB more heap: %s\n", (unsigned long)holdKb,
               (block != NULL) ? "ok" : "refused");
-      return (block != NULL) ? 1u : 0u;
+      return (block != NULL) ? 1U : 0U;
     }
     case DEVHOOKS_APP_DOWNLOAD:
       return devdownload_start();
     case DEVHOOKS_APP_WIFI:
-      netTestWifi((payloadSize >= 2u) && (payload[0] != 0u));
+      netTestWifi((payloadSize >= 2U) && (payload[0] != 0U));
       return 1;
     default:
       return 0;
@@ -214,10 +227,10 @@ static uint32_t emul_devhooksApp(uint16_t commandId, const uint16_t *payload,
 }
 #endif
 
-// Keep answering the ST for ms milliseconds, so a command in flight is not
-// left without its answer while a sentinel command waits to be seen.
-static void emul_serviceFor(uint32_t ms) {
-  absolute_time_t until = make_timeout_time_ms(ms);
+// Keep answering the ST for durationMs, so a command in flight is not left
+// without its answer while a sentinel command waits to be seen.
+static void emul_serviceFor(uint32_t durationMs) {
+  absolute_time_t until = make_timeout_time_ms(durationMs);
   while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
     chandler_loop();
   }
@@ -250,7 +263,7 @@ static bool emul_waitForStReboot(uint32_t maxMs) {
   while (absolute_time_diff_us(get_absolute_time(), until) > 0) {
     chandler_loop();
     int32_t offset = romemul_lastReadOffset();
-    if (offset >= 0 && offset < 0x100) {
+    if (offset >= 0 && offset < CARTRIDGE_HEADER_BYTES) {
       return true;
     }
   }
@@ -355,7 +368,7 @@ static void romFlashEnd(void) {
 
 // n with a comma every three digits, for the user's messages.
 static void formatThousands(char *out, size_t outSize, uint32_t n) {
-  char digits[16];
+  char digits[NUMBER_TEXT_BYTES];
   int len = snprintf(digits, sizeof(digits), "%lu", (unsigned long)n);
   size_t pos = 0;
   for (int i = 0; i < len && pos + 1 < outSize; i++) {
@@ -372,8 +385,8 @@ static void romstoreReport(romstore_result_t result,
                            const romstore_info_t *info) {
   term_printString("\n");
   if (result == ROMSTORE_TOO_LARGE) {
-    char size[16];
-    char limit[16];
+    char size[NUMBER_TEXT_BYTES];
+    char limit[NUMBER_TEXT_BYTES];
     char line[TERM_SCREEN_SIZE_X * 2];
     formatThousands(size, sizeof(size), info->fileBytes);
     formatThousands(limit, sizeof(limit), ROMSTORE_MAX_BYTES);
@@ -462,11 +475,12 @@ static AutorunResult autorunIfRequested(const char *folder) {
   // The ROM into flash, read back; only then the settings that boot into it.
   autorunRomName = filenameStart;
   romstore_info_t info;
+  term_setBusy(true);
   romFlashBegin();
-  romstore_result_t stored =
-      romstore_launch(romPath, FLASH_ROM_LOAD_OFFSET, &romFlash, &info,
-                      autorunSelect);
+  romstore_result_t stored = romstore_launch(romPath, FLASH_ROM_LOAD_OFFSET,
+                                             &romFlash, &info, autorunSelect);
   romFlashEnd();
+  term_setBusy(false);
   free(fileBuf);
   autorunRomName = NULL;
   if (stored != ROMSTORE_OK) {
@@ -475,17 +489,15 @@ static AutorunResult autorunIfRequested(const char *folder) {
     return AUTORUN_ERR_FLASH_STORE;  // Failed to store ROM in flash
   }
 
-  term_setBusy(true);
   // Blink the LED (if available) forever instead of resetting. The ST and
   // SELECT stay serviced: a short press restarts the RP, which boots into the
   // ROM just stored (MODE is ROM_MODE_DIRECT now), as v2.1.2 did.
   DPRINTF("Autorun successful. Blinking LED to indicate autorun mode.\n");
-  term_setBusy(false);
   bool ledOn = false;
   uint32_t toggledUs = time_us_32();
   while (1) {
     emul_pollTick();
-    if (time_us_32() - toggledUs < AUTORUN_BLINK_MS * 1000U) {
+    if (time_us_32() - toggledUs < AUTORUN_BLINK_MS * US_PER_MS) {
       continue;
     }
     toggledUs = time_us_32();
@@ -789,8 +801,8 @@ static void netConnect(void);
 #if defined(_DEBUG) && (_DEBUG != 0)
 // The Wi-Fi debug hook: down as a lost network would be (the station leaves
 // the AP), or a new connection.
-static void netTestWifi(bool up) {
-  if (up) {
+static void netTestWifi(bool connect) {
+  if (connect) {
     netAttempts = 0;
     netConnect();
   } else {
@@ -906,7 +918,8 @@ static void downloadsPoll(void) {
     snprintf(path, sizeof(path), "%s/%s", romsFolder, name);
     FILINFO fno;
     if (downloadRomSizeKb > 0 && f_stat(path, &fno) == FR_OK) {
-      uint32_t gotKb = (uint32_t)((fno.fsize + 1023u) / 1024u);
+      uint32_t gotKb =
+          (uint32_t)((fno.fsize + BYTES_PER_KB - 1U) / BYTES_PER_KB);
       if (gotKb + 1 < downloadRomSizeKb || gotKb > downloadRomSizeKb + 1) {
         f_unlink(path);
         snprintf(downloadMessage, sizeof(downloadMessage),
@@ -918,8 +931,8 @@ static void downloadsPoll(void) {
     }
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, name);
     settings_save(aconfig_getContext(), true);
-    snprintf(downloadMessage, sizeof(downloadMessage), "Downloaded: %.*s",
-             TERM_SCREEN_SIZE_X - 13, name);
+    snprintf(downloadMessage, sizeof(downloadMessage), DOWNLOADED_PREFIX "%.*s",
+             (int)(TERM_SCREEN_SIZE_X - sizeof(DOWNLOADED_PREFIX)), name);
   } else {
     describeDownload(err, reason, sizeof(reason));
     snprintf(downloadMessage, sizeof(downloadMessage), "Download failed: %s",
@@ -1114,8 +1127,9 @@ static void listAct(void) {
   snprintf(downloadRomName, sizeof(downloadRomName), "%s",
            catalog_fileName(&catalogEntry));
   downloadRomSizeKb = catalogEntry.sizeKb;
-  snprintf(downloadMessage, sizeof(downloadMessage), "Downloading: %.*s",
-           TERM_SCREEN_SIZE_X - 14, downloadRomName);
+  snprintf(downloadMessage, sizeof(downloadMessage), DOWNLOADING_PREFIX "%.*s",
+           (int)(TERM_SCREEN_SIZE_X - sizeof(DOWNLOADING_PREFIX)),
+           downloadRomName);
   listClose();
   menu();
   display_refresh();
@@ -1243,9 +1257,8 @@ void cmdLaunch(const char *arg) {
   DPRINTF("Loading ROM file into FLASH: %s\n", filename);
   romstore_info_t info;
   romFlashBegin();
-  romstore_result_t result =
-      romstore_launch(filename, FLASH_ROM_LOAD_OFFSET, &romFlash, &info,
-                      cmdLaunchSelect);
+  romstore_result_t result = romstore_launch(filename, FLASH_ROM_LOAD_OFFSET,
+                                             &romFlash, &info, cmdLaunchSelect);
   romFlashEnd();
   if (result != ROMSTORE_OK) {
     DPRINTF("Launch failed: %s\n", romstore_message(result));
@@ -1372,7 +1385,10 @@ volatile uint32_t romModeLiveUs = 0;
 volatile uint32_t romModeAccessBeforeLive = 0;
 volatile uint32_t romModeFirstAccessUs = 0;
 
-#define ROM4_EDGE_FALL_BITS (GPIO_IRQ_EDGE_FALL << (4 * (ROM4_GPIO % 8)))
+// IO_BANK0 keeps eight GPIOs' four event bits in each interrupt register.
+#define GPIOS_PER_IRQ_REG 8
+#define ROM4_EDGE_FALL_BITS \
+  (GPIO_IRQ_EDGE_FALL << (4 * (ROM4_GPIO % GPIOS_PER_IRQ_REG)))
 
 // One-shot: records the first access and switches itself off, with register
 // writes only (no flash code in an interrupt).
@@ -1382,16 +1398,17 @@ static void __not_in_flash_func(romModeFirstAccessIrq)(void) {
   }
   gpio_acknowledge_irq(ROM4_GPIO, GPIO_IRQ_EDGE_FALL);
   romModeFirstAccessUs = time_us_32();
-  hw_clear_bits(&io_bank0_hw->proc0_irq_ctrl.inte[ROM4_GPIO / 8],
-                ROM4_EDGE_FALL_BITS);
+  hw_clear_bits(
+      &io_bank0_hw->proc0_irq_ctrl.inte[ROM4_GPIO / GPIOS_PER_IRQ_REG],
+      ROM4_EDGE_FALL_BITS);
 }
 
 // Called the moment the engine serves the bus: takes the time, reads the
 // latch of edges since reset, then arms the one-shot for the next access.
 static void romModeMarkLive(void) {
   romModeLiveUs = time_us_32();
-  romModeAccessBeforeLive =
-      (io_bank0_hw->intr[ROM4_GPIO / 8] & ROM4_EDGE_FALL_BITS) != 0U;
+  romModeAccessBeforeLive = (io_bank0_hw->intr[ROM4_GPIO / GPIOS_PER_IRQ_REG] &
+                             ROM4_EDGE_FALL_BITS) != 0U;
   gpio_acknowledge_irq(ROM4_GPIO, GPIO_IRQ_EDGE_FALL);
   gpio_add_raw_irq_handler(ROM4_GPIO, romModeFirstAccessIrq);
   gpio_set_irq_enabled(ROM4_GPIO, GPIO_IRQ_EDGE_FALL, true);
@@ -1415,8 +1432,8 @@ static void romMode(int appModeValue) {
           (unsigned int)&_rom_temp_start, ROM_SIZE_BYTES * ROM_BANKS);
   COPY_FIRMWARE_TO_RAM((uint16_t *)&_rom_temp_start,
                        ROM_SIZE_WORDS * ROM_BANKS);
-  if (init_romemul_two_banks(false) < 0) {
-    panic("init_romemul_two_banks failed: PIO/DMA claim returned <0");
+  if (romemul_initTwoBanks(false) < 0) {
+    panic("romemul_initTwoBanks failed: PIO/DMA claim returned <0");
   }
   romModeMarkLive();
 #if defined(_DEBUG) && (_DEBUG != 0)
@@ -1428,8 +1445,7 @@ static void romMode(int appModeValue) {
   }
 #endif
   DPRINTF("ROM mode live at %lu us; the ST read the cartridge before: %s\n",
-          (unsigned long)romModeLiveUs,
-          romModeAccessBeforeLive ? "yes" : "no");
+          (unsigned long)romModeLiveUs, romModeAccessBeforeLive ? "yes" : "no");
 
 #ifdef BLINK_H
   blink_on();
@@ -1590,7 +1606,7 @@ void emul_start() {
     // loop to the command ring.
     if (absolute_time_diff_us(nextNetworkPoll, get_absolute_time()) >= 0) {
       network_safePoll();
-      nextNetworkPoll = make_timeout_time_ms(10);
+      nextNetworkPoll = make_timeout_time_ms(NETWORK_POLL_MS);
     }
 #endif
 
@@ -1624,8 +1640,8 @@ void emul_start() {
     bool stRebooted = emul_waitForStReboot(BOOSTER_HANDOVER_MAX_MS);
     SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_NOP);
     DPRINTF("The ST %s\n", stRebooted
-                                ? "rebooted: its cartridge header was read"
-                                : "did not reboot (nothing listening)");
+                               ? "rebooted: its cartridge header was read"
+                               : "did not reboot (nothing listening)");
     // Before jumping to the booster app, clean the settings: no ROM selected,
     // setup mode
     settings_put_string(aconfig_getContext(), ACONFIG_PARAM_ROM_SELECTED, "");

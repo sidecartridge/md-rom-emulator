@@ -53,7 +53,7 @@ static int initRomEmulator(PIO pio) {
 
   // Claim a free state machine from the PIO read program
   uint smReadROM = pio_claim_unused_sm(pio, true);
-  engineSmMask |= 1u << smReadROM;
+  engineSmMask |= 1U << smReadROM;
 
   // Start the state machine, executing the PIO read program
   romemul_read_program_init(pio, smReadROM, offsetReadROM, READ_ADDR_GPIO_BASE,
@@ -198,7 +198,8 @@ static int initTwoBankEmulator(PIO pio) {
     DPRINTF("Failed to claim the state machines for the two-bank ROM.\n");
     return -1;
   }
-  engineSmMask |= (1u << smMonitorRom3) | (1u << smMonitorRom4) | (1u << smRead);
+  engineSmMask |=
+      (1U << smMonitorRom3) | (1U << smMonitorRom4) | (1U << smRead);
   DPRINTF("Two-bank ROM: SM %d (ROM3) %d (ROM4) %d (read), DMA %d %d\n",
           smMonitorRom3, smMonitorRom4, smRead, readAddrRomDmaChannel,
           lookupDataRomDmaChannel);
@@ -243,7 +244,7 @@ static int initTwoBankEmulator(PIO pio) {
   return smRead;
 }
 
-int init_romemul_two_banks(bool copyFlashToRAM) {
+int romemul_initTwoBanks(bool copyFlashToRAM) {
   // DMA over the CPUs, as v2.1.2's ROM mode always had it: here the CPU
   // only watches SELECT, and the ST's reads must never wait.
   bus_ctrl_hw->priority =
@@ -299,10 +300,10 @@ void romemul_stop(void) {
   // The two channels chain to each other: abort them in one write.
   uint32_t dmaMask = 0;
   if (readAddrRomDmaChannel >= 0) {
-    dmaMask |= 1u << (uint)readAddrRomDmaChannel;
+    dmaMask |= 1U << (uint)readAddrRomDmaChannel;
   }
   if (lookupDataRomDmaChannel >= 0) {
-    dmaMask |= 1u << (uint)lookupDataRomDmaChannel;
+    dmaMask |= 1U << (uint)lookupDataRomDmaChannel;
   }
   if (dmaMask != 0U) {
     dma_hw->abort = dmaMask;
@@ -315,12 +316,12 @@ void romemul_stop(void) {
   // directions as they were. Hand the latch controls back to the CPU at their
   // idle level (high: both latches off), then the data lines as inputs.
   const uint32_t controls =
-      (1u << READ_SIGNAL_GPIO_BASE) | (1u << WRITE_SIGNAL_GPIO_BASE);
+      (1U << READ_SIGNAL_GPIO_BASE) | (1U << WRITE_SIGNAL_GPIO_BASE);
   gpio_put_masked(controls, controls);
   gpio_set_dir_out_masked(controls);
   gpio_set_function(READ_SIGNAL_GPIO_BASE, GPIO_FUNC_SIO);
   gpio_set_function(WRITE_SIGNAL_GPIO_BASE, GPIO_FUNC_SIO);
-  const uint32_t data = ((1u << WRITE_DATA_PIN_COUNT) - 1u)
+  const uint32_t data = ((1U << WRITE_DATA_PIN_COUNT) - 1U)
                         << WRITE_DATA_GPIO_BASE;
   gpio_set_dir_in_masked(data);
   for (uint pin = WRITE_DATA_GPIO_BASE;
