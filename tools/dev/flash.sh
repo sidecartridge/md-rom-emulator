@@ -16,7 +16,7 @@
 # PICO_OPENOCD_PATH (see swd.py), RELEASE_DATE (default: the date of the HEAD
 # commit, so builds of one commit are byte-identical), APP_DOWNLOAD_HTTPS=0 for
 # a build without HTTPS downloads (in tools/dev/builds/<type>-http),
-# RP_CMAKE_BUILD_TYPE for a CMake type other than rp/build.sh's (MinSizeRel).
+# RP_CMAKE_BUILD_TYPE for a CMake type other than rp/build.sh's (Release).
 set -Eeo pipefail
 trap 'echo "ERROR: ${BASH_SOURCE[0]}: failed at line ${LINENO}" >&2' ERR
 
@@ -86,12 +86,12 @@ fi
 export RELEASE_DATE
 
 echo "Building $NAME from $SRC"
-# Same CMake build type as rp/build.sh: MinSizeRel, unless RP_CMAKE_BUILD_TYPE
-# says otherwise (Release to compare, Debug to step through the code).
+# Same CMake build type as rp/build.sh: Release, unless RP_CMAKE_BUILD_TYPE
+# says otherwise (MinSizeRel to compare, Debug to step through the code).
 if [ -n "${RP_CMAKE_BUILD_TYPE:-}" ]; then
   echo "WARNING: RP_CMAKE_BUILD_TYPE=$RP_CMAKE_BUILD_TYPE: not a shipping build"
 fi
-cmake -S "$SRC" -B "$OUT" -DCMAKE_BUILD_TYPE="${RP_CMAKE_BUILD_TYPE:-MinSizeRel}" \
+cmake -S "$SRC" -B "$OUT" -DCMAKE_BUILD_TYPE="${RP_CMAKE_BUILD_TYPE:-Release}" \
   > "$OUT/cmake.log" 2>&1 \
   || { tail -20 "$OUT/cmake.log"; exit 1; }
 make -C "$OUT" -j"$(sysctl -n hw.ncpu 2>/dev/null || nproc)" > "$OUT/make.log" 2>&1 \
