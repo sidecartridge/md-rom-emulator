@@ -1,7 +1,13 @@
 #include "reset.h"
 
+#include "health.h"
+
 void reset_device() {
   DPRINTF("Resetting the device\n");
+
+  // A reset the user asked for (SELECT, a launch, [E]xit): the next boot
+  // reports it as such and clears the crash-loop guard.
+  health_markReset();
 
   save_and_disable_interrupts();
   // watchdog_enable(RESET_WATCHDOG_TIMEOUT, 0);
