@@ -28,6 +28,10 @@
 #include "hardware/flash.h"
 #include "hardware/sync.h"
 #include "health.h"
+#if APP_DOWNLOAD_HTTPS
+#include "httpc/httpc.h"
+#include "mbedtls/memory_buffer_alloc.h"
+#endif
 #include "memfunc.h"
 #include "navlist.h"
 #include "network.h"
@@ -900,6 +904,22 @@ static void netScheduleRetry(void) {
   }
 }
 
+#if APP_DOWNLOAD_HTTPS
+// mbedTLS allocates in the window's ROM3 bank, which setup mode doesn't serve
+// (the template's program serves ROM4 only); ROM mode copies the ROM over it
+// and never uses TLS. A TLS session's buffers (about 40 KB) stay off the heap.
+// lwIP points mbedTLS at its own 4 KB heap when it creates its TLS config, so
+// the arena goes in once that config exists, while nothing is allocated yet.
+static void tlsArenaStart(void) {
+  if (httpc_shared_tls_config() == NULL) {
+    DPRINTF("No TLS config: https downloads will fail\n");
+    return;
+  }
+  mbedtls_memory_buffer_alloc_init(
+      (unsigned char *)&__rom_in_ram_start__ + ROM_SIZE_BYTES, ROM_SIZE_BYTES);
+}
+#endif
+
 // At boot, once the menu is up. Booster owns the Wi-Fi settings.
 static void netStart(void) {
   netAttempts = 0;
@@ -913,6 +933,9 @@ static void netStart(void) {
     netRetry = false;
     netReason = "The Wi-Fi chip did not start.";
   } else {
+#if APP_DOWNLOAD_HTTPS
+    tlsArenaStart();
+#endif
     netConnect();
     if (netState == NET_FAILED && netRetry) {
       netScheduleRetry();
@@ -1014,6 +1037,14 @@ static void downloadsPoll(void) {
     return;
   }
   download_err_t err = download_finish();
+#if APP_DOWNLOAD_HTTPS && defined(_DEBUG) && (_DEBUG != 0)
+  size_t tlsPeakBytes = 0;
+  size_t tlsPeakBlocks = 0;
+  mbedtls_memory_buffer_alloc_max_get(&tlsPeakBytes, &tlsPeakBlocks);
+  DPRINTF("TLS arena: peak %u bytes in %u blocks\n", (unsigned)tlsPeakBytes,
+          (unsigned)tlsPeakBlocks);
+  mbedtls_memory_buffer_alloc_max_reset();
+#endif
   if (err == DOWNLOAD_OK) {
     err = download_confirm();
   }

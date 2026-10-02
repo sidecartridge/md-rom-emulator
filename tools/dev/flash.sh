@@ -14,8 +14,8 @@
 #
 # Environment: APP_UUID_KEY (default: the development UUID), OPENOCD and
 # PICO_OPENOCD_PATH (see swd.py), RELEASE_DATE (default: the date of the HEAD
-# commit, so builds of one commit are byte-identical), APP_DOWNLOAD_HTTPS=1 for
-# a build with HTTPS downloads (in tools/dev/builds/<type>-https),
+# commit, so builds of one commit are byte-identical), APP_DOWNLOAD_HTTPS=0 for
+# a build without HTTPS downloads (in tools/dev/builds/<type>-http),
 # RP_CMAKE_BUILD_TYPE for a CMake type other than rp/build.sh's (MinSizeRel).
 set -Eeo pipefail
 trap 'echo "ERROR: ${BASH_SOURCE[0]}: failed at line ${LINENO}" >&2' ERR
@@ -46,11 +46,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# APP_DOWNLOAD_HTTPS=1 (HTTP and HTTPS downloads) builds in its own folder.
-export APP_DOWNLOAD_HTTPS="${APP_DOWNLOAD_HTTPS:-0}"
+# HTTP and HTTPS downloads, as releases ship; APP_DOWNLOAD_HTTPS=0 (HTTP only)
+# builds in its own folder.
+export APP_DOWNLOAD_HTTPS="${APP_DOWNLOAD_HTTPS:-1}"
 NAME="$TYPE"
-if [ "$APP_DOWNLOAD_HTTPS" = 1 ]; then
-  NAME="$TYPE-https"
+if [ "$APP_DOWNLOAD_HTTPS" = 0 ]; then
+  NAME="$TYPE-http"
 fi
 # Another CMake type (RP_CMAKE_BUILD_TYPE) builds in its own folder too.
 if [ -n "${RP_CMAKE_BUILD_TYPE:-}" ]; then

@@ -98,6 +98,7 @@
 // Ciphers
 #define MBEDTLS_CIPHER_C                            // Symmetric cipher generic code
 #define MBEDTLS_AES_C                               // AES
+#define MBEDTLS_AES_ROM_TABLES                      // AES tables in flash: 8.5 KB less RAM
 #define MBEDTLS_GCM_C                               // Galois/Counter mode
 
 // Parsers
@@ -141,6 +142,16 @@
 #define MBEDTLS_CTR_DRBG_C                          // for MBEDTLS_AES_C
 #define MBEDTLS_OID_C                               // for MBEDTLS_RSA_C
 #define MBEDTLS_ASN1_WRITE_C                        // for MBEDTLS_ECDSA_C
+
+// mbedTLS's own allocator over a buffer of its own: in setup mode the
+// cartridge window's ROM3 bank, which nobody serves then, so a TLS session's
+// buffers (about 28 KB at the peak) stay off the heap (emul.c,
+// tlsArenaStart()). Debug builds keep its peak for SWD and the console.
+#define MBEDTLS_PLATFORM_MEMORY
+#define MBEDTLS_MEMORY_BUFFER_ALLOC_C
+#if defined(_DEBUG) && (_DEBUG != 0)
+#define MBEDTLS_MEMORY_DEBUG
+#endif
 
 // Debug
 // #define MBEDTLS_DEBUG_C                           // Debug functions

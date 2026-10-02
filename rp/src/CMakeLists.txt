@@ -199,14 +199,14 @@ target_include_directories(${PROJECT_NAME} PRIVATE
 # Use reduced space for ROMs
 pico_set_binary_type(${PROJECT_NAME} rp)
 
-# HTTPS downloads. APP_DOWNLOAD_HTTPS=1 in the environment builds TLS in:
-# mbedTLS, lwIP's ALTCP layer and the memory they need. Unset or 0 builds HTTP
-# only, with neither linked. The C code, lwipopts.h and the build ID all follow
+# HTTPS downloads. Unset or APP_DOWNLOAD_HTTPS=1 in the environment builds TLS
+# in, as releases ship: mbedTLS, lwIP's ALTCP layer and the memory they need.
+# 0 builds HTTP only, with neither linked. The C code, lwipopts.h and the build ID all follow
 # the one definition, and httpc.c is compiled into this target, not a library
 # of its own, so it cannot be built with a different value.
 set(APP_DOWNLOAD_HTTPS "$ENV{APP_DOWNLOAD_HTTPS}")
 if(APP_DOWNLOAD_HTTPS STREQUAL "")
-    set(APP_DOWNLOAD_HTTPS 0)
+    set(APP_DOWNLOAD_HTTPS 1)
 endif()
 if(NOT APP_DOWNLOAD_HTTPS MATCHES "^[01]$")
     message(FATAL_ERROR "APP_DOWNLOAD_HTTPS must be 0 or 1, not '${APP_DOWNLOAD_HTTPS}'")
@@ -330,11 +330,18 @@ add_definitions(-DPICO_FLASH_ASSUME_CORE0_SAFE=1)
 # walk through SCRATCH_X into the cartridge window below it. Measured on an ST
 # with the setup menu: 1,696 bytes at the deepest. PICO_HEAP_SIZE is the heap
 # the link guarantees: a build whose static data leaves less fails to link.
-# Measured: 13.1 KB of heap at the peak after boot and the menu commands.
+# Measured: 13.1 KB of heap at the peak after boot and the menu commands; with
+# HTTPS downloads (their TLS buffers are in the window, see emul.c) 18.6 KB over
+# every test download, so an HTTPS build guarantees that and 11 KB more.
+if(APP_DOWNLOAD_HTTPS)
+    set(APP_HEAP_SIZE 0x7600)
+else()
+    set(APP_HEAP_SIZE 0x8000)
+endif()
 target_compile_definitions(${PROJECT_NAME} PRIVATE
     PICO_STACK_SIZE=0x1000
     PICO_USE_STACK_GUARDS=1
-    PICO_HEAP_SIZE=0x8000)
+    PICO_HEAP_SIZE=${APP_HEAP_SIZE})
 
 # HTTP only, or HTTP and HTTPS downloads (see APP_DOWNLOAD_HTTPS above)
 add_definitions(-DAPP_DOWNLOAD_HTTPS=${APP_DOWNLOAD_HTTPS})

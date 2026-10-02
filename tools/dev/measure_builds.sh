@@ -1,7 +1,7 @@
 #!/bin/bash
 # Out-of-tree measurement builds of the rp/ firmware: MinSizeRel and Release,
-# each with and without DEBUG_MODE, and CMake Debug. APP_DOWNLOAD_HTTPS=1 in
-# the environment measures the HTTPS download profile.
+# each with and without DEBUG_MODE, and CMake Debug. APP_DOWNLOAD_HTTPS=0 in
+# the environment measures the HTTP-only download profile.
 #
 # Does not touch rp/build, rp/dist or the submodule pins (it never runs
 # rp/build.sh, which re-pins submodules and wipes rp/build). Adds
