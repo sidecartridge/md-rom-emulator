@@ -9,7 +9,9 @@
 #   tools/dev/tidy.sh [--build debug|release] [FILE ...]
 #
 # FILE is relative to rp/src. Without one, the app's own sources are checked:
-# the ones that are not the template's. Diagnostics are shown for the files
+# the ones that are not the template's. health.c is md-devops', taken whole
+# like the template's files: only this app's lines in it are held to the
+# config (check them with `tidy.sh health.c`). Diagnostics are shown for the files
 # given and their own headers (include/<name>.h), not for every header they
 # include. The exit status is clang-tidy's: non-zero when anything was found.
 #
