@@ -678,6 +678,9 @@ static absolute_time_t staStatusTime;
 static absolute_time_t staTimeout;
 
 wifi_sta_conn_process_status_t network_wifiStaConnectStart() {
+// No network by that name: when the join may be armed again (see the poll).
+static absolute_time_t staRearmAt;
+#define STA_REARM_MS 2000U
   if (!cyw43Initialized) {
     DPRINTF("WiFi not initialized. Cancelling connection\n");
     return NETWORK_WIFI_STA_CONN_ERR_NOT_INITIALIZED;
@@ -923,6 +926,22 @@ wifi_sta_conn_process_status_t network_wifiStaConnectPoll() {
   }
   if (status != CONNECTED_WIFI_IP) {
     return NETWORK_WIFI_STA_CONN_IN_PROGRESS;
+  if (status == CONNECT_FAILED_ERROR &&
+      absolute_time_diff_us(staRearmAt, get_absolute_time()) >= 0) {
+    // No network by that name (an AP refusing a station that has just left
+    // it, or still starting up): the driver does not try again by itself, so
+    // the join is armed again within the same attempt, as pico-sdk's own
+    // connect loop does, instead of the attempt waiting out its timeout.
+    absolute_time_t timeout = staTimeout;
+    wifi_sta_conn_process_status_t armed = network_wifiStaConnectStart();
+    if (armed != NETWORK_WIFI_STA_CONN_OK) {
+      staConnecting = false;
+      return armed;
+    }
+    staTimeout = timeout;
+    staRearmAt = make_timeout_time_ms(STA_REARM_MS);
+    return NETWORK_WIFI_STA_CONN_IN_PROGRESS;
+  }
   }
 #ifdef BLINK_H
   blink_on();
