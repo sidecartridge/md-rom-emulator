@@ -1,7 +1,36 @@
 #include "sdcard.h"
 
+#include "diskio.h"
+#include "health.h"
+
 static FATFS *mountedFsPtr = NULL;
 static bool sdMounted = false;
+
+// Remount, from md-devops' sdcard.c (v1.1.0). The card is mounted once at
+// boot, so a card pulled and put back stayed dead until a reset: FatFs keeps
+// the volume registered, and with card-detect disabled on this board nothing
+// ever marks the drive uninitialised, so mount_volume() sees a mounted volume
+// and never asks the driver to re-initialise the card. Unregistering the
+// volume is what breaks that: with fs_type cleared, the next f_mount() runs
+// disk_initialize(), which calls the card's own init unconditionally
+// (fatfs-sdk src/glue.c), and a freshly inserted card comes up.
+static FATFS *bootFsPtr = NULL;
+static char bootFolder[SDCARD_FOLDER_NAME_MAX] = "";
+static absolute_time_t nextRemountAt;
+static bool remountScheduled = false;
+static uint32_t remountAttempts = 0;
+static uint32_t remountRecoveries = 0;
+static FRESULT lastMountResult = FR_OK;
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+// Debug builds only: the card looks pulled while set (the presence check
+// fails and nothing remounts), and is found again once cleared. The same path
+// a real pull and reinsertion take.
+static bool sdcardTestRemoved = false;
+void sdcard_testSetRemoved(bool removed) { sdcardTestRemoved = removed; }
+#else
+static const bool sdcardTestRemoved = false;
+#endif
 
 static void sdcard_warnDebugRisk(void) {
   size_t sdCount = sd_get_num();
@@ -35,6 +64,7 @@ static sdcard_status_t sdcardInit() {
 FRESULT sdcard_mountFilesystem(FATFS *fsys, const char *drive) {
   // Mount the drive
   FRESULT fres = f_mount(fsys, drive, 1);
+  lastMountResult = fres;
   if (fres != FR_OK) {
     DPRINTF("ERROR: Could not mount the filesystem. Error code: %d\n", fres);
   } else {
@@ -83,6 +113,12 @@ sdcard_status_t sdcard_initFilesystem(FATFS *fsPtr, const char *folderName) {
     DPRINTF("Invalid SD filesystem initialization arguments.\n");
     return SDCARD_INIT_ERROR;
   }
+
+  // Remember what to mount with before trying, not after succeeding: a device
+  // booted with no card has to keep retrying too, and that is the case where
+  // the retry matters most.
+  bootFsPtr = fsPtr;
+  snprintf(bootFolder, sizeof(bootFolder), "%s", folderName);
 
   // Check the status of the sd card
   sdcard_status_t sdcardOk = sdcardInit();
@@ -190,6 +226,139 @@ void sdcard_getInfo(FATFS *fsPtr, uint32_t *totalSizeMb,
 }
 
 bool sdcard_isMounted(void) { return sdMounted && (mountedFsPtr != NULL); }
+
+uint32_t sdcard_getRemountRecoveries(void) { return remountRecoveries; }
+
+static void sdcard_markGone(const char *why) {
+  DPRINTF("SD card: %s -- card gone\n", why);
+  sdMounted = false;
+  mountedFsPtr = NULL;
+  remountScheduled = true;
+  nextRemountAt = get_absolute_time();
+}
+
+// Whether the card is still there cannot be inferred from FatFs results: with
+// the card physically out FatFs serves what it has cached and never reports a
+// disk error, and card-detect is not wired on this board. The only honest
+// question is a real one: read sector 0 off the card, bypassing FatFs's cache.
+static uint8_t presenceBuf[NUM_BYTES_PER_SECTOR];
+
+bool sdcard_checkPresence(void) {
+  if (!sdcard_isMounted()) {
+    return false;
+  }
+  if (sdcardTestRemoved || disk_read(0, presenceBuf, 0, 1) != RES_OK) {
+    sdcard_markGone("sector 0 read failed");
+    return false;
+  }
+  return true;
+}
+
+static absolute_time_t nextPresenceCheckAt;
+static bool presenceCheckStarted = false;
+
+static void sdcard_pollPresence(void) {
+  absolute_time_t now = get_absolute_time();
+  if (!presenceCheckStarted) {
+    presenceCheckStarted = true;
+    nextPresenceCheckAt = delayed_by_ms(now, SDCARD_PRESENCE_POLL_MS);
+    return;
+  }
+  if (absolute_time_diff_us(now, nextPresenceCheckAt) > 0) {
+    return;
+  }
+  nextPresenceCheckAt = delayed_by_ms(now, SDCARD_PRESENCE_POLL_MS);
+  sdcard_checkPresence();
+}
+
+// This board has no chip-select line (hw_config.c: ss_gpio = -1), so the card
+// is always selected. An RP restart in the middle of a multi-block write (a
+// SELECT press during a download, a crash, the watchdog) leaves the card
+// waiting for data or a stop token; it takes the driver's reset clocks and
+// CMD0 as data, and never mounts again until it loses power. Finishing the
+// block, sending the stop token and clocking it through its busy phase frees
+// it (found and proven over the probe).
+#define SDCARD_UNSTICK_BYTES 1200U
+#define SDCARD_STOP_TRAN_TOKEN 0xFDU
+
+static void sdcard_unstick(void) {
+  sd_card_t *sdCard = sd_get_by_num(0);
+  if ((sdCard == NULL) || (sdCard->spi_if_p == NULL) ||
+      (sdCard->spi_if_p->spi == NULL)) {
+    return;
+  }
+  DPRINTF("SD card: not ready; ending a write it may be stuck in\n");
+  spi_t *spi = sdCard->spi_if_p->spi;
+  static const uint8_t stopToken = SDCARD_STOP_TRAN_TOKEN;
+  spi_lock(spi);
+  spi_transfer(spi, NULL, NULL, SDCARD_UNSTICK_BYTES);  // 0xFF: the block
+  spi_transfer(spi, &stopToken, NULL, 1);
+  spi_transfer(spi, NULL, NULL, SDCARD_UNSTICK_BYTES);  // 0xFF: busy
+  spi_unlock(spi);
+}
+
+// One mount from scratch: the driver forgotten (sd_card_spi_init() returns at
+// once unless STA_NOINIT is set, and nothing sets it when a card is pulled),
+// the volume unregistered, then the card brought up again. A card stuck
+// inside a write answers FR_NOT_READY: freed and tried once more.
+static sdcard_status_t sdcard_mountAgain(void) {
+  for (int attempt = 0; attempt < 2; attempt++) {
+    sd_card_t *sdCard = sd_get_by_num(0);
+    if ((sdCard != NULL) && (sdCard->deinit != NULL)) {
+      sdCard->deinit(sdCard);
+    }
+    f_mount(NULL, "0:", 0);
+    sdcard_status_t status = sdcard_initFilesystem(bootFsPtr, bootFolder);
+    health_feed();
+    if (status == SDCARD_INIT_OK || lastMountResult != FR_NOT_READY ||
+        attempt > 0) {
+      return status;
+    }
+    sdcard_unstick();
+  }
+  return SDCARD_MOUNT_ERROR;
+}
+
+sdcard_status_t sdcard_recoverAtBoot(sdcard_status_t status) {
+  if ((status != SDCARD_MOUNT_ERROR) || (lastMountResult != FR_NOT_READY) ||
+      (bootFsPtr == NULL)) {
+    return status;
+  }
+  sdcard_unstick();
+  return sdcard_mountAgain();
+}
+
+void sdcard_pollRemount(void) {
+  if (sdcard_isMounted()) {
+    sdcard_pollPresence();
+    return;
+  }
+  if ((bootFsPtr == NULL) || (bootFolder[0] == '\0') || sdcardTestRemoved) {
+    return;
+  }
+  if (!remountScheduled) {
+    remountScheduled = true;
+    nextRemountAt = get_absolute_time();
+  }
+  if (absolute_time_diff_us(get_absolute_time(), nextRemountAt) > 0) {
+    return;
+  }
+  // A remount talks to the card over SPI and can take a moment, and a card
+  // that is half-inserted can take longer still.
+  health_feed();
+  health_setPhase(HEALTH_PHASE_SD_CARD);
+  remountAttempts++;
+  if (sdcard_mountAgain() == SDCARD_INIT_OK) {
+    remountRecoveries++;
+    presenceCheckStarted = false;
+    DPRINTF("SD card: mounted after %lu attempt(s)\n",
+            (unsigned long)remountAttempts);
+    remountAttempts = 0;
+    remountScheduled = false;
+    return;
+  }
+  nextRemountAt = delayed_by_ms(get_absolute_time(), SDCARD_REMOUNT_RETRY_MS);
+}
 
 bool sdcard_getMountedInfo(uint32_t *totalSizeMb, uint32_t *freeSpaceMb) {
   if ((totalSizeMb == NULL) || (freeSpaceMb == NULL)) {

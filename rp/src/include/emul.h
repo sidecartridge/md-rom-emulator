@@ -110,5 +110,9 @@ void emul_start();
 //                  4 a 500 ms stall, 5 stack overflow. Each must end in a
 //                  reboot that names itself, but the stall.
 #define DEVHOOKS_APP_HEALTH 4
+//   sd 0|1         the SD card looks pulled (0: the presence check fails, at
+//                  once) or put back (1: the next poll mounts it), through
+//                  the path a real pull and reinsertion take.
+#define DEVHOOKS_APP_SD 5
 
 #endif  // EMUL_H

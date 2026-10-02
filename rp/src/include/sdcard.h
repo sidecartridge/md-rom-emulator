@@ -32,6 +32,13 @@ typedef enum {
 #define NUM_BYTES_PER_SECTOR 512
 #define SDCARD_MEGABYTE 1048576
 
+// How long to wait between mount attempts while no card is mounted.
+#define SDCARD_REMOUNT_RETRY_MS 2000U
+// How often to ask the card whether it is still there, by reading one sector.
+#define SDCARD_PRESENCE_POLL_MS 2000U
+// Longest ROM folder name kept for a later mount.
+#define SDCARD_FOLDER_NAME_MAX 128
+
 /**
  * @brief Mount filesystem using FatFS library.
  *
@@ -121,6 +128,38 @@ void sdcard_getInfo(FATFS *fsPtr, uint32_t *totalSizeMb, uint32_t *freeSpaceMb);
  * @return true if mounted and usable; false otherwise.
  */
 bool sdcard_isMounted(void);
+
+/**
+ * @brief Read sector 0 now: false, and the card marked gone, when it does not
+ * answer. For after a failed operation, so the menu says so at once.
+ */
+bool sdcard_checkPresence(void);
+
+/**
+ * @brief From the main loop: while a card is mounted, ask whether it is still
+ * there every SDCARD_PRESENCE_POLL_MS; while none is, try to mount one every
+ * SDCARD_REMOUNT_RETRY_MS. From md-devops' sdcard.c.
+ */
+void sdcard_pollRemount(void);
+
+/**
+ * @brief How many times a card has been mounted again since boot.
+ */
+uint32_t sdcard_getRemountRecoveries(void);
+
+/**
+ * @brief After the boot's sdcard_initFilesystem(): a card that answered
+ * FR_NOT_READY may be stuck inside a write from before an RP restart; free it
+ * and mount once more. Returns the status to go on with.
+ */
+sdcard_status_t sdcard_recoverAtBoot(sdcard_status_t status);
+
+#if defined(_DEBUG) && (_DEBUG != 0)
+/**
+ * @brief Debug builds: make the card look pulled (true) or put back (false).
+ */
+void sdcard_testSetRemoved(bool removed);
+#endif
 
 /**
  * @brief Retrieves total and free SD card space from the mounted filesystem.
