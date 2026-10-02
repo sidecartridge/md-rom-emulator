@@ -310,9 +310,13 @@ by name for the cursor keys (`swd.py key down`: ASCII 0 and the ST's scan code).
   autorun); a SELECT press clears it. A hang in ROM mode or the Delay wait: write 1 to
   `romModeTestHang` over SWD (a GDB `set var`), and the watchdog reboots the RP into the same ROM.
   `healthMaxFeedGapUs` and `healthMaxFeedGapPhase` hold the longest gap between watchdog feeds.
-- `wifi 0|1`: 0 leaves the access point as a lost network would (the menu's `Network:` line says
-  so, `[D]` shows the card's catalog under a notice); 1 connects again, and the catalog refreshes
-  by itself. For the offline paths without touching the AP.
+- `wifi 0|1`: 0 leaves the access point as a lost network would: the link check notices, the
+  menu says "Wi-Fi lost; joining again.", and the app joins again by itself 5 s later and refreshes
+  the catalog (about 10 s in all). 1 makes the next try now instead of after the backoff. A
+  silent loss (the link up, the network gone): set the station's gateway to an address nobody
+  answers with GDB (`set var cyw43_state.netif[0].gw.addr = 0xFD01A8C0`, 192.168.1.253) and the
+  gateway probe gives up within about 75 s. No AP at boot: rename `WIFI_SSID` in RAM at the first
+  connect (EPIC-06's GDB script) and put it back later.
 
 Add an app's own commands the same way: a `DEVHOOKS_APP_<NAME>` define and a case in the handler.
 Useful ones in other microfirmwares: stop a boot countdown; stall or fail the next answer on
