@@ -475,10 +475,12 @@ static AutorunResult autorunIfRequested(const char *folder) {
     return AUTORUN_ERR_FLASH_STORE;  // Failed to store ROM in flash
   }
 
+  term_setBusy(true);
   // Blink the LED (if available) forever instead of resetting. The ST and
   // SELECT stay serviced: a short press restarts the RP, which boots into the
   // ROM just stored (MODE is ROM_MODE_DIRECT now), as v2.1.2 did.
   DPRINTF("Autorun successful. Blinking LED to indicate autorun mode.\n");
+  term_setBusy(false);
   bool ledOn = false;
   uint32_t toggledUs = time_us_32();
   while (1) {
