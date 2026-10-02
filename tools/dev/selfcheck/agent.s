@@ -5,6 +5,9 @@
 ; resets the ST when the probe writes AGENT_SIG1 and AGENT_SIG2 into the
 ; cartridge window at AGENT_SIG_ADDR (`swd.py st-reset`).
 ;
+; ST, STE and Mega STE only: on a TT or a Falcon the RAM it takes is in use,
+; and selfcheck.s does not install it there.
+;
 ; Where it lives: a 512-byte block at the top of the ST RAM, taken out of
 ; TOS's hands by lowering phystop by 512 (TOS never clears or hands out RAM
 ; above phystop). It rides on two hooks every Atari TOS has:

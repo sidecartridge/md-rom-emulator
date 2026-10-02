@@ -147,10 +147,8 @@ check_commands		macro
 					beq rom_function			; If it is, jump to the user firmware dispatcher
 
 					; If we are here, the command is a NOP
-					; If the command is a NOP, check the shift keys to bypass the command.
-					; The ROM Emulator keeps this (the template has it off): its setup
-					; screen offers "press SHIFT to boot to desktop", as v2.1.2 did.
-					check_shift_keys
+					; If the command is a NOP, check the shift keys to bypass the command
+					; check_shift_keys
 					check_keys
 .\@bypass:
 					endm
@@ -204,6 +202,7 @@ pre_auto:
 .copy_rom_code:
     move.l (a1)+, (a2)+
     dbf d6, .copy_rom_code
+	bsr clear_icache_68030
 	jmp (a3)
 
 ; The word the caller pushed takes a flag and the Mega STE's speed and cache
@@ -227,6 +226,36 @@ megaste_take:
 	move.b MEGASTE_SPEED_CACHE_REG.w, 5(sp)
 	bclr #0, MEGASTE_SPEED_CACHE_REG.w
 .megaste_take_done:
+	rts
+
+; A 68020's or 68030's instruction cache (a TT, a Falcon) does not see the
+; copy just made: clear it before running the copy, as TOS's own clrcache
+; does. The _CPU cookie says which CPU; a 68000 has none, or 0. A 68040 or
+; 68060 clears its caches another way, and is left alone. Keeps d0 (the
+; screen's address) and every other register but a0.
+clear_icache_68030:
+	move.l d0, -(sp)
+	move.l _p_cookies.w, d0
+	beq.s .clear_icache_done
+	move.l d0, a0
+.clear_icache_next:
+	move.l (a0)+, d0
+	beq.s .clear_icache_done
+	cmp.l #'_CPU', d0
+	beq.s .clear_icache_cpu
+	addq.w #4, a0
+	bra.s .clear_icache_next
+.clear_icache_cpu:
+	move.l (a0), d0
+	cmp.l #20, d0
+	bcs.s .clear_icache_done
+	cmp.l #30, d0
+	bhi.s .clear_icache_done
+	dc.w $4e7a, $0002				; movec cacr, d0
+	or.w #$0008, d0					; CI: clear the instruction cache
+	dc.w $4e7b, $0002				; movec d0, cacr
+.clear_icache_done:
+	move.l (sp)+, d0
 	rts
 
 start_rom_code:

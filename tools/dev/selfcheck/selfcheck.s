@@ -19,7 +19,10 @@
 ;
 ; Last, it installs the remote reset agent (agent.s): from then on the probe
 ; can reset the ST (`swd.py st-reset`) whatever the ST shows, as long as it
-; stays powered and nothing takes over its interrupts or tests its RAM.
+; stays powered and nothing takes over its interrupts or tests its RAM. Not on
+; a TT or a Falcon: the agent takes the last bytes of the 32 KB at the top of
+; the RAM, after the ST's 32,000-byte screen, and those are in use there (two
+; bombs on the Falcon). It says so, and a reset there needs the button.
 
 ROM4_ADDR           equ $FA0000
 WINDOW_BYTES        equ $20000          ; ROM4 and ROM3, 128 KB
@@ -32,6 +35,8 @@ CMD_SELFCHECK_FAIL  equ $7F02
 FRAME_REPEATS       equ 3
 VERDICT_FRAMES      equ 250             ; the verdict stays up 5 s at 50 Hz
 _vbclock            equ $462            ; TOS counts vertical blanks here
+_p_cookies          equ $5a0            ; the cookie jar, 0 before TOS 1.06
+MCH_TT              equ $00020000       ; _MCH: the TT, and above it the Falcon
 
 	section
 
@@ -108,9 +113,39 @@ selfcheck:
 	cmp.l _vbclock,d0
 	bhi.s .hold
 
+	bsr is_tt_or_falcon
+	bne.s .no_agent
 	bsr agent_install
+	bra.s .done
+.no_agent:
+	lea msg_no_agent(pc),a0
+	bsr print
+.done:
 
 	movem.l (sp)+,d0-d7/a0-a6
+	rts
+
+; is_tt_or_falcon: d0.l 1 on a TT or a Falcon (_MCH $00020000 or more), 0
+; elsewhere and on a TOS with no cookie jar; Z set for 0. Uses a0.
+is_tt_or_falcon:
+	move.l _p_cookies.w,d0
+	beq.s .machine_done
+	move.l d0,a0
+.machine_next:
+	move.l (a0)+,d0
+	beq.s .machine_done
+	cmp.l #'_MCH',d0
+	beq.s .machine_mch
+	addq.w #4,a0
+	bra.s .machine_next
+.machine_mch:
+	cmp.l #MCH_TT,(a0)
+	bcs.s .machine_st
+	moveq #1,d0
+	rts
+.machine_st:
+	moveq #0,d0
+.machine_done:
 	rts
 
 ; send_frame: d4.w the command, d3.l the address. Keeps d3-d6.
@@ -183,6 +218,7 @@ msg_fail:       dc.b "FAIL at ",0
 msg_read:       dc.b ", read ",0
 msg_expected:   dc.b ", expected ",0
 msg_newline:    dc.b 13,10,0
+msg_no_agent:   dc.b "Remote reset: not on a TT or Falcon.",13,10,0
 	even
 
 	include "agent.s"

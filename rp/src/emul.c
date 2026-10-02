@@ -942,7 +942,7 @@ static void menu(void) {
   term_printAt(MENU_ROW_DEVICE, MENU_COL_LABEL, MENU_LABEL_DEVICE);
   term_printAt(MENU_ROW_SETTINGS, MENU_COL_KEY, "[S]ettings");
   term_printAt(MENU_ROW_EXIT, MENU_COL_KEY,
-               "[E]xit to desktop (or hold SHIFT)");
+               "[E]xit to desktop");
   term_printAt(MENU_ROW_BOOSTER, MENU_COL_KEY,
                "[X] Back to Booster   [M] Refresh");
   const char *url = catalogUrl();
@@ -2324,7 +2324,10 @@ void emul_start() {
     chandler_loop();
     if (chandler_consumeStBoot()) {
       // A new ST session: nothing typed before the reset carries over, and
-      // the ST gets a freshly drawn menu.
+      // the ST gets a freshly drawn menu. A command still in the sentinel was
+      // the last session's (the desktop after [E]): left there, every reset
+      // went straight to the desktop again.
+      SEND_COMMAND_TO_DISPLAY(DISPLAY_COMMAND_NOP);
       term_clearInputBuffer();
       listClose();
       menu();
