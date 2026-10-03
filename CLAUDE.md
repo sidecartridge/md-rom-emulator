@@ -21,7 +21,7 @@ Prerequisites: `arm-none-eabi-*` toolchain, CMake 3.26+, Python, `stcmd` on PATH
 
 ```sh
 # Full build (target + rp + dist packaging)
-./build.sh <pico|pico_w> <debug|release> <app_uuid_key>
+./build.sh pico_w <debug|release> <app_uuid_key>
 # e.g. ./build.sh pico_w debug 44444444-4444-4444-8444-444444444444
 
 # Target-only (regenerates rp/src/include/target_firmware.h); it runs from its
@@ -127,7 +127,7 @@ Setup mode is the template's at `6935f53`; every other file under `rp/src` and `
 - **`network.c`:** the STA connect without blocking (`network_wifiStaConnectStart()`/`…Poll()`, which arms the join again on "no network"; `network_wifiStaConnect()` is the two in a loop), the link check and the gateway probe (`network_isLinkHealthy()`, `network_pollGatewayProbe()`, from md-devops).
 - **`sdcard.c`, this app's (from md-devops):** the presence check, the remount (`sdcard_pollRemount()`, `sdcard_checkPresence()`), and this board's stuck-card recovery (`sdcard_recoverAtBoot()`), which the template, on the same board, has not.
 - **Device health, this app's (not in the template yet):** `health.c`/`health.h` from md-devops; `reset.c` marks a requested reset (`health_markReset()`); `reset.h`'s jump to Booster stops the watchdog; `CMakeLists.txt` sets `PICO_PANIC_FUNCTION`.
-- **HTTPS downloads, built by default:** mbedTLS allocates in the ROM3 bank (`tlsArenaStart()` in `emul.c`, about 28 KB at the peak), installed once lwIP has created its shared TLS config, since lwIP points mbedTLS at its own allocator then; `mbedtls_config.h` keeps the AES tables in flash; `download.c` reads the response headers in place instead of copying them whole (GitHub's redirects send 5 KB of them); `commemul.c`'s ring is 4 KB; `CMakeLists.txt` guarantees an HTTPS build 29.5 KB of heap (18.6 KB at the peak over every test download, 35.4 KB in a release). `lwipopts.h` keeps the template's HTTPS sizes: 32 pool pbufs, 24 at the peak against an internet server. The HTTPS build reads `HTTPS_CATALOG`.
+- **HTTPS downloads, built by default:** mbedTLS allocates in the ROM3 bank (`tlsArenaStart()` in `emul.c`, about 28 KB at the peak), installed once lwIP has created its shared TLS config, since lwIP points mbedTLS at its own allocator then; `mbedtls_config.h` keeps the AES tables in flash; `download.c` reads the response headers in place instead of copying them whole (GitHub's redirects send 5 KB of them); `commemul.c`'s ring is 4 KB; `CMakeLists.txt` guarantees an HTTPS build 27 KB of heap (the 18.6 KB peak over every test download and 8 KB; a release build has 34.2 KB, a debug build 29.2 KB). `lwipopts.h` keeps the template's HTTPS sizes: 32 pool pbufs, 24 at the peak against an internet server. The HTTPS build reads `HTTPS_CATALOG`.
 
 ## Working style
 
