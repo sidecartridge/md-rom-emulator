@@ -129,6 +129,23 @@ For a computer whose keyboard or screen does not work (a diagnostic cartridge, f
 - **The microSD card** can be taken out and put back while the setup screen is up: the card is found again by itself.
 - **After an unexpected restart** of the Multi-device, the setup screen says why ("Last restart: ...") for a few seconds.
 
+## 🧰 Making a Cartridge from Your Own Programs: USM Web
+
+[USM Web](https://usm.sidecartridge.com/) packs one or more Atari ST `.PRG` or `.TOS` programs into a 128 KB cartridge ROM image that this app can launch. It runs in a recent Chrome, Firefox or Safari, and your files never leave your computer: the image is built in the browser. The same image also works in Hatari and STEem.
+
+![USM Web](images/usm-web.png)
+
+1. **Add programs:** drag and drop one or more `.PRG` or `.TOS` files onto the box, or click *browse*. Each must be an Atari ST program of up to 128 KB that does not load other files when it runs (the cartridge has no folders or files of its own). They appear on the cartridge's `C:` drive in the list's order. For each one you can choose:
+   - **Compress (`-z`):** packs the program; it is kept as it is when packing would not make it smaller.
+   - **Init flag (`-f`):** whether TOS runs the program by itself after a reset. *None* leaves it on the `C:` drive to open from the desktop; `3` runs it before the boot disk, the usual choice for a launcher.
+2. **Cart options:**
+   - **Output format:** `.ROM`, the standard cartridge image; `.STC`, STEem's (with 4 more bytes at the start; this app takes it too); or a **diagnostic** cartridge (Classic mode, one program), which TOS runs right after a reset.
+   - **Mode:** **Default** copies each program into RAM and runs it there, and works with any program; **Classic** (`-c`) runs it straight from the cartridge, only for programs written for that.
+3. **Build:** click **Build cart**. The log shows each program's result.
+4. **Download:** give the file a name and click **Download**. **Build another** starts again.
+
+Copy the image to the ROM folder on the microSD card (`/roms` by default), then select it with **B** and launch it with **L**. The **?** buttons on the page explain every option.
+
 ## 🛠️ Setting Up the Development Environment
 
 This project is based on the [SidecarTridge Multi-device Microfirmware App Template](https://github.com/sidecartridge/md-microfirmware-template).  
